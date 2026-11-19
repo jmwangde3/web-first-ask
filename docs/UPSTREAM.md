@@ -24,12 +24,11 @@ One JSON object per line. Fields used by web-first-ask:
   "files": ["C:/repo/src/file.js"],
   "images": [],
   "downloadImages": false,
-  "model": "optional provider model",
-  "reasoning": "high"
+  "model": "optional provider model"
 }
 ```
 
-Optional properties are omitted when not configured. `session` is omitted for a new conversation. `temporary` is intentionally not used with `session`.
+Optional properties are omitted when not configured. `session` is omitted for a new conversation. `temporary` is intentionally not used with `session`. WFA uses the provider's current web UI reasoning setting.
 
 The upstream currently accepts `chatgpt`, `gemini` and `claude`. Gemini image attachments are not supported by batch; document `files` are used instead.
 
@@ -71,12 +70,14 @@ Metadata fields include `id`, `provider`, `pageId`, `threadUrl`, `state`, `elaps
 3. The batch worker closes tabs for terminal states other than `recoverable`; a timed-out job may need the saved conversation URL reopened by `get`.
 4. Browser automation inside ask-bridge currently uses `chrome-devtools-mcp`. Codex does not connect to MCP, but the upstream implementation internally does.
 5. Upstream may change JSONL fields, artifact names or exit behavior. After `wfa upstream update`, run `wfa doctor` and the smoke tests before using it for production tasks.
+6. Gemini submission and document upload depend on ask-bridge recognizing the current webpage controls. A missing upload menu or send button is reported as an incomplete provider result and may leave the other providers' responses available.
 
 ## Update policy
 
 - No automatic background update.
 - Update only when no task is active:
   `wfa upstream update`
+- WFA coordinates the updater and new batch launches using the same task store. With ask-bridge 0.4.0 on Windows, WFA also tracks the background installer announced by the upstream command.
 - Then:
   `wfa doctor`
 - For a release candidate, run one short request and one two-provider compare before relying on the new upstream version.

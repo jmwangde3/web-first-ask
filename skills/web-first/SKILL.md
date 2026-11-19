@@ -78,13 +78,13 @@ Preserve and use the multi-provider comparison capability when:
 Use:
 
 ```powershell
-wfa compare --providers chatgpt,gemini --workspace <repository-key> --prompt-file <prompt-file>
+wfa compare --providers 'chatgpt,gemini' --workspace <repository-key> --prompt-file <prompt-file>
 ```
 
 For independent code implementations:
 
 ```powershell
-wfa code --providers chatgpt,gemini --workspace <repository-key> `
+wfa code --providers 'chatgpt,gemini' --workspace <repository-key> `
   --requirement "<same precise implementation requirement>" `
   --file <complete-source-file> --file <focused-test-file>
 ```
@@ -94,13 +94,14 @@ The same prompt and attachments are sent independently and concurrently. Each pr
 Default comparison set is ChatGPT + Gemini. Claude is available when explicitly selected:
 
 ```powershell
-wfa compare --providers chatgpt,gemini,claude ...
+wfa compare --providers 'chatgpt,gemini,claude' ...
 ```
 
 ## Waiting and recovery
 
 - Run one foreground `wfa` command and let the local CLI/ask-bridge process wait for the provider. Do not create a 30-second `wfa status` or `wfa ask` polling loop.
 - `wfa` prints a task ID before waiting and persists it locally.
+- A nonzero exit from `ask`, `compare` or `code` can still include completed provider results. Read the task summary and use successful result files before deciding how to recover the unfinished providers.
 - If the terminal tool returns while the process is still running, inspect `wfa status <task-id>` once when needed. If it is still running, do not submit again.
 - `timed_out`, `recoverable`, `interrupted_unknown` and ambiguous `failed` states may mean the prompt was already submitted. Never resend automatically.
 - If the provider finished but the batch ended before the result was collected, first independently confirm that generation is complete, then use:

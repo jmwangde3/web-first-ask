@@ -11,7 +11,7 @@ export function summarizeTask(task) {
     state = "completed";
   } else if (states.length && states.every((value) => value === "abandoned")) {
     state = "abandoned";
-  } else if (states.length && states.every((value) => ["completed", "failed", "failed_before_start", "abandoned"].includes(value))) {
+  } else if (states.length && states.every((value) => ["completed", "failed", "failed_before_start", "abandoned", "cancelled"].includes(value))) {
     state = states.some((value) => value === "completed") ? "partial" : "failed";
   } else if (states.some((value) => ["timed_out", "recoverable", "interrupted_unknown", "failed"].includes(value))) {
     state = "needs_recovery";
@@ -29,4 +29,29 @@ export function workspaceHasBlockingTask(tasks, workspace, providers, exceptTask
     }
   }
   return null;
+}
+
+function latestSessionTask(tasks, workspace, provider) {
+  // Task records are appended under the store lock. Ledger order also works for
+  // existing tasks without a sequence number and is independent of clock changes.
+  return Object.values(tasks).findLast((task) => {
+    const child = task.children?.[provider];
+    return task.workspace === workspace && child?.state === "completed" && child.threadUrl;
+  });
+}
+
+export function workspaceSessions(tasks, sessions, workspace, providers) {
+  const current = { ...sessions.workspaces?.[workspace] };
+  for (const provider of providers) {
+    const latest = latestSessionTask(tasks, workspace, provider);
+    if (latest) current[provider] = latest.children[provider].threadUrl;
+  }
+  return current;
+}
+
+export function rememberSession(tasks, sessions, task, provider) {
+  if (latestSessionTask(tasks, task.workspace, provider) !== task) return;
+  sessions.workspaces ??= {};
+  sessions.workspaces[task.workspace] ??= {};
+  sessions.workspaces[task.workspace][provider] = task.children[provider].threadUrl;
 }

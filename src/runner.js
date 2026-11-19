@@ -6,8 +6,9 @@ import { loadConfig } from "./config.js";
 import { buildJobs, normalizeProviders, resolveAttachmentPaths, validateConcurrency } from "./jobs.js";
 import { resolveAskBridge, runProcess, checkAskBridge } from "./ask-bridge.js";
 import { readBatchMetadata } from "./metadata.js";
-import { summarizeTask, workspaceHasBlockingTask } from "./state.js";
+import { rememberSession, summarizeTask, workspaceHasBlockingTask, workspaceSessions } from "./state.js";
 import { WfaError } from "./errors.js";
+import { assertUpstreamAvailable } from "./maintenance.js";
 import { hashFile, isPidAlive, sha256, slug, uuid } from "./util.js";
 
 async function validateFiles(paths, label) {
@@ -91,9 +92,6 @@ export async function executeTask(input, dependencies = {}) {
     return { task: prior, replayed: true };
   }
 
-  const preflight = dependencies.skipPreflight ? null : await checkAskBridge(config);
-  const command = preflight?.command ?? resolveAskBridge(config);
-
   const created = await store.transaction(async ({ tasks, sessions }) => {
     const priorId = tasks.requestIndex?.[requestId];
     if (priorId) {
@@ -104,6 +102,7 @@ export async function executeTask(input, dependencies = {}) {
       return { existing: prior };
     }
 
+    assertUpstreamAvailable(tasks);
     const blocking = workspaceHasBlockingTask(tasks.tasks, workspace, providers);
     if (blocking) {
       throw new WfaError(
@@ -112,7 +111,9 @@ export async function executeTask(input, dependencies = {}) {
       );
     }
 
-    const sessionMap = sessions.workspaces?.[workspace] ?? {};
+    const preflight = dependencies.skipPreflight ? null : await checkAskBridge(config);
+    const command = preflight?.command ?? resolveAskBridge(config);
+    const sessionMap = workspaceSessions(tasks.tasks, sessions, workspace, providers);
     const jobs = buildJobs({
       taskId,
       providers,
@@ -170,14 +171,14 @@ export async function executeTask(input, dependencies = {}) {
     tasks.tasks[taskId] = task;
     tasks.requestIndex ??= {};
     tasks.requestIndex[requestId] = taskId;
-    return { task };
+    return { task, command };
   });
 
   if (created.existing) {
     return { task: created.existing, replayed: true };
   }
 
-  const task = created.task;
+  const { task, command } = created;
   input.onTaskCreated?.(task);
   const args = [
     "--backend", "browser",
@@ -237,29 +238,30 @@ export async function executeTask(input, dependencies = {}) {
     current.processStdioDrainTimedOut = Boolean(processResult.stdioDrainTimedOut);
     current.processSignal = processResult.signal;
     current.processTimedOut = Boolean(processResult.timedOut);
-    current.childPid = null;
+    current.childPid = processResult.childMayRun ? processResult.pid : null;
     for (const [provider, result] of Object.entries(results)) {
       const child = current.children[provider];
+      child.childPid = current.childPid;
+      if (child.state === "completed" || child.state === "abandoned") continue;
       child.state = result.state;
       child.threadUrl = result.threadUrl;
       child.error = result.error;
       child.resultPath = result.responsePath;
       child.elapsedSeconds = result.elapsedSeconds;
       child.pageId = result.pageId;
-      child.childPid = null;
 
       if (result.state === "completed" && result.threadUrl) {
-        sessions.workspaces ??= {};
-        sessions.workspaces[current.workspace] ??= {};
-        sessions.workspaces[current.workspace][provider] = result.threadUrl;
+        rememberSession(tasks.tasks, sessions, current, provider);
       }
     }
     current.state = stateForParent(current.children);
     current.updatedAt = new Date().toISOString();
-    if ((processResult.code !== 0 || processResult.timedOut) && !current.error) {
-      current.processWarning = processResult.timedOut
-        ? "The local ask-bridge process exceeded the safety watchdog and was stopped. Any provider without a completed metadata+response artifact remains unresolved; do not resend."
-        : `ask-bridge batch exited with code ${processResult.code}${processResult.signal ? ` (${processResult.signal})` : ""}. Per-provider metadata is authoritative.`;
+    if (processResult.processError) {
+      current.processWarning = `ask-bridge failed after launch: ${processResult.processError.message}. Check unresolved providers before sending again.`;
+    } else if (processResult.timedOut) {
+      current.processWarning = "The local ask-bridge process exceeded the safety watchdog. Any provider without a completed metadata+response artifact remains unresolved; do not resend.";
+    } else if (processResult.code !== 0) {
+      current.processWarning = `ask-bridge batch exited with code ${processResult.code}${processResult.signal ? ` (${processResult.signal})` : ""}. Per-provider metadata is authoritative.`;
     }
   });
 
@@ -272,24 +274,22 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
     const task = tasks.tasks[taskId];
     if (!task) throw new WfaError("TASK_NOT_FOUND", `Task not found: ${taskId}`);
     for (const child of Object.values(task.children)) {
+      if (["completed", "abandoned", "failed_before_start"].includes(child.state)) continue;
       const metadata = await readBatchMetadata(task.outputDir, child.jobId);
       if (metadata.threadUrl && !child.threadUrl) child.threadUrl = metadata.threadUrl;
-      if (metadata.state === "completed" && metadata.responsePath && child.state !== "abandoned") {
+      if (metadata.state === "completed" && metadata.responsePath) {
         child.state = "completed";
         child.threadUrl = metadata.threadUrl;
         child.resultPath = metadata.responsePath;
         child.error = null;
-        sessions.workspaces ??= {};
-        sessions.workspaces[task.workspace] ??= {};
-        if (metadata.threadUrl) sessions.workspaces[task.workspace][child.provider] = metadata.threadUrl;
+        if (metadata.threadUrl) rememberSession(tasks.tasks, sessions, task, child.provider);
       } else if (["failed", "timed_out", "recoverable", "cancelled"].includes(metadata.state)
         && ["queued", "running", "interrupted_unknown"].includes(child.state)) {
         child.state = metadata.state;
         child.error = metadata.error;
       }
     }
-    if (["preparing", "running"].includes(task.state)
-      && ((task.childPid && !isPidAlive(task.childPid)) || (!task.childPid && !isPidAlive(task.parentPid)))) {
+    if (!isPidAlive(task.childPid) && !isPidAlive(task.parentPid)) {
       for (const child of Object.values(task.children)) {
         if (child.state === "queued" || child.state === "running") {
           child.state = "interrupted_unknown";

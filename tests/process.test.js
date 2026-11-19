@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { ChildProcess } from "node:child_process";
 import { runProcess } from "../src/ask-bridge.js";
 
 test("local process watchdog terminates a stuck child and reports timeout", async () => {
@@ -30,4 +31,29 @@ test("process wait settles after main child exits when a descendant keeps inheri
   assert.equal(result.timedOut, false);
   assert.equal(result.stdioDrainTimedOut, true);
   assert.match(result.stdout, /parent-finished/);
+});
+
+test("failure to signal a spawned process is not classified as a spawn failure", async (t) => {
+  const failure = new Error("simulated failed termination");
+  t.mock.method(ChildProcess.prototype, "kill", function () {
+    this.emit("error", failure);
+    return false;
+  });
+
+  const result = await runProcess(process.execPath, ["-e", "setTimeout(() => {}, 2000)"], {
+    timeoutMs: 150,
+    killGraceMs: 100,
+  });
+  try {
+    assert.equal(result.timedOut, true);
+    assert.equal(result.spawnError, null);
+    assert.equal(result.processError, failure);
+    assert.ok(result.pid > 0);
+  } finally {
+    if (result.pid && result.code === null && !result.signal) {
+      try { process.kill(result.pid); } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+  }
 });
