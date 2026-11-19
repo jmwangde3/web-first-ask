@@ -25,7 +25,7 @@ export function buildJobs({
   files = [],
   images = [],
   modelByProvider = {},
-  reasoningByProvider = {},
+
   downloadImages = false,
 }) {
   const suffix = taskId.replaceAll("-", "").slice(0, 8);
@@ -44,12 +44,7 @@ export function buildJobs({
     };
     if (!fresh && sessions[provider]) job.session = sessions[provider];
     if (modelByProvider[provider]) job.model = modelByProvider[provider];
-    if (reasoningByProvider[provider]) {
-      if (provider === "claude") {
-        throw new WfaError("REASONING_UNSUPPORTED", "ask-bridge does not support Claude reasoning selection.");
-      }
-      job.reasoning = reasoningByProvider[provider];
-    }
+
     return job;
   });
 }

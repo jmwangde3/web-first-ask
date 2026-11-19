@@ -16,8 +16,6 @@ export const DEFAULT_CONFIG = Object.freeze({
   maxTimeoutSeconds: 7200,
   defaultCompareProviders: ["chatgpt", "gemini"],
   maxConcurrency: 3,
-  defaultReasoning: {
-    chatgpt: "high",
-  },
+
   downloadImages: false,
 });

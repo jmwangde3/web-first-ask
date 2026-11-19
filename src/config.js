@@ -10,13 +10,11 @@ export async function loadConfig(home) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
+  const userConfig = { ...user };
+  delete userConfig.defaultReasoning;
   return {
     ...DEFAULT_CONFIG,
-    ...user,
-    defaultReasoning: {
-      ...DEFAULT_CONFIG.defaultReasoning,
-      ...(user.defaultReasoning ?? {}),
-    },
+    ...userConfig,
     defaultCompareProviders: user.defaultCompareProviders ?? DEFAULT_CONFIG.defaultCompareProviders,
   };
 }

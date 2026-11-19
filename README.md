@@ -5,7 +5,7 @@
 `web-first-ask` (`wfa`) is a local Node.js CLI that calls the independently maintained [`ask-bridge`](https://github.com/doggy8088/ask-bridge) executable. It explicitly selects ask-bridge's `browser` backend because its Batch command does not support SIWC. It does not expose an MCP server to Codex and does not reimplement browser automation.
 
 - Codex calls one local command and waits while `ask-bridge batch` performs its own browser-side polling.
-- ChatGPT is the default provider; the Skill requests high reasoning for ChatGPT.
+- ChatGPT is the default provider. WFA does not set or change provider reasoning strength; it uses the current setting in the provider web UI.
 - `wfa compare` sends the same prompt and attachments to multiple providers concurrently, then saves each answer separately.
 - `wfa code` asks for **complete replacement contents of changed files**, not an implementation plan or diff-only response.
 - A local task ledger records request IDs, provider states, conversation URLs and result paths.
@@ -112,7 +112,7 @@ wfa code `
   --file .\test\feature.test.js
 ```
 
-For provider-specific reasoning/model selection in a parallel run, use `--reasoning-map chatgpt=high,gemini=extended` and `--model-map chatgpt=<model>,gemini=<model>`. `--download-images` enables downloading generated images; it is off by default.
+For provider-specific model selection in a parallel run, use `--model-map chatgpt=<model>,gemini=<model>`. Reasoning-strength selection is intentionally not managed by WFA. `--download-images` enables downloading generated images; it is off by default.
 
 The answers are saved separately under the local data directory. Codex should read the returned files, review them, apply the chosen implementation, and run tests. `wfa` never writes provider-generated code into the target repository automatically.
 

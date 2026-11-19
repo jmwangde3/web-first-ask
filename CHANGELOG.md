@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Disable provider reasoning-strength selection in WFA. Requests use each provider's current web UI setting; model selection, parallel execution and task recovery remain available.
+- Bound the local ask-bridge stdio drain after the child process exits, so inherited descendant handles cannot keep `wfa ask` waiting indefinitely. Preserve captured output and record when the drain grace period is used.
+
 ## 0.1.0 — Initial project package
 
 - Added local `wfa` CLI backed by the independently installed ask-bridge executable.

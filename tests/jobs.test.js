@@ -17,14 +17,14 @@ test("builds independent jobs for simultaneous providers", () => {
       chatgpt: "https://chatgpt.com/c/one",
       gemini: "https://gemini.google.com/app/two",
     },
-    reasoningByProvider: { chatgpt: "high" },
+
   });
   assert.equal(jobs.length, 2);
   assert.equal(jobs[0].prompt, jobs[1].prompt);
   assert.equal(jobs[0].session, "https://chatgpt.com/c/one");
   assert.equal(jobs[1].session, "https://gemini.google.com/app/two");
-  assert.equal(jobs[0].reasoning, "high");
-  assert.equal(jobs[1].reasoning, undefined);
+  assert.equal(Object.hasOwn(jobs[0], "reasoning"), false);
+  assert.equal(Object.hasOwn(jobs[1], "reasoning"), false);
   assert.equal(jobs[0].downloadImages, false);
   assert.notEqual(jobs[0].id, jobs[1].id);
 });
