@@ -11,8 +11,8 @@ import { checkAskBridge, resolveAskBridge, runProcess } from "./ask-bridge.js";
 import { buildCodePrompt, buildComparePrompt } from "./prompts.js";
 import { normalizeProviders } from "./jobs.js";
 import { WfaError } from "./errors.js";
-import { BLOCKING_STATES } from "./constants.js";
-import { isPidAlive, truncate } from "./util.js";
+import { updateAskBridge } from "./maintenance.js";
+import { truncate } from "./util.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const VALUE_FLAGS = new Set([
@@ -154,8 +154,8 @@ Code mode:
   wfa code --requirement "..." --file src/a.js --file test/a.test.js --workspace repo-name
 
 Multi-provider:
-  wfa compare --providers chatgpt,gemini --prompt-file question.md --workspace repo-name
-  wfa code --providers chatgpt,gemini --requirement "..." --file src/a.js
+  wfa compare --providers 'chatgpt,gemini' --prompt-file question.md --workspace repo-name
+  wfa code --providers 'chatgpt,gemini' --requirement "..." --file src/a.js
 
 Safety:
   A timed-out/recoverable/unknown task is never resent automatically.
@@ -226,18 +226,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (command === "upstream") {
     if (positional[0] !== "update") throw new WfaError("ARGUMENT_ERROR", "Usage: wfa upstream update");
-    const snapshot = await store.snapshot();
-    for (const task of Object.values(snapshot.tasks.tasks)) {
-      const unresolved = Object.entries(task.children ?? {}).find(([, child]) =>
-        BLOCKING_STATES.has(child.state) || (child.childPid && isPidAlive(child.childPid))
-      );
-      if (unresolved) {
-        throw new WfaError("UPSTREAM_UPDATE_BLOCKED", `Cannot update ask-bridge while task ${task.taskId} has unresolved ${unresolved[0]} state ${unresolved[1].state}. Collect or explicitly resolve the task first.`);
-      }
-    }
-    const result = await runProcess(resolveAskBridge(config), ["update"], { inherit: true });
-    if (result.spawnError || result.code !== 0) throw new WfaError("UPSTREAM_UPDATE_FAILED", result.spawnError?.message ?? `ask-bridge update exited with ${result.code}.`);
-    return;
+    return updateAskBridge(config, store);
   }
   if (command === "status") {
     const taskId = positional[0];
@@ -339,4 +328,5 @@ export async function main(argv = process.argv.slice(2)) {
   }, { home, store, config });
 
   printTask(result.task, Boolean(options.json), Boolean(result.replayed));
+  return result.task.state === "completed" ? 0 : 1;
 }

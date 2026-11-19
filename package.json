@@ -1,6 +1,6 @@
 {
   "name": "web-first-ask",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A Codex-first CLI and Skill that delegates complete implementation work to ChatGPT and other web AI providers through ask-bridge.",
   "type": "module",
   "private": false,

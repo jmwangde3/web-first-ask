@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { executeTask } from "../src/runner.js";
+import { executeTask, refreshTask } from "../src/runner.js";
 import { Store } from "../src/store.js";
 
 function argAfter(args, flag) {
@@ -131,6 +131,89 @@ test("request ID with changed content is rejected and ambiguous task blocks dupl
       workspace: "sample-repo",
       requestId: "new-id",
     }, { home, store, config, skipPreflight: true }), /unresolved chatgpt task/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("status preserves the current legacy session and an already collected result", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-status-"));
+  try {
+    const store = new Store(home);
+    const outputDir = path.join(home, "batch");
+    const jobDir = path.join(outputDir, "old-job");
+    const oldUrl = "https://chatgpt.com/c/old";
+    const newUrl = "https://chatgpt.com/c/new";
+    const recoveredPath = path.join(home, "recovered.md");
+    await mkdir(jobDir, { recursive: true });
+    await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({ state: "completed", threadUrl: oldUrl }));
+    await writeFile(path.join(jobDir, "response.md"), "Old batch response");
+    await writeFile(recoveredPath, "Verified recovered response");
+    await store.transaction(({ tasks, sessions }) => {
+      tasks.tasks.old = {
+        taskId: "old", workspace: "repo", outputDir, createdAt: "2026-01-01T00:00:00Z",
+        children: {
+          chatgpt: { provider: "chatgpt", jobId: "old-job", state: "completed", threadUrl: oldUrl, resultPath: recoveredPath },
+        },
+      };
+      tasks.tasks.new = {
+        taskId: "new", workspace: "repo", createdAt: "2026-01-02T00:00:00Z",
+        children: {
+          chatgpt: { provider: "chatgpt", state: "completed", threadUrl: newUrl },
+        },
+      };
+      sessions.workspaces.repo = { chatgpt: newUrl, gemini: "https://gemini.google.com/app/unchanged" };
+    });
+
+    const task = await refreshTask("old", { home, store });
+    assert.equal(task.children.chatgpt.resultPath, recoveredPath);
+    const { sessions } = await store.snapshot();
+    assert.equal(sessions.workspaces.repo.chatgpt, newUrl);
+    assert.equal(sessions.workspaces.repo.gemini, "https://gemini.google.com/app/unchanged");
+
+    await store.transaction(({ tasks }) => {
+      const child = tasks.tasks.old.children.chatgpt;
+      child.state = "interrupted_unknown";
+      child.resultPath = null;
+    });
+    const reconciled = await refreshTask("old", { home, store });
+    assert.equal(reconciled.children.chatgpt.state, "completed");
+    assert.equal(reconciled.children.chatgpt.resultPath, path.join(jobDir, "response.md"));
+    assert.equal((await store.snapshot()).sessions.workspaces.repo.chatgpt, newUrl);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a post-launch process error preserves a finished result and keeps the uncertain provider locked", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-process-error-"));
+  try {
+    const store = new Store(home);
+    const { task } = await executeTask({
+      prompt: "Compare two independent results.", providers: ["chatgpt", "gemini"], workspace: "repo",
+    }, {
+      home, store, skipPreflight: true,
+      runProcess: async (_command, args) => {
+        const jobs = (await readFile(argAfter(args, "--input"), "utf8")).trim().split("\n").map(JSON.parse);
+        const jobDir = path.join(argAfter(args, "--output-dir"), jobs[0].id);
+        await mkdir(jobDir, { recursive: true });
+        await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({ state: "completed" }));
+        await writeFile(path.join(jobDir, "response.md"), "Completed ChatGPT answer");
+        return {
+          code: null, spawnError: null, processError: new Error("Termination failed"),
+          childMayRun: true, pid: process.pid,
+        };
+      },
+    });
+    assert.equal(task.state, "needs_recovery");
+    assert.equal(task.children.chatgpt.state, "completed");
+    assert.equal(await readFile(task.children.chatgpt.resultPath, "utf8"), "Completed ChatGPT answer");
+    assert.equal(task.children.gemini.state, "interrupted_unknown");
+    assert.equal(task.children.gemini.childPid, process.pid);
+    await assert.rejects(
+      () => executeTask({ prompt: "Do not resend.", provider: "gemini", workspace: "repo" }, { home, store, skipPreflight: true }),
+      { code: "WORKSPACE_PROVIDER_LOCKED" },
+    );
   } finally {
     await rm(home, { recursive: true, force: true });
   }

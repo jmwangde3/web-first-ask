@@ -11,6 +11,7 @@ export function runProcess(command, args, {
   inherit = false,
   env = process.env,
   onSpawn,
+  onStdout,
   timeoutMs,
   killGraceMs = 5000,
   drainGraceMs = 1000,
@@ -20,10 +21,14 @@ export function runProcess(command, args, {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let spawned = false;
+    let exited = false;
+    let processError = null;
     let timedOut = false;
     let stdioDrainTimedOut = false;
     let timeoutHandle = null;
     let forceKillHandle = null;
+    let watchdogHandle = null;
     let drainHandle = null;
     let spawnCallback = Promise.resolve();
 
@@ -32,13 +37,29 @@ export function runProcess(command, args, {
       settled = true;
       if (timeoutHandle) clearTimeout(timeoutHandle);
       if (forceKillHandle) clearTimeout(forceKillHandle);
+      if (watchdogHandle) clearTimeout(watchdogHandle);
       if (drainHandle) clearTimeout(drainHandle);
-      resolve({ ...result, timedOut, stdioDrainTimedOut });
+      resolve({ ...result, processError, timedOut, stdioDrainTimedOut });
     };
 
-    const finishAfterSpawnCallback = async (code, signal) => {
+    const destroyPipes = () => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    };
+
+    const finishAfterSpawnCallback = async (code, signal, childMayRun = false) => {
       await spawnCallback;
-      finish({ code, signal, stdout, stderr, spawnError: null, pid: child.pid ?? null });
+      finish({ code, signal, stdout, stderr, spawnError: null, pid: child.pid ?? null, childMayRun });
+    };
+
+    const signalChild = (signal) => {
+      try {
+        if (!child.kill(signal) && !exited) {
+          processError ??= new Error(`Could not signal ask-bridge with ${signal}`);
+        }
+      } catch (error) {
+        processError ??= error;
+      }
     };
 
     try {
@@ -54,12 +75,14 @@ export function runProcess(command, args, {
     }
 
     child.once("spawn", () => {
-      spawnCallback = Promise.resolve(onSpawn?.(child.pid ?? null)).catch(() => {});
+      spawned = true;
+      spawnCallback = Promise.resolve().then(() => onSpawn?.(child.pid ?? null)).catch(() => {});
     });
 
     if (!inherit) {
       child.stdout?.on("data", (chunk) => {
         stdout = truncate(stdout + chunk.toString("utf8"), 200000);
+        onStdout?.(stdout);
       });
       child.stderr?.on("data", (chunk) => {
         stderr = truncate(stderr + chunk.toString("utf8"), 12000);
@@ -69,16 +92,31 @@ export function runProcess(command, args, {
     if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
       timeoutHandle = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
-        forceKillHandle = setTimeout(() => child.kill("SIGKILL"), killGraceMs);
+        signalChild("SIGTERM");
+        forceKillHandle = setTimeout(() => {
+          if (exited) return;
+          signalChild("SIGKILL");
+          watchdogHandle = setTimeout(() => {
+            if (exited) return;
+            processError ??= new Error("ask-bridge did not exit after the watchdog tried to stop it");
+            child.unref();
+            destroyPipes();
+            void finishAfterSpawnCallback(null, null, true);
+          }, 1000);
+        }, killGraceMs);
       }, timeoutMs);
     }
 
-    child.once("error", (error) => {
-      finish({ code: null, signal: null, stdout, stderr, spawnError: error, pid: child.pid ?? null });
+    child.on("error", (error) => {
+      if (spawned) {
+        processError ??= error;
+      } else {
+        finish({ code: null, signal: null, stdout, stderr, spawnError: error, pid: child.pid ?? null });
+      }
     });
 
     child.once("exit", (code, signal) => {
+      exited = true;
       // The main process has exited. Do not let inherited handles in a
       // descendant keep this CLI waiting forever for the later "close" event.
       if (timeoutHandle) {
@@ -89,11 +127,14 @@ export function runProcess(command, args, {
         clearTimeout(forceKillHandle);
         forceKillHandle = null;
       }
+      if (watchdogHandle) {
+        clearTimeout(watchdogHandle);
+        watchdogHandle = null;
+      }
 
       drainHandle = setTimeout(() => {
         stdioDrainTimedOut = true;
-        child.stdout?.destroy();
-        child.stderr?.destroy();
+        destroyPipes();
         void finishAfterSpawnCallback(code, signal);
       }, Math.max(0, drainGraceMs));
     });

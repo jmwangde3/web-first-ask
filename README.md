@@ -81,13 +81,13 @@ wfa ask --provider gemini --workspace my-repository --prompt "Review this error 
 Ask ChatGPT and Gemini **at the same time**:
 
 ```powershell
-wfa compare --providers chatgpt,gemini --workspace my-repository --prompt-file .\question.md
+wfa compare --providers 'chatgpt,gemini' --workspace my-repository --prompt-file .\question.md
 ```
 
 Include Claude too:
 
 ```powershell
-wfa compare --providers chatgpt,gemini,claude --workspace my-repository --prompt-file .\question.md
+wfa compare --providers 'chatgpt,gemini,claude' --workspace my-repository --prompt-file .\question.md
 ```
 
 Ask ChatGPT for complete modified code, attaching complete relevant source and test files:
@@ -105,14 +105,14 @@ Compare complete code implementations from ChatGPT and Gemini in parallel:
 
 ```powershell
 wfa code `
-  --providers chatgpt,gemini `
+  --providers 'chatgpt,gemini' `
   --workspace my-repository `
   --requirement "Implement the requested behavior. Return complete replacement contents for every changed file, not a plan or diff." `
   --file .\src\feature.js `
   --file .\test\feature.test.js
 ```
 
-For provider-specific model selection in a parallel run, use `--model-map chatgpt=<model>,gemini=<model>`. Reasoning-strength selection is intentionally not managed by WFA. `--download-images` enables downloading generated images; it is off by default.
+For provider-specific model selection in a parallel run, use `--model-map 'chatgpt=<model>,gemini=<model>'`. Reasoning-strength selection is intentionally not managed by WFA. `--download-images` enables downloading generated images; it is off by default.
 
 The answers are saved separately under the local data directory. Codex should read the returned files, review them, apply the chosen implementation, and run tests. `wfa` never writes provider-generated code into the target repository automatically.
 
@@ -133,6 +133,8 @@ The answers are saved separately under the local data directory. Codex should re
 | `wfa upstream update` | Run ask-bridge's official update command |
 
 Use `--json` for machine-readable summaries. Reuse `--request-id` only when recovering the **exact same logical request with identical prompt, providers, attachments and options**. A changed request must use a new request ID.
+
+`ask`, `compare` and `code` exit with 0 when all selected providers complete. An incomplete request exits with 1 and still prints its task summary, including any completed result files. Successful `status` and `list` lookups exit with 0 independently of the state they report.
 
 ## Multi-provider behavior
 
