@@ -1,0 +1,15 @@
+{
+  "askBridgePath": null,
+  "defaultProvider": "chatgpt",
+  "defaultTimeoutSeconds": 1200,
+  "maxTimeoutSeconds": 7200,
+  "defaultCompareProviders": [
+    "chatgpt",
+    "gemini"
+  ],
+  "maxConcurrency": 3,
+  "defaultReasoning": {
+    "chatgpt": "high"
+  },
+  "downloadImages": false
+}

@@ -1,0 +1,26 @@
+{
+  "name": "web-first-ask",
+  "version": "0.1.0",
+  "description": "A Codex-first CLI and Skill that delegates complete implementation work to ChatGPT and other web AI providers through ask-bridge.",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "engines": {
+    "node": "^20.19.0 || ^22.12.0 || >=23.0.0"
+  },
+  "bin": {
+    "wfa": "./bin/wfa.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check bin/wfa.js && node --check src/cli.js && node --check src/runner.js"
+  },
+  "keywords": [
+    "codex",
+    "chatgpt",
+    "ask-bridge",
+    "cli",
+    "agent-skill",
+    "multi-provider"
+  ]
+}
