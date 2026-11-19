@@ -10,7 +10,7 @@ description: Default web-first reasoning and complete-code delegation workflow f
 - **ChatGPT Web is the default reasoning and implementation partner** for nontrivial engineering work: requirements, root-cause analysis, technical decisions, architecture, debugging and code changes.
 - **Codex is the local execution owner**: inspect the actual repository, collect complete source evidence, call `wfa`, review returned code, edit local files, run tests, inspect diffs and report verified results.
 - Do not expose or configure an MCP server for this workflow. Call `wfa` directly as a local CLI.
-- Default provider is ChatGPT. ChatGPT reasoning defaults to `high` through web-first-ask configuration.
+- Default provider is ChatGPT. WFA does not set or change provider reasoning strength; the current setting in the provider web UI is used.
 - Do not delegate trivial one-line changes or tasks that need no meaningful reasoning.
 
 ## Mandatory behavior for code-design and implementation tasks

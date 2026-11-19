@@ -19,7 +19,7 @@ test("one CLI task runs ChatGPT and Gemini in parallel and persists independent 
     defaultTimeoutSeconds: 1200,
     maxTimeoutSeconds: 7200,
     maxConcurrency: 3,
-    defaultReasoning: { chatgpt: "high" },
+
     downloadImages: false,
   };
   try {
@@ -43,6 +43,8 @@ test("one CLI task runs ChatGPT and Gemini in parallel and persists independent 
         const jobs = (await readFile(inputFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
         assert.equal(jobs.length, 2);
         assert.equal(jobs[0].prompt, jobs[1].prompt);
+        assert.equal(Object.hasOwn(jobs[0], "reasoning"), false);
+        assert.equal(Object.hasOwn(jobs[1], "reasoning"), false);
         await Promise.all(jobs.map(async (job) => {
           const jobDir = path.join(outputDir, job.id);
           await mkdir(jobDir, { recursive: true });
@@ -91,7 +93,7 @@ test("request ID with changed content is rejected and ambiguous task blocks dupl
     defaultTimeoutSeconds: 1200,
     maxTimeoutSeconds: 7200,
     maxConcurrency: 3,
-    defaultReasoning: {},
+
     downloadImages: false,
   };
   try {

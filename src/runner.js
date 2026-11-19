@@ -55,16 +55,7 @@ export async function executeTask(input, dependencies = {}) {
   }
   const requestId = slug(input.requestId || uuid(), "request_id");
   const taskId = uuid();
-  const reasoningByProvider = {
-    ...config.defaultReasoning,
-    ...(input.reasoningByProvider ?? {}),
-  };
-  if (input.reasoning) {
-    if (providers.length !== 1) {
-      throw new WfaError("AMBIGUOUS_REASONING", "For multi-provider requests, use provider-specific reasoning settings rather than one shared --reasoning value.");
-    }
-    reasoningByProvider[providers[0]] = input.reasoning;
-  }
+
   const modelByProvider = input.modelByProvider ?? {};
   if (input.model) {
     if (providers.length !== 1) {
@@ -82,7 +73,7 @@ export async function executeTask(input, dependencies = {}) {
     options: {
       kind: input.kind ?? "ask",
       timeoutSeconds,
-      reasoningByProvider,
+
       modelByProvider,
       fresh: Boolean(input.fresh),
       downloadImages: Boolean(input.downloadImages ?? config.downloadImages),
@@ -132,7 +123,7 @@ export async function executeTask(input, dependencies = {}) {
       files,
       images,
       modelByProvider,
-      reasoningByProvider,
+
       downloadImages: Boolean(input.downloadImages ?? config.downloadImages),
     });
     const runDir = path.join(paths.runs, taskId);
@@ -243,6 +234,7 @@ export async function executeTask(input, dependencies = {}) {
   await store.transaction(({ tasks, sessions }) => {
     const current = tasks.tasks[task.taskId];
     current.processExitCode = processResult.code;
+    current.processStdioDrainTimedOut = Boolean(processResult.stdioDrainTimedOut);
     current.processSignal = processResult.signal;
     current.processTimedOut = Boolean(processResult.timedOut);
     current.childPid = null;

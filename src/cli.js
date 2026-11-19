@@ -141,8 +141,7 @@ Common options:
   --file <path>        Repeatable document/source attachment
   --image <path>       Repeatable image attachment (not supported by Gemini)
   --timeout <seconds>  Default 1200; maximum 7200
-  --reasoning <value>  Single-provider request only
-  --reasoning-map chatgpt=high,gemini=extended
+
   --model <name>       Single-provider request only
   --model-map chatgpt=<name>,gemini=<name>
   --context <text>     Additional code-generation context
@@ -205,6 +204,15 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.help) {
     help();
     return;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(options, "reasoning")
+    || Object.prototype.hasOwnProperty.call(options, "reasoning-map")
+  ) {
+    throw new WfaError(
+      "REASONING_DISABLED",
+      "Reasoning-strength selection is temporarily disabled. Remove --reasoning/--reasoning-map; WFA now uses each provider's current web UI setting.",
+    );
   }
   const home = getHomeDir();
   const config = await loadConfig(home);
@@ -306,7 +314,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (providers.length > 1) prompt = buildComparePrompt(prompt);
 
-  const reasoningByProvider = parseMap(options["reasoning-map"], "reasoning-map");
+
   const modelByProvider = parseMap(options["model-map"], "model-map");
 
   const result = await executeTask({
@@ -319,8 +327,7 @@ export async function main(argv = process.argv.slice(2)) {
     images,
     timeoutSeconds: options.timeout ? Number(options.timeout) : config.defaultTimeoutSeconds,
     concurrency: options.concurrency ? Number(options.concurrency) : undefined,
-    reasoning: options.reasoning,
-    reasoningByProvider,
+
     model: options.model,
     modelByProvider,
     requestId: options["request-id"],

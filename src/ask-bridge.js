@@ -13,6 +13,7 @@ export function runProcess(command, args, {
   onSpawn,
   timeoutMs,
   killGraceMs = 5000,
+  drainGraceMs = 1000,
 } = {}) {
   return new Promise((resolve) => {
     let child;
@@ -20,8 +21,10 @@ export function runProcess(command, args, {
     let stderr = "";
     let settled = false;
     let timedOut = false;
+    let stdioDrainTimedOut = false;
     let timeoutHandle = null;
     let forceKillHandle = null;
+    let drainHandle = null;
     let spawnCallback = Promise.resolve();
 
     const finish = (result) => {
@@ -29,7 +32,13 @@ export function runProcess(command, args, {
       settled = true;
       if (timeoutHandle) clearTimeout(timeoutHandle);
       if (forceKillHandle) clearTimeout(forceKillHandle);
-      resolve({ ...result, timedOut });
+      if (drainHandle) clearTimeout(drainHandle);
+      resolve({ ...result, timedOut, stdioDrainTimedOut });
+    };
+
+    const finishAfterSpawnCallback = async (code, signal) => {
+      await spawnCallback;
+      finish({ code, signal, stdout, stderr, spawnError: null, pid: child.pid ?? null });
     };
 
     try {
@@ -68,9 +77,35 @@ export function runProcess(command, args, {
     child.once("error", (error) => {
       finish({ code: null, signal: null, stdout, stderr, spawnError: error, pid: child.pid ?? null });
     });
-    child.once("close", async (code, signal) => {
-      await spawnCallback;
-      finish({ code, signal, stdout, stderr, spawnError: null, pid: child.pid ?? null });
+
+    child.once("exit", (code, signal) => {
+      // The main process has exited. Do not let inherited handles in a
+      // descendant keep this CLI waiting forever for the later "close" event.
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+      }
+      if (forceKillHandle) {
+        clearTimeout(forceKillHandle);
+        forceKillHandle = null;
+      }
+
+      drainHandle = setTimeout(() => {
+        stdioDrainTimedOut = true;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        void finishAfterSpawnCallback(code, signal);
+      }, Math.max(0, drainGraceMs));
+    });
+
+    child.once("close", (code, signal) => {
+      // Normally close follows exit after stdout/stderr are fully drained.
+      // If it arrives within the grace period, preserve the complete output.
+      if (drainHandle) {
+        clearTimeout(drainHandle);
+        drainHandle = null;
+      }
+      void finishAfterSpawnCallback(code, signal);
     });
   });
 }
