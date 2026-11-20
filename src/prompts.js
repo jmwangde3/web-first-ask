@@ -1,7 +1,7 @@
 export function buildCodePrompt({ requirement, filePaths, context = "", mode = "full-file" }) {
   const files = filePaths.map((file) => `- ${file}`).join("\n");
   if (mode === "spec") {
-    return `你是本地 Coding Agent 的技术设计负责人。请基于附件中的真实源码，输出可直接交给本地 Codex 执行的精确实施规格，而不是完整文件。
+    return `你是本地 Coding Agent 的技术设计负责人。请基于附件中的真实源码，输出可直接交给本地 Coding Agent 执行的精确实施规格，而不是完整文件。
 
 ## 需求目标
 ${requirement.trim()}

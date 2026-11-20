@@ -1,6 +1,6 @@
 ---
 name: web-first
-description: Default web-first reasoning and complete-code delegation workflow for Codex. Use ChatGPT Web through the local wfa CLI for nontrivial requirements, research, architecture, debugging and especially code design/implementation. Coding requests must ask ChatGPT for complete modified file contents, not a plan or diff-only response. Supports parallel ChatGPT/Gemini/Claude consultation and independent comparison.
+description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Use ChatGPT Web through the local wfa CLI for nontrivial requirements, research, architecture, debugging and especially code design/implementation. Coding requests must ask ChatGPT for complete modified file contents, not a plan or diff-only response. Supports parallel ChatGPT/Gemini/Claude consultation and independent comparison.
 ---
 
 # Web-First
@@ -8,7 +8,7 @@ description: Default web-first reasoning and complete-code delegation workflow f
 ## Core role split
 
 - **ChatGPT Web is the default reasoning and implementation partner** for nontrivial engineering work: requirements, root-cause analysis, technical decisions, architecture, debugging and code changes.
-- **Codex is the local execution owner**: inspect the actual repository, collect complete source evidence, call `wfa`, review returned code, edit local files, run tests, inspect diffs and report verified results.
+- **You (the local coding agent) are the execution owner**: inspect the actual repository, collect complete source evidence, call `wfa`, review returned code, edit local files, run tests, inspect diffs and report verified results.
 - Do not expose or configure an MCP server for this workflow. Call `wfa` directly as a local CLI.
 - Default provider is ChatGPT. WFA does not set or change provider reasoning strength; the current setting in the provider web UI is used.
 - Do not delegate trivial one-line changes or tasks that need no meaningful reasoning.
@@ -89,7 +89,7 @@ wfa code --providers 'chatgpt,gemini' --workspace <repository-key> `
   --file <complete-source-file> --file <focused-test-file>
 ```
 
-The same prompt and attachments are sent independently and concurrently. Each provider has its own conversation and result file. Do not send one provider's answer to another unless explicitly doing a second-round critique. Codex compares the results, identifies agreement and disagreement, selects or synthesizes the best implementation, then verifies it locally. Do not automatically fan out every routine task; avoid unnecessary provider cost.
+The same prompt and attachments are sent independently and concurrently. Each provider has its own conversation and result file. Do not send one provider's answer to another unless explicitly doing a second-round critique. The local agent compares the results, identifies agreement and disagreement, selects or synthesizes the best implementation, then verifies it locally. Do not automatically fan out every routine task; avoid unnecessary provider cost.
 
 Default comparison set is ChatGPT + Gemini. Claude is available when explicitly selected:
 
@@ -120,7 +120,7 @@ wfa compare --providers 'chatgpt,gemini,claude' ...
 ## Trust and evidence
 
 - Provider answers are suggestions, not verified facts or test results.
-- Do not treat generated code as applied, compiled or tested until Codex has done so locally.
+- Do not treat generated code as applied, compiled or tested until you have done so locally.
 - For current public facts, verify authoritative sources when necessary; do not rely solely on a web provider's memory.
 - Keep sensitive local material out of provider requests.
 - Prefer one comprehensive request with complete relevant files over repeated short prompts that force the model to rediscover context.
@@ -128,7 +128,7 @@ wfa compare --providers 'chatgpt,gemini,claude' ...
 
 ## Context-efficient code workflow
 
-- Prefer `wfa code --file <directory> --exclude "<glob>"` over asking Codex to enumerate many files manually. Directory scans recurse and skip common generated/dependency folders.
+- Prefer `wfa code --file <directory> --exclude "<glob>"` over enumerating many files manually. Directory scans recurse and skip common generated/dependency folders.
 - `wfa code` line-numbers recognized text source by default. Use `--no-bundle-lines` only when separate raw source attachments are preferable.
 - Run `--dry-run` before sending a large context. Review the estimated size, secret findings and unscanned native/image attachments. The token figure is heuristic, not an exact provider count.
 - Use `--mode spec` for large refactors or files where complete-file output is likely to be wasteful; use `full-file` for small/medium changes that should be returned as complete files.
@@ -143,4 +143,4 @@ wfa compare --providers 'chatgpt,gemini,claude' ...
 - A verified result may be read while ask-bridge finishes batch cleanup, but the same workspace/provider remains locked until the owning process exits.
 - On `RATE_LIMITED`, `LOGIN_REQUIRED`, or `CLOUDFLARE_BLOCKED`, follow the displayed recovery hint. WFA never automatically resends an uncertain request.
 - Use `wfa result` to inspect output. `wfa stage` is non-destructive. `wfa apply --confirm` is the only path that writes staged complete files into the workspace; review `git diff` and run tests afterward.
-- `spec` results are instructions for local Codex and cannot be staged as full-file replacements.
+- `spec` results are instructions for the local coding agent and cannot be staged as full-file replacements.
