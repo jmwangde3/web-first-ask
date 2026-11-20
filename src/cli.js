@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Store } from "./store.js";
 import { getHomeDir } from "./paths.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, saveBrowserMode } from "./config.js";
 import { executeTask, refreshTask } from "./runner.js";
 import { collectTask, listTasks, abandonProvider, waitForTask } from "./recovery.js";
 import { checkAskBridge, resolveAskBridge, runProcess } from "./ask-bridge.js";
@@ -146,6 +146,7 @@ Commands:
   wfa apply     Apply staged code only after explicit confirmation
   wfa resolve   Abandon an unresolved provider task after confirming it is no longer running
   wfa login     Log in to a provider through ask-bridge
+  wfa browser-mode [headless|headful]  Show or save the browser mode for batch tasks
   wfa doctor    Check Node.js and ask-bridge integration
   wfa install-skill  Install the web-first Skill into the Codex user Skills directory
   wfa upstream update  Update ask-bridge using its official updater
@@ -252,8 +253,23 @@ export async function main(argv = process.argv.slice(2)) {
     );
   }
   const home = getHomeDir();
-  const config = await loadConfig(home);
   const store = new Store(home);
+  if (command === "browser-mode") {
+    if (positional.length > 1 || Object.keys(options).length > 0) {
+      throw new WfaError("ARGUMENT_ERROR", "Usage: wfa browser-mode [headless|headful]");
+    }
+    const [mode] = positional;
+    if (mode === undefined) {
+      const config = await loadConfig(home);
+      process.stdout.write(`${config.browserMode}\n`);
+      return;
+    }
+    await saveBrowserMode(store, mode);
+    process.stdout.write(`Saved browser mode: ${mode}\n`);
+    process.stdout.write("If ask-bridge is already running Chrome, wait for active tasks to finish and run `ask-bridge close` to use this mode on the next request.\n");
+    return;
+  }
+  const config = await loadConfig(home);
 
   if (command === "doctor") return doctor(config);
   if (command === "install-skill") return installSkill();

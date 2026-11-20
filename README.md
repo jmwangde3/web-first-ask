@@ -70,6 +70,16 @@ Only log in to the providers you intend to use.
 
 ## Basic use
 
+Set the default browser mode once. WFA saves the setting in its local `config.json` and uses it for subsequent `ask`, `compare`, and `code` tasks.
+
+```powershell
+wfa browser-mode           # Show the saved or default mode
+wfa browser-mode headful   # Show the Chrome window
+wfa browser-mode headless  # Run Chrome in the background (default)
+```
+
+ask-bridge can reuse an open Chrome instance. To switch an already running instance, wait for active tasks to finish and run `ask-bridge close`. The next request opens Chrome in the saved mode. `wfa login` opens a visible window for manual sign-in.
+
 Ask ChatGPT (default) and continue the stable workspace conversation:
 
 ```powershell
@@ -193,6 +203,7 @@ wfa apply <task-id> --provider chatgpt --confirm
 | `wfa resolve <task-id> --provider chatgpt --confirm` | Unlock an unresolved provider only after confirming its old generation is no longer active |
 | `wfa login --provider <provider>` | Interactive provider login |
 | `wfa doctor` | Check Node.js and ask-bridge batch availability |
+| `wfa browser-mode [headless\|headful]` | Show or save the default browser mode for batch tasks |
 | `wfa install-skill` | Install the single Codex Skill |
 | `wfa upstream update` | Run ask-bridge's official update command |
 

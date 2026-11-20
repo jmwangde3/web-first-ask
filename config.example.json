@@ -1,5 +1,6 @@
 {
   "askBridgePath": null,
+  "browserMode": "headless",
   "defaultProvider": "chatgpt",
   "defaultTimeoutSeconds": 1200,
   "maxTimeoutSeconds": 7200,

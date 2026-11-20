@@ -24,6 +24,31 @@ for (const [label, args] of deprecatedCases) {
   });
 }
 
+test("browser-mode persists across CLI processes and preserves other config fields", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-browser-mode-"));
+  try {
+    const bin = fileURLToPath(new URL("../bin/wfa.js", import.meta.url));
+    const options = { env: { ...process.env, WFA_HOME: home }, encoding: "utf8" };
+    const run = (...args) => spawnSync(process.execPath, [bin, "browser-mode", ...args], options);
+    const config = path.join(home, "config.json");
+    await writeFile(config, JSON.stringify({ defaultProvider: "gemini" }));
+
+    assert.equal(run().stdout.trim(), "headless");
+    assert.equal(run("headful").status, 0);
+    assert.equal(run().stdout.trim(), "headful");
+    assert.deepEqual(JSON.parse(await readFile(config, "utf8")), {
+      defaultProvider: "gemini",
+      browserMode: "headful",
+    });
+    assert.equal(run("invalid").status, 1);
+    assert.equal(run().stdout.trim(), "headful");
+    assert.equal(run("headless").status, 0);
+    assert.equal(run().stdout.trim(), "headless");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("compare replay returns nonzero for a partial batch without losing the successful result", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-cli-"));
   try {

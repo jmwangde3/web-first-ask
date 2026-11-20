@@ -487,6 +487,7 @@ export async function executeTask(input, dependencies = {}) {
   input.onTaskCreated?.(task);
   const args = [
     "--backend", "browser",
+    `--headless=${config.browserMode !== "headful"}`,
     "batch",
     "--input", task.inputFile,
     "--concurrency", String(task.concurrency),

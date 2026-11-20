@@ -37,6 +37,7 @@ test("one CLI task runs ChatGPT and Gemini in parallel and persists independent 
       skipPreflight: true,
       runProcess: async (_command, args, options) => {
         launches += 1;
+        assert.deepEqual(args.slice(0, 4), ["--backend", "browser", "--headless=true", "batch"]);
         await options.onSpawn?.(999999);
         const inputFile = argAfter(args, "--input");
         const outputDir = argAfter(args, "--output-dir");
