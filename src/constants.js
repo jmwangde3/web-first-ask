@@ -7,6 +7,9 @@ export const BLOCKING_STATES = new Set([
   "timed_out",
   "recoverable",
   "interrupted_unknown",
+  "rate_limited",
+  "login_required",
+  "cloudflare_blocked",
 ]);
 
 export const DEFAULT_CONFIG = Object.freeze({

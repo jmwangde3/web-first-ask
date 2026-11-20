@@ -7,10 +7,14 @@
 - Codex calls one local command and waits while `ask-bridge batch` performs its own browser-side polling.
 - ChatGPT is the default provider. WFA does not set or change provider reasoning strength; it uses the current setting in the provider web UI.
 - `wfa compare` sends the same prompt and attachments to multiple providers concurrently, then saves each answer separately.
-- `wfa code` asks for **complete replacement contents of changed files**, not an implementation plan or diff-only response.
-- A local task ledger records request IDs, provider states, conversation URLs and result paths.
+- `wfa code` defaults to a path-and-line-numbered source bundle and asks for **complete replacement contents**; `--mode spec` switches to a compact implementation specification.
+- Directory recursion, quoted glob patterns, exclusions, image attachments and native document attachments are built into the CLI.
+- `--dry-run` previews prompt/attachment size, estimated tokens and likely secret locations without creating a task or launching a provider.
+- A local task ledger records request IDs, provider states, conversation URLs, parent-task lineage, revisions and result paths.
 - Uncertain sends are never automatically repeated. An unresolved provider/workspace is locked until the user collects or explicitly abandons the old task.
-- ask-bridge is not vendored. Update it independently with its official updater.
+- Results can be inspected and staged; writing staged code into the workspace requires an explicit `wfa apply --confirm` and SHA-256 revalidation.
+- WFA can continue an existing task conversation with `--followup`.
+- ask-bridge remains an external tool; WFA adds no runtime npm dependency.
 
 ## Architecture
 
@@ -96,9 +100,9 @@ Ask ChatGPT for complete modified code, attaching complete relevant source and t
 wfa code `
   --workspace my-repository `
   --requirement "Fix the race in task recovery. Preserve existing idempotency and add focused regression coverage." `
-  --file .\src\core\tasks.js `
-  --file .\src\core\locks.js `
-  --file .\test\tasks.test.js
+  --file .\src `
+  --file .\test `
+  --exclude "**/*.snap"
 ```
 
 Compare complete code implementations from ChatGPT and Gemini in parallel:
@@ -108,13 +112,67 @@ wfa code `
   --providers 'chatgpt,gemini' `
   --workspace my-repository `
   --requirement "Implement the requested behavior. Return complete replacement contents for every changed file, not a plan or diff." `
-  --file .\src\feature.js `
-  --file .\test\feature.test.js
+  --file .\src `
+  --file .\test `
+  --exclude "**/*.snap"
 ```
 
 For provider-specific model selection in a parallel run, use `--model-map 'chatgpt=<model>,gemini=<model>'`. Reasoning-strength selection is intentionally not managed by WFA. `--download-images` enables downloading generated images; it is off by default.
 
 The answers are saved separately under the local data directory. Codex should read the returned files, review them, apply the chosen implementation, and run tests. `wfa` never writes provider-generated code into the target repository automatically.
+
+## Context packaging and attachments
+
+- `--file <path>` accepts a file, a directory, or a quoted glob. Directories recurse.
+- `--dir <path>` is an explicit recursive-directory alias.
+- `--exclude <glob>` can be repeated. A leading `!` on an include value also treats it as an exclusion.
+- Supported glob operators are `*`, `?`, `**`, and `{a,b}`. A pattern without `/` also matches basenames.
+- Directory scans skip `.git`, `node_modules`, `.wfa`, common build/cache folders, and credential-like filenames by default.
+- Images (`png`, `jpg/jpeg`, `webp`, `gif`, `bmp`, `tif/tiff`, `avif`) are routed as image attachments. If a directory contains images, they are detected automatically. Gemini image attachments are rejected before launch because the current ask-bridge batch contract does not support them.
+- Common source files and native documents (`pdf`, `doc/docx`, `xls/xlsx`, `ppt/pptx`, `odt/ods/odp`, `rtf`, `csv`, Markdown and text) are attached without flattening binary document formats into text.
+- `wfa code` bundles text source by default. The bundle uses `relative/path:line | source text`; native documents and images stay as separate files.
+
+Preview before sending:
+
+```powershell
+wfa code --requirement "Review this module for race conditions." --file .\src --exclude "**/*.snap" --dry-run
+```
+
+The preview's token count is a rough byte/4 heuristic, not the provider's tokenizer. The secret scanner reports file/line/kind but never prints matched values. It cannot inspect binary documents or image contents. A positive finding blocks sending unless you explicitly pass `--allow-sensitive`; WFA does not silently rewrite or redact source files.
+
+## Briefs and follow-up lineage
+
+Create a project brief using handoff-kb and save it as UTF-8 without BOM at `.wfa/active-brief.md`:
+
+```powershell
+.\scripts\make-active-brief.ps1 -Target . -Task "Current task summary" -KbRoot "$HOME\.skills-manager\skills\handoff-kb"
+```
+
+WFA auto-injects it only when a provider is starting a new workspace conversation or when `--fresh`/`--new-session` is used. Existing conversations do not receive the same brief every turn. Use `--brief-file <path>` for an explicit one-off injection, or `--no-brief` to disable automatic discovery.
+
+Continue a completed WFA task's exact provider conversation:
+
+```powershell
+wfa ask --provider chatgpt --workspace my-repository --followup <parent-task-id> --prompt "Continue with the second issue."
+```
+
+This sends a new follow-up turn to the saved conversation; it does not re-submit the parent prompt or attach the parent response as a duplicate prompt. The provider may still count the conversation history as input context for the new turn.
+
+## Result review and safe application
+
+```powershell
+wfa result <task-id> --provider chatgpt
+wfa result <task-id> --provider chatgpt --stdout
+wfa stage <task-id> --provider chatgpt
+wfa apply <task-id> --provider chatgpt
+wfa apply <task-id> --provider chatgpt --confirm
+```
+
+`wfa stage` only creates a local staging copy and manifest. `wfa apply` without `--confirm` is preview-only. Confirmation rechecks the provider result SHA-256, staged-file hashes, target-file hashes, workspace containment and symlink boundaries. Spec-mode results cannot be applied as complete files. WFA never runs git add/commit and never applies code automatically on task completion.
+
+## Provider errors and recovery
+
+`RATE_LIMITED`, `LOGIN_REQUIRED`, and `CLOUDFLARE_BLOCKED` are distinct actionable states. WFA shows a cooldown estimate or login/verification hint, but does not automatically retry or unlock an uncertain task. Inspect the task, reattach/collect if a response exists, or use explicit `wfa resolve --confirm` only after verifying the original generation is no longer active.
 
 ## Commands
 
@@ -122,10 +180,16 @@ The answers are saved separately under the local data directory. Codex should re
 |---|---|
 | `wfa ask` | One provider; ChatGPT by default |
 | `wfa compare` | Same prompt to multiple providers concurrently |
-| `wfa code` | Build a strict full-file implementation prompt |
+| `wfa code` | Build a line-numbered full-file or compact spec implementation prompt |
+| `wfa wait <task-id>` | Observe task state; adopts only verified ask-bridge terminal artifacts and never resends |
+| `wfa attach <task-id>` | Read-only reattachment to a saved task ID |
+| `wfa result <task-id>` | Read a saved provider result |
+| `wfa stage <task-id>` | Create a non-destructive code staging preview |
+| `wfa apply <task-id> --confirm` | Apply a reviewed staging manifest after hash revalidation |
 | `wfa status <task-id>` | Inspect task and recoverable provider states |
 | `wfa list` | List recent tasks |
-| `wfa collect <task-id> --provider chatgpt --confirm-complete` | Read the latest response from a conversation after you independently confirmed generation is complete |
+| `wfa collect <task-id> --provider chatgpt` | Return an already verified/saved result; no extra confirmation or browser request |
+| `wfa collect <task-id> --provider chatgpt --confirm-complete` | Manual recovery via `ask-bridge get` only when no trusted terminal batch artifact exists |
 | `wfa resolve <task-id> --provider chatgpt --confirm` | Unlock an unresolved provider only after confirming its old generation is no longer active |
 | `wfa login --provider <provider>` | Interactive provider login |
 | `wfa doctor` | Check Node.js and ask-bridge batch availability |
@@ -164,7 +228,9 @@ The directory contains prompts, task metadata, provider results, batch input and
 - `timed_out`, `recoverable`, interrupted and ambiguous states are not resent automatically.
 - A local process watchdog allows the ask-bridge per-job timeout plus a 3-minute cleanup margin; if the watchdog fires, the task remains unresolved unless completed artifacts can be verified.
 - The same workspace/provider is locked while a previous task is unresolved.
-- `collect` requires `--confirm-complete`; ask-bridge `get` reads the latest message but does not itself prove generation has finished.
+- Ask-bridge batch completion is trusted only when `metadata.json` has the exact expected job ID and provider, `state: completed`, and a stable, non-empty UTF-8 `response.md`. WFA records hashes for both artifacts and verifies them again before reading or staging the result.
+- `wfa collect` returns a verified batch result idempotently without `--confirm-complete` and without calling `ask-bridge get`. The flag remains required only for manual recovery when no trusted terminal artifact exists, because `ask-bridge get` alone cannot prove generation has finished.
+- A completed per-provider result may be read while ask-bridge finishes batch cleanup, but the workspace/provider lock remains active until the owning process exits.
 - `resolve` requires `--confirm`; use it only after confirming the old generation has stopped.
 - Provider output is untrusted input. Codex must validate code, run tests and inspect actual diffs before accepting it.
 
@@ -182,3 +248,21 @@ npm run check
 ```
 
 No runtime npm dependencies are required. CI runs Node's built-in test runner on Windows and Ubuntu.
+
+## Detached tasks and safe reattachment
+
+Use `wfa ask --detach ...` to start ask-bridge with task-specific stdout/stderr logs and return the task ID after the OS confirms launch. The task ID and original request ID are persisted; detached work is never auto-resubmitted.
+
+```powershell
+wfa ask --workspace my-repository --prompt "Review the design" --detach
+wfa wait <task-id> --timeout 300
+wfa attach <task-id> --timeout 0
+# Return the saved result; verified batch terminal metadata needs no extra confirmation:
+wfa collect <task-id> --provider chatgpt
+# Only for manual recovery when there is no trusted terminal artifact:
+wfa collect <task-id> --provider chatgpt --confirm-complete
+```
+
+`wait` and `attach` do not call `ask-bridge get`, do not infer completion from repeated text, and never resend a task. They automatically adopt a per-provider result only when ask-bridge has atomically written matching terminal metadata (`id`, `provider`, `state: completed`) after the non-empty `response.md` artifact. WFA records and rechecks both artifact hashes. For completed full-file code results, `wfa wait <task-id> --stage` can create a non-destructive staging copy; only `wfa apply --confirm` writes code to the workspace.
+
+If the detached process exits without trustworthy metadata and response.md, the task remains `interrupted_unknown` and is **not** automatically retried or collected. Use `wfa status` and inspect the saved browser conversation. `--confirm-complete` is available for this explicit manual recovery path. No external session-manager dependency is required.

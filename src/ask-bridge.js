@@ -1,6 +1,47 @@
 import { spawn } from "node:child_process";
+import { open } from "node:fs/promises";
 import { WfaError } from "./errors.js";
 import { truncate } from "./util.js";
+
+export async function spawnDetached(command, args, {
+  cwd,
+  env = process.env,
+  stdoutPath,
+  stderrPath,
+} = {}) {
+  if (!stdoutPath || !stderrPath) {
+    throw new WfaError("DETACH_LOG_PATH_REQUIRED", "Detached execution needs task-scoped stdout/stderr log paths.");
+  }
+  let stdout = null;
+  let stderr = null;
+  let child = null;
+  try {
+    stdout = await open(stdoutPath, "wx", 0o600);
+    stderr = await open(stderrPath, "wx", 0o600);
+    child = spawn(command, args, {
+      cwd,
+      env,
+      detached: true,
+      windowsHide: true,
+      stdio: ["ignore", stdout.fd, stderr.fd],
+    });
+    await new Promise((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    if (!Number.isInteger(child.pid) || child.pid <= 0) {
+      throw new WfaError("DETACHED_SPAWN_UNCONFIRMED", "ask-bridge did not provide a valid launched PID.");
+    }
+    // The detached child owns the saved task logs; errors after the confirmed
+    // spawn are visible as incomplete metadata, not a signal to resend.
+    child.on("error", () => {});
+    child.unref();
+    return { pid: child.pid };
+  } finally {
+    await stdout?.close().catch(() => {});
+    await stderr?.close().catch(() => {});
+  }
+}
 
 export function resolveAskBridge(config = {}, env = process.env) {
   return env.ASK_BRIDGE_BIN || config.askBridgePath || (process.platform === "win32" ? "ask-bridge.exe" : "ask-bridge");
@@ -12,6 +53,7 @@ export function runProcess(command, args, {
   env = process.env,
   onSpawn,
   onStdout,
+  input,
   timeoutMs,
   killGraceMs = 5000,
   drainGraceMs = 1000,
@@ -67,7 +109,7 @@ export function runProcess(command, args, {
         cwd,
         env,
         windowsHide: !inherit,
-        stdio: inherit ? "inherit" : ["ignore", "pipe", "pipe"],
+        stdio: inherit ? (input === undefined ? "inherit" : ["pipe", "inherit", "inherit"]) : [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       });
     } catch (error) {
       finish({ code: null, signal: null, stdout, stderr, spawnError: error });
@@ -76,6 +118,7 @@ export function runProcess(command, args, {
 
     child.once("spawn", () => {
       spawned = true;
+      if (input !== undefined && child.stdin) child.stdin.end(String(input), "utf8");
       spawnCallback = Promise.resolve().then(() => onSpawn?.(child.pid ?? null)).catch(() => {});
     });
 

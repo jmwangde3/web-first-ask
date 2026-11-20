@@ -57,3 +57,13 @@ test("failure to signal a spawned process is not classified as a spawn failure",
     }
   }
 });
+
+
+test("runProcess can provide a prompt on stdin while capturing streamed output", async () => {
+  const result = await runProcess(process.execPath, ["-e", "process.stdin.setEncoding('utf8');let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>process.stdout.write('received:'+s));"], {
+    input: "provider-stdin-prompt",
+    timeoutMs: 5000,
+  });
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, "received:provider-stdin-prompt");
+});

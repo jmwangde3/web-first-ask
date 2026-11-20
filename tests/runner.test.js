@@ -130,7 +130,7 @@ test("request ID with changed content is rejected and ambiguous task blocks dupl
       providers: ["chatgpt"],
       workspace: "sample-repo",
       requestId: "new-id",
-    }, { home, store, config, skipPreflight: true }), /unresolved chatgpt task/);
+    }, { home, store, config, skipPreflight: true }), /locked by chatgpt task/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -140,18 +140,21 @@ test("status preserves the current legacy session and an already collected resul
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-status-"));
   try {
     const store = new Store(home);
-    const outputDir = path.join(home, "batch");
+    const runDir = path.join(home, "old-run");
+    const outputDir = path.join(runDir, "ask-bridge-output");
     const jobDir = path.join(outputDir, "old-job");
     const oldUrl = "https://chatgpt.com/c/old";
     const newUrl = "https://chatgpt.com/c/new";
     const recoveredPath = path.join(home, "recovered.md");
     await mkdir(jobDir, { recursive: true });
-    await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({ state: "completed", threadUrl: oldUrl }));
+    await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({
+      id: "old-job", provider: "chatgpt", state: "completed", threadUrl: oldUrl, error: null,
+    }));
     await writeFile(path.join(jobDir, "response.md"), "Old batch response");
     await writeFile(recoveredPath, "Verified recovered response");
     await store.transaction(({ tasks, sessions }) => {
       tasks.tasks.old = {
-        taskId: "old", workspace: "repo", outputDir, createdAt: "2026-01-01T00:00:00Z",
+        taskId: "old", workspace: "repo", runDir, outputDir, createdAt: "2026-01-01T00:00:00Z",
         children: {
           chatgpt: { provider: "chatgpt", jobId: "old-job", state: "completed", threadUrl: oldUrl, resultPath: recoveredPath },
         },
@@ -197,7 +200,10 @@ test("a post-launch process error preserves a finished result and keeps the unce
         const jobs = (await readFile(argAfter(args, "--input"), "utf8")).trim().split("\n").map(JSON.parse);
         const jobDir = path.join(argAfter(args, "--output-dir"), jobs[0].id);
         await mkdir(jobDir, { recursive: true });
-        await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({ state: "completed" }));
+        await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({
+          id: jobs[0].id, provider: jobs[0].provider, state: "completed",
+          threadUrl: "https://chatgpt.com/c/completed", error: null,
+        }));
         await writeFile(path.join(jobDir, "response.md"), "Completed ChatGPT answer");
         return {
           code: null, spawnError: null, processError: new Error("Termination failed"),
@@ -214,6 +220,52 @@ test("a post-launch process error preserves a finished result and keeps the unce
       () => executeTask({ prompt: "Do not resend.", provider: "gemini", workspace: "repo" }, { home, store, skipPreflight: true }),
       { code: "WORKSPACE_PROVIDER_LOCKED" },
     );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("new task reconciles a stale completed-task cleanup lock before checking workspace/provider locks", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-stale-execution-lock-"));
+  const store = new Store(home);
+  const runDir = path.join(home, "runs", "old-task");
+  const outputDir = path.join(runDir, "ask-bridge-output");
+  const savedResult = path.join(runDir, "saved.md");
+  try {
+    await mkdir(runDir, { recursive: true });
+    await writeFile(savedResult, "old completed result");
+    await store.transaction(({ tasks }) => {
+      tasks.tasks["old-task"] = {
+        taskId: "old-task", workspace: "repo", workspaceRoot: home, runDir, outputDir,
+        state: "completed", executionPending: true, childPid: 2147483000, parentPid: null,
+        children: { chatgpt: {
+          provider: "chatgpt", jobId: "old-job", state: "completed",
+          resultPath: savedResult, threadUrl: "https://chatgpt.com/c/old", revision: 2,
+        } },
+      };
+    });
+    let launches = 0;
+    const result = await executeTask({
+      prompt: "Start the next independent request.", provider: "chatgpt", workspace: "repo",
+    }, {
+      home, store, skipPreflight: true,
+      runProcess: async (_command, args) => {
+        launches += 1;
+        const input = (await readFile(argAfter(args, "--input"), "utf8")).trim();
+        const job = JSON.parse(input);
+        const jobDir = path.join(argAfter(args, "--output-dir"), job.id);
+        await mkdir(jobDir, { recursive: true });
+        await writeFile(path.join(jobDir, "response.md"), "new answer");
+        await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({
+          id: job.id, provider: job.provider, state: "completed",
+          threadUrl: "https://chatgpt.com/c/new", elapsedSeconds: 1, error: null,
+        }));
+        return { code: 0, signal: null, stdout: "Completed", stderr: "", spawnError: null };
+      },
+    });
+    assert.equal(launches, 1);
+    assert.equal(result.task.state, "completed");
+    assert.equal((await store.snapshot()).tasks.tasks["old-task"].executionPending, false);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

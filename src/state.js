@@ -13,19 +13,38 @@ export function summarizeTask(task) {
     state = "abandoned";
   } else if (states.length && states.every((value) => ["completed", "failed", "failed_before_start", "abandoned", "cancelled"].includes(value))) {
     state = states.some((value) => value === "completed") ? "partial" : "failed";
-  } else if (states.some((value) => ["timed_out", "recoverable", "interrupted_unknown", "failed"].includes(value))) {
+  } else if (states.some((value) => ["timed_out", "recoverable", "interrupted_unknown", "failed", "rate_limited", "login_required", "cloudflare_blocked"].includes(value))) {
     state = "needs_recovery";
   }
   return { ...task, state, children: task.children };
 }
 
 export function workspaceHasBlockingTask(tasks, workspace, providers, exceptTaskId = null) {
-  for (const task of Object.values(tasks)) {
-    if (task.taskId === exceptTaskId || task.workspace !== workspace) continue;
-    for (const provider of providers) {
-      if (isBlockingChild(task.children?.[provider])) {
-        return { taskId: task.taskId, provider, state: task.children[provider].state };
-      }
+  const ordered = Object.values(tasks)
+    .filter((task) => task.taskId !== exceptTaskId && task.workspace === workspace)
+    .reverse();
+  for (const provider of providers) {
+    const latest = ordered.find((task) => task.children?.[provider]);
+    const child = latest?.children?.[provider];
+    if (!latest || !child) continue;
+
+    const retryAt = child.errorCode === "RATE_LIMITED" && child.state !== "completed"
+      ? Date.parse(child.retryAfterAt ?? "")
+      : NaN;
+    if (Number.isFinite(retryAt) && retryAt > Date.now()) {
+      return {
+        taskId: latest.taskId,
+        provider,
+        state: child.state,
+        cooldownUntil: child.retryAfterAt,
+        cooldown: true,
+      };
+    }
+    if (latest.executionPending) {
+      return { taskId: latest.taskId, provider, state: "execution_pending", childState: child.state, executionPending: true };
+    }
+    if (isBlockingChild(child)) {
+      return { taskId: latest.taskId, provider, state: child.state };
     }
   }
   return null;

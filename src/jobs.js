@@ -19,6 +19,7 @@ export function buildJobs({
   taskId,
   providers,
   prompt,
+  promptByProvider = {},
   timeoutSeconds,
   sessions = {},
   fresh = false,
@@ -36,7 +37,7 @@ export function buildJobs({
     const job = {
       id: `wfa-${provider}-${suffix}`,
       provider,
-      prompt,
+      prompt: promptByProvider[provider] ?? prompt,
       timeout: timeoutSeconds,
       files,
       images,

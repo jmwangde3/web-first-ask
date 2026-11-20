@@ -44,7 +44,11 @@ test("compare replay returns nonzero for a partial batch without losing the succ
           await mkdir(jobDir, { recursive: true });
           if (completed) await writeFile(path.join(jobDir, "response.md"), "Sample answer");
           await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({
+            id: job.id,
+            provider: job.provider,
             state: completed ? "completed" : "failed",
+            threadUrl: job.provider === "chatgpt" ? "https://chatgpt.com/c/cli-test" : "https://gemini.google.com/app/cli-test",
+            error: completed ? null : "synthetic failure",
           }));
         }
         return { code: 1, spawnError: null };
