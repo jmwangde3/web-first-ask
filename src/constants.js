@@ -14,6 +14,7 @@ export const BLOCKING_STATES = new Set([
 
 export const DEFAULT_CONFIG = Object.freeze({
   askBridgePath: null,
+  browserMode: "headless",
   defaultProvider: "chatgpt",
   defaultTimeoutSeconds: 1200,
   maxTimeoutSeconds: 7200,

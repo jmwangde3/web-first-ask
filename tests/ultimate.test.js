@@ -102,9 +102,11 @@ test("detached launch persists lineage and task log paths", async () => {
           threadUrl: "https://chatgpt.com/c/test-12345", resultPath: path.join(parentRunDir, "response.md") }} };
     });
     let launchOpts;
+    await writeFile(path.join(home, "config.json"), JSON.stringify({ browserMode: "headful" }));
     const output = await executeTask({ prompt: "Add tests", providers: ["chatgpt"],
       workspace: "demo", workspaceRoot: repo, followupTaskId: "parent", detach: true },
-    { home, store, skipPreflight: true, spawnDetached: async (_cmd, _args, opts) => {
+    { home, store, skipPreflight: true, spawnDetached: async (_cmd, args, opts) => {
+      assert.deepEqual(args.slice(0, 4), ["--backend", "browser", "--headless=false", "batch"]);
       launchOpts = opts; return { pid: 999999 };
     }});
     assert.equal(output.detached, true);
