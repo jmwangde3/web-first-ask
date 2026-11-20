@@ -104,9 +104,8 @@ wfa compare --providers 'chatgpt,gemini,claude' ...
 - A nonzero exit from `ask`, `compare` or `code` can still include completed provider results. Read the task summary and use successful result files before deciding how to recover the unfinished providers.
 - If the terminal tool returns while the process is still running, inspect `wfa status <task-id>` once when needed. If it is still running, do not submit again.
 - `timed_out`, `recoverable`, `interrupted_unknown` and ambiguous `failed` states may mean the prompt was already submitted. Never resend automatically.
-- If the provider finished but the batch ended before the result was collected, first independently confirm that generation is complete, then use:
-  `wfa collect <task-id> --provider <provider> --confirm-complete`
-- `wfa collect` calls ask-bridge `get`; it reads the latest message but does not establish that the provider has finished. The confirmation is therefore mandatory.
+- If ask-bridge writes matching terminal `completed` metadata and a complete `response.md`, WFA automatically adopts the saved result during task refresh. Use `wfa collect <task-id> --provider <provider>` to return that result without another browser request or confirmation.
+- If no trusted terminal artifact exists, `wfa collect --confirm-complete` uses ask-bridge `get` as a manual recovery path. Independently confirm in the browser that generation has stopped first, because `get` itself does not establish completion.
 - If the old generation is definitely no longer active and cannot be collected, unlock it only with:
   `wfa resolve <task-id> --provider <provider> --confirm`
 - Reuse the same `request_id` only for an identical request. A changed prompt or attachment set is a new logical request and needs a new request ID.
@@ -125,3 +124,23 @@ wfa compare --providers 'chatgpt,gemini,claude' ...
 - For current public facts, verify authoritative sources when necessary; do not rely solely on a web provider's memory.
 - Keep sensitive local material out of provider requests.
 - Prefer one comprehensive request with complete relevant files over repeated short prompts that force the model to rediscover context.
+
+
+## Context-efficient code workflow
+
+- Prefer `wfa code --file <directory> --exclude "<glob>"` over asking Codex to enumerate many files manually. Directory scans recurse and skip common generated/dependency folders.
+- `wfa code` line-numbers recognized text source by default. Use `--no-bundle-lines` only when separate raw source attachments are preferable.
+- Run `--dry-run` before sending a large context. Review the estimated size, secret findings and unscanned native/image attachments. The token figure is heuristic, not an exact provider count.
+- Use `--mode spec` for large refactors or files where complete-file output is likely to be wasteful; use `full-file` for small/medium changes that should be returned as complete files.
+- Keep native documents and images as native attachments; do not try to flatten PDF/Office binary files into a text source bundle.
+- Use `.wfa/active-brief.md` for project hot-state handoff. It is injected only for a new/fresh provider conversation. Use `--brief-file` for an explicit one-off brief.
+
+## Follow-up and recovery
+
+- For a completed WFA task, use `--followup <task-id>` to continue the same provider conversation. Do not copy the parent answer into the prompt again unless the task specifically needs a quoted excerpt.
+- Use `wfa wait <task-id>` or `wfa attach <task-id>` to observe a saved task without resending. They automatically adopt a result only when ask-bridge writes matching per-job `id`/`provider` metadata with `state: completed` after a stable, non-empty `response.md`. They never infer completion from repeated text or call `ask-bridge get`.
+- `wfa collect <task-id> --provider <provider>` returns an already verified result idempotently without another confirmation. Use `--confirm-complete` only for manual recovery when no trusted batch terminal artifact exists and you have independently confirmed in the browser that generation has stopped; `ask-bridge get` itself does not prove completion.
+- A verified result may be read while ask-bridge finishes batch cleanup, but the same workspace/provider remains locked until the owning process exits.
+- On `RATE_LIMITED`, `LOGIN_REQUIRED`, or `CLOUDFLARE_BLOCKED`, follow the displayed recovery hint. WFA never automatically resends an uncertain request.
+- Use `wfa result` to inspect output. `wfa stage` is non-destructive. `wfa apply --confirm` is the only path that writes staged complete files into the workspace; review `git diff` and run tests afterward.
+- `spec` results are instructions for local Codex and cannot be staged as full-file replacements.

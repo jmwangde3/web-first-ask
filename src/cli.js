@@ -6,21 +6,24 @@ import { Store } from "./store.js";
 import { getHomeDir } from "./paths.js";
 import { loadConfig } from "./config.js";
 import { executeTask, refreshTask } from "./runner.js";
-import { collectTask, listTasks, abandonProvider } from "./recovery.js";
+import { collectTask, listTasks, abandonProvider, waitForTask } from "./recovery.js";
 import { checkAskBridge, resolveAskBridge, runProcess } from "./ask-bridge.js";
 import { buildCodePrompt, buildComparePrompt } from "./prompts.js";
 import { normalizeProviders } from "./jobs.js";
 import { WfaError } from "./errors.js";
 import { updateAskBridge } from "./maintenance.js";
 import { truncate } from "./util.js";
+import { expandAttachmentInputs } from "./attachments.js";
+import { readTaskResult, stageTaskFiles, applyStagedFiles } from "./stage.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const VALUE_FLAGS = new Set([
   "provider", "providers", "workspace", "prompt", "prompt-file", "requirement",
   "file", "image", "timeout", "request-id", "concurrency", "reasoning",
   "reasoning-map", "model", "model-map", "context", "limit",
+  "mode", "brief-file", "followup", "dir", "exclude", "poll-ms",
 ]);
-const REPEAT_FLAGS = new Set(["file", "image"]);
+const REPEAT_FLAGS = new Set(["file", "image", "dir", "exclude"]);
 
 function parseArgs(argv) {
   const positional = [];
@@ -92,6 +95,11 @@ function printTask(task, json = false, replayed = false) {
     result: child.resultPath ?? null,
     thread: child.threadUrl ?? null,
     error: child.error ?? null,
+    errorCode: child.errorCode ?? null,
+    recoveryHint: child.recoveryHint ?? null,
+    autoCollected: child.completionProof?.source === "ask-bridge-batch-terminal",
+    retryAfterAt: child.retryAfterAt ?? null,
+    retryAfterEstimated: child.retryAfterEstimated ?? false,
   }]));
   const summary = {
     taskId: task.taskId,
@@ -99,6 +107,7 @@ function printTask(task, json = false, replayed = false) {
     workspace: task.workspace,
     kind: task.kind,
     state: task.state,
+    executionPending: Boolean(task.executionPending),
     replayed,
     providers: children,
   };
@@ -108,13 +117,16 @@ function printTask(task, json = false, replayed = false) {
   }
   process.stdout.write(`Task: ${task.taskId}${replayed ? " (existing request; not resent)" : ""}\n`);
   process.stdout.write(`Workspace: ${task.workspace}\nState: ${task.state}\n`);
+  if (task.executionPending) process.stdout.write("Execution cleanup: pending; completed results are readable but the workspace/provider lock remains active.\n");
   for (const [provider, child] of Object.entries(children)) {
     process.stdout.write(`- ${provider}: ${child.state}\n`);
     if (child.result) process.stdout.write(`  Result: ${child.result}\n`);
     if (child.thread) process.stdout.write(`  Conversation: ${child.thread}\n`);
+    if (child.errorCode) process.stdout.write(`  Error: ${child.errorCode}${child.retryAfterAt ? ` (retry after ${child.retryAfterAt}${child.retryAfterEstimated ? ", estimated" : ""})` : ""}\n`);
     if (child.error) process.stdout.write(`  Detail: ${truncate(child.error, 500)}\n`);
+    if (child.recoveryHint) process.stdout.write(`  Hint: ${child.recoveryHint}\n`);
   }
-  process.stdout.write("Use `wfa status <task-id>` to inspect or `wfa collect <task-id> --provider <provider> --confirm-complete` only after confirming generation has finished.\n");
+  process.stdout.write("Verified ask-bridge completed artifacts are collected automatically. Use `wfa collect <task-id> --provider <provider>` to retrieve the saved result; --confirm-complete is only for manual recovery when no trusted terminal artifact exists.\n");
 }
 
 function help() {
@@ -126,7 +138,12 @@ Commands:
   wfa code      Ask for complete replacement code for attached source files
   wfa status    Inspect a task by ID
   wfa list      List recent tasks
-  wfa collect   Collect a response after you have confirmed generation completed
+  wfa wait      Wait for a task; adopt verified results and optionally stage completed code
+  wfa attach    Reattach read-only to saved task status; never resubmit
+  wfa collect   Return a verified saved result; manual get requires --confirm-complete
+  wfa result    Read a saved provider result
+  wfa stage     Stage complete code files for review
+  wfa apply     Apply staged code only after explicit confirmation
   wfa resolve   Abandon an unresolved provider task after confirming it is no longer running
   wfa login     Log in to a provider through ask-bridge
   wfa doctor    Check Node.js and ask-bridge integration
@@ -138,8 +155,10 @@ Common options:
   --providers chatgpt,gemini[,claude]
   --workspace <stable-project-key>
   --prompt <text> | --prompt-file <path> | stdin
-  --file <path>        Repeatable document/source attachment
-  --image <path>       Repeatable image attachment (not supported by Gemini)
+  --file <path|glob|dir> Repeatable source/document attachment; directories recurse
+  --dir <path>         Alias for a recursive directory attachment
+  --image <path|glob>  Repeatable image attachment (not supported by Gemini)
+  --exclude <glob>     Repeatable exclusion pattern; !pattern on --file also excludes
   --timeout <seconds>  Default 1200; maximum 7200
 
   --model <name>       Single-provider request only
@@ -147,11 +166,25 @@ Common options:
   --context <text>     Additional code-generation context
   --download-images    Download generated images (off by default)
   --new-session        Do not reuse the saved workspace/provider conversation
+  --fresh              Alias for --new-session
+  --followup <id>      Continue a completed WFA task in its saved provider conversation
+  --mode full-file|spec Select complete-file delivery or compact implementation specification
+  --brief-file <path>  Inject a project handoff brief
+  --no-brief           Disable automatic .wfa/active-brief.md injection
+  --bundle-lines       Bundle text source files with exact path:line prefixes
+  --detach             Run ask-bridge in background with task-specific logs; never resend
+  --stage              Stage completed full-file code without applying it
+  --poll-ms <ms>       Polling interval for wait/attach (250..60000; default 2000)
+  --dry-run            Preview attachments, size, estimated tokens and secret findings
+  --allow-sensitive    Explicitly allow sending text flagged by the secret scanner
+  --no-bundle-lines     Disable the default source bundle for wfa code
   --request-id <id>    Reuse only to recover the exact same logical request
   --json               Print a compact machine-readable summary
 
 Code mode:
-  wfa code --requirement "..." --file src/a.js --file test/a.test.js --workspace repo-name
+  wfa code --requirement "..." --file src --exclude "**/*.snap" --workspace repo-name
+  wfa code --mode spec --requirement "..." --file "src/**/*.js"
+  --no-bundle-lines    Disable the default source bundle for wfa code
 
 Multi-provider:
   wfa compare --providers 'chatgpt,gemini' --prompt-file question.md --workspace repo-name
@@ -160,6 +193,7 @@ Multi-provider:
 Safety:
   A timed-out/recoverable/unknown task is never resent automatically.
   A provider/workspace remains locked until collect or explicit resolve.
+  Code results are staged first; wfa apply --confirm is required to modify the workspace.
 `);
 }
 
@@ -205,6 +239,9 @@ export async function main(argv = process.argv.slice(2)) {
     help();
     return;
   }
+  if (Object.prototype.hasOwnProperty.call(options, "engine")) {
+    throw new WfaError("UNSUPPORTED_ENGINE", "--engine is not supported. WFA uses ask-bridge only; no external engine is selected or invoked.");
+  }
   if (
     Object.prototype.hasOwnProperty.call(options, "reasoning")
     || Object.prototype.hasOwnProperty.call(options, "reasoning-map")
@@ -247,9 +284,42 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(`${options.json ? JSON.stringify(result, null, 2) : result.map((item) => `${item.taskId}  ${item.state.padEnd(16)} ${item.workspace}  ${Object.entries(item.providers).map(([p, s]) => `${p}:${s}`).join(" ")}`).join("\n")}\n`);
     return;
   }
+  if (command === "wait" || command === "attach") {
+    const taskId = positional[0];
+    if (!taskId) throw new WfaError("ARGUMENT_ERROR", `Usage: wfa ${command} <task-id> [--provider <provider>] [--timeout <seconds>] [--stage] [--json]`);
+    if (options["no-collect"]) throw new WfaError("ARGUMENT_ERROR", "--no-collect is obsolete: wait and attach never resend or invoke ask-bridge get.");
+    const timeoutSeconds = options.timeout === undefined ? 300 : Number(options.timeout);
+    const pollMs = options["poll-ms"] === undefined ? 2000 : Number(options["poll-ms"]);
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 7200) {
+      throw new WfaError("INVALID_TIMEOUT", "Wait timeout must be an integer from 0 to 7200 seconds.");
+    }
+    if (!Number.isInteger(pollMs) || pollMs < 250 || pollMs > 60000) {
+      throw new WfaError("INVALID_POLL_INTERVAL", "--poll-ms must be an integer from 250 to 60000.");
+    }
+    const result = await waitForTask(taskId, {
+      provider: options.provider,
+      timeoutSeconds,
+      pollMs,
+      stage: Boolean(options.stage),
+      home,
+      store,
+      config,
+    });
+    printTask(result.task, Boolean(options.json), false);
+    if (!options.json) {
+      for (const item of result.collected ?? []) {
+        process.stdout.write(`Auto-collected (${item.provider}) from verified ask-bridge terminal metadata: ${item.resultPath}\n`);
+      }
+      for (const s of result.staged ?? []) {
+        process.stdout.write(`Staged (${s.provider}): ${s.files?.length ?? 0} file(s) -> ${s.stageRoot}\n`);
+      }
+      if (result.task.executionPending) process.stdout.write("ask-bridge batch cleanup is still running; completed results are safe to read, but the workspace/provider lock remains until the process exits.\n");
+    }
+    return result.task.state === "completed" ? 0 : 1;
+  }
   if (command === "collect") {
     const taskId = positional[0];
-    if (!taskId) throw new WfaError("ARGUMENT_ERROR", "Usage: wfa collect <task-id> --provider <provider> --confirm-complete");
+    if (!taskId) throw new WfaError("ARGUMENT_ERROR", "Usage: wfa collect <task-id> --provider <provider> [--confirm-complete]");
     const result = await collectTask(taskId, {
       provider: options.provider,
       confirmComplete: Boolean(options["confirm-complete"]),
@@ -257,7 +327,40 @@ export async function main(argv = process.argv.slice(2)) {
       store,
       config,
     });
-    process.stdout.write(`Collected ${result.provider}: ${result.resultPath}\nTask state: ${result.task.state}\n`);
+    process.stdout.write(`${result.autoCollected ? "Auto-collected" : result.alreadyCollected ? "Result already saved" : "Manually collected"} (${result.provider}): ${result.resultPath}\nTask state: ${result.task.state}${result.executionPending ? " (batch cleanup pending; workspace remains locked)" : ""}\n`);
+    return;
+  }
+  if (command === "result") {
+    const taskId = positional[0];
+    if (!taskId) throw new WfaError("ARGUMENT_ERROR", "Usage: wfa result <task-id> --provider <provider> [--stdout]");
+    const result = await readTaskResult(taskId, { provider: options.provider, stdout: Boolean(options.stdout), home, store });
+    if (options.stdout) {
+      process.stdout.write(result.body);
+      if (!result.body.endsWith("\n")) process.stdout.write("\n");
+    } else {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    }
+    return;
+  }
+  if (command === "stage") {
+    const taskId = positional[0];
+    if (!taskId) throw new WfaError("ARGUMENT_ERROR", "Usage: wfa stage <task-id> --provider <provider>");
+    const result = await stageTaskFiles(taskId, { provider: options.provider, home, store });
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  if (command === "apply") {
+    const taskId = positional[0];
+    if (!taskId) throw new WfaError("ARGUMENT_ERROR", "Usage: wfa apply <task-id> --provider <provider> [--confirm]");
+    if (!options.confirm) {
+      const staged = await stageTaskFiles(taskId, { provider: options.provider, home, store });
+      const preview = await applyStagedFiles(taskId, { provider: options.provider, home, store });
+      process.stdout.write(`${JSON.stringify({ ...preview, staged }, null, 2)}\n`);
+      process.stdout.write("Preview only. Inspect the staged files, then run the same command with --confirm to apply.\n");
+      return;
+    }
+    const result = await applyStagedFiles(taskId, { provider: options.provider, confirm: true, home, store });
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return;
   }
   if (command === "resolve") {
@@ -276,19 +379,48 @@ export async function main(argv = process.argv.slice(2)) {
   let prompt = command === "code" && options.requirement
     ? (options["prompt-file"] ? await readPrompt({ "prompt-file": options["prompt-file"] }) : "")
     : await readPrompt(options);
-  const files = options.file ?? [];
-  const images = options.image ?? [];
+  const rawFiles = [...(options.file ?? []), ...(options.dir ?? [])];
+  const rawImages = options.image ?? [];
+  const expanded = rawFiles.length || rawImages.length
+    ? await expandAttachmentInputs({ files: rawFiles, images: rawImages, excludes: options.exclude ?? [], cwd: process.cwd() })
+    : { files: [], images: [] };
+  const files = expanded.files;
+  const images = expanded.images;
+  let mode = "full-file";
   if (command === "code") {
     const requirement = options.requirement || prompt;
     if (!requirement) throw new WfaError("ARGUMENT_ERROR", "wfa code requires --requirement or --prompt.");
-    if (!files.length) throw new WfaError("ARGUMENT_ERROR", "wfa code requires at least one complete source/test file via --file.");
+    if (!files.length) throw new WfaError("ARGUMENT_ERROR", "wfa code requires at least one source/test or native document via --file/--dir.");
+    mode = String(options.mode ?? "full-file").toLowerCase();
+    if (!["full-file", "spec"].includes(mode)) {
+      throw new WfaError("ARGUMENT_ERROR", `Invalid --mode "${mode}". Use "full-file" or "spec".`);
+    }
     prompt = buildCodePrompt({
       requirement,
-      filePaths: files.map((file) => path.relative(process.cwd(), path.resolve(file)) || path.basename(file)),
-      context: options.context ?? "",
+      filePaths: [...files, ...images].map((file) => {
+        const relative = path.relative(process.cwd(), path.resolve(file));
+        return (relative || path.basename(file)).split(path.sep).join("/");
+      }),
+      // --prompt can itself be the requirement. Do not repeat it in the
+      // supplementary context; that would waste provider input tokens.
+      context: [options.context, ...(options.requirement && prompt ? [prompt] : [])].filter(Boolean).join("\n\n"),
+      mode,
     });
   }
   if (!prompt) throw new WfaError("EMPTY_PROMPT", "Provide --prompt, --prompt-file, or pipe prompt text through stdin.");
+  if (options.stage && (command !== "code" || mode !== "full-file")) {
+    throw new WfaError("STAGE_REQUIRES_FULL_FILE", "--stage requires wfa code --mode full-file; spec and ordinary ask/compare results cannot be staged.");
+  }
+
+  let followupDefaultProviders = null;
+  if (options.followup && !options.providers && !options.provider ) {
+    const snap = await store.snapshot();
+    const parent = snap.tasks.tasks[options.followup];
+    if (parent?.providers?.length === 1) followupDefaultProviders = parent.providers;
+    if (parent?.providers?.length > 1) {
+      throw new WfaError("FOLLOWUP_PROVIDER_REQUIRED", `Parent task ${options.followup} has multiple providers. Specify exactly one --provider to continue a verified conversation.`);
+    }
+  }
 
   let providers;
   if (command === "compare") {
@@ -299,9 +431,9 @@ export async function main(argv = process.argv.slice(2)) {
   } else if (options.providers) {
     providers = normalizeProviders([options.providers], config.defaultCompareProviders);
   } else {
-    providers = normalizeProviders([options.provider], [config.defaultProvider]);
+    providers = normalizeProviders([options.provider], followupDefaultProviders ?? [config.defaultProvider]);
   }
-  if (providers.length > 1) prompt = buildComparePrompt(prompt);
+  if (providers.length > 1) prompt = buildComparePrompt(prompt, command === "code" ? mode : "full-file");
 
 
   const modelByProvider = parseMap(options["model-map"], "model-map");
@@ -314,19 +446,42 @@ export async function main(argv = process.argv.slice(2)) {
     workspace: defaultWorkspace(options.workspace),
     files,
     images,
+    workspaceRoot: process.cwd(),
+    bundleLines: command === "code"
+      ? options["no-bundle-lines"] !== true
+      : Boolean(options["bundle-lines"]),
+    dryRun: Boolean(options["dry-run"]),
+    allowSensitive: Boolean(options["allow-sensitive"]),
+    briefFile: options["brief-file"],
+    noBrief: Boolean(options["no-brief"]),
+    followupTaskId: options.followup,
+    detach: Boolean(options.detach),
+    mode,
     timeoutSeconds: options.timeout ? Number(options.timeout) : config.defaultTimeoutSeconds,
     concurrency: options.concurrency ? Number(options.concurrency) : undefined,
 
     model: options.model,
     modelByProvider,
     requestId: options["request-id"],
-    fresh: Boolean(options["new-session"]),
+    fresh: Boolean(options["new-session"] || options.fresh),
     downloadImages: options["download-images"] === undefined ? undefined : Boolean(options["download-images"]),
     onTaskCreated: (task) => {
-      process.stderr.write(`Started task ${task.taskId} (request ${task.requestId}); waiting inside one local CLI process.\n`);
+      process.stderr.write(`Started task ${task.taskId} (request ${task.requestId}); ${options.detach ? "detached ask-bridge process" : "waiting inside one local CLI process"}.\n`);
     },
   }, { home, store, config });
 
+  if (result.dryRun) {
+    process.stdout.write(`${JSON.stringify(result.preview, null, 2)}\n`);
+    return result.preview.sendBlocked ? 2 : 0;
+  }
+  if (options.stage && !result.detached && result.task.state === "completed") {
+    for (const p of Object.keys(result.task.children ?? {})) {
+      if (result.task.children[p]?.state === "completed" && result.task.children[p].resultPath) {
+        await stageTaskFiles(result.task.taskId, { provider: p, home, store });
+      }
+    }
+  }
   printTask(result.task, Boolean(options.json), Boolean(result.replayed));
+  if (result.detached) return 0;
   return result.task.state === "completed" ? 0 : 1;
 }
