@@ -5,6 +5,8 @@ import { runProcess } from "./ask-bridge.js";
 import { PolicyStore } from "./policy-store.js";
 import { WfaError } from "./errors.js";
 import { bundleRepository, repositoryBlock, resolveRepository } from "./repository.js";
+import { archiveRepository, repositoryArchiveBlock } from "./repository-archive.js";
+import { getPaths } from "./paths.js";
 
 function positiveInteger(value, label, allowZero = false) {
   const number = Number(value);
@@ -33,8 +35,15 @@ export async function executeTask(input, dependencies = {}) {
   }
   const stallTimeoutSeconds = positiveInteger(input.stallTimeoutSeconds ?? 300, "--stall-timeout", true);
   const sessionPolicy = input.followupTaskId || input.continueSession ? "continue" : "fresh";
-  const bundle = input.bundleRepo ? await bundleRepository({
+  const bundleMode = input.bundleRepoMode === "zip" ? "zip" : "inline";
+  const bundle = input.bundleRepo && bundleMode === "inline" ? await bundleRepository({
     cwd: workspaceRoot, excludes: input.repoExcludes ?? [], includes: input.files ?? [], prompt: input.prompt,
+  }) : null;
+  // A zip attachment carries the same sources as the inline bundle but travels
+  // as a native upload, so prompt truncation cannot corrupt it.
+  const archive = input.bundleRepo && bundleMode === "zip" ? await archiveRepository({
+    cwd: workspaceRoot, excludes: input.repoExcludes ?? [], prompt: input.prompt,
+    outDir: path.join(getPaths(dependencies.home).home, "archives"),
   }) : null;
   if (bundle && !bundle.stats.listed) {
     throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo found no eligible tracked files. Select paths with --file or adjust --exclude.");
@@ -42,8 +51,9 @@ export async function executeTask(input, dependencies = {}) {
   let prompt = input.prompt;
   // The inline bundle and the remote-reading contract are mutually exclusive.
   // In particular do not ask a bundled follow-up to return REPO_UNREADABLE.
-  if (repository.available && !bundle) prompt = `${repositoryBlock(repository)}\n\n${prompt}`;
+  if (repository.available && !bundle && !archive) prompt = `${repositoryBlock(repository)}\n\n${prompt}`;
   if (bundle) prompt += `\n\n${bundle.content}\nEND SOURCE BUNDLE`;
+  if (archive) prompt += `\n\n${repositoryArchiveBlock(archive, repository)}\n`;
   const store = dependencies.store instanceof PolicyStore ? dependencies.store : new PolicyStore(dependencies.home);
   store.intent = { sessionPolicy, followupTaskId: input.followupTaskId ?? null,
     stallTimeoutSeconds, repository, bundleRepo: Boolean(bundle) };
@@ -61,8 +71,8 @@ export async function executeTask(input, dependencies = {}) {
       ...input, prompt, workspaceRoot,
       fresh: sessionPolicy === "fresh",
       noBrief: Boolean(input.noBrief || (repository.available && !input.briefFile)),
-      files: bundle ? [] : input.files,
-      bundleLines: bundle ? false : input.bundleLines,
+      files: bundle ? [] : (archive ? [...(input.files ?? []), archive.file] : input.files),
+      bundleLines: bundle || archive ? false : input.bundleLines,
       sequentialBatches: true,
     }, {
       ...dependencies, store,
@@ -72,13 +82,14 @@ export async function executeTask(input, dependencies = {}) {
       result.preview.repository = repository;
       result.preview.repositoryWarnings = repository.warnings ?? [];
       result.preview.bundleRepo = bundle?.stats ?? null;
+      result.preview.repositoryArchive = archive?.stats ?? null;
       result.preview.sessionPolicy = sessionPolicy;
       result.preview.stallTimeoutSeconds = stallTimeoutSeconds;
     }
     return result;
   } catch (error) {
     if (bundle && error.code === "PROMPT_OVERSIZE") {
-      throw new WfaError("PROMPT_OVERSIZE", `${error.message} Narrow --bundle-repo with --file <path> and --exclude 'docs/**'; do not rely on --allow-oversize because upstream truncates prompts.`);
+      throw new WfaError("PROMPT_OVERSIZE", `${error.message} For a whole-repository request prefer --bundle-repo=zip, which attaches the sources instead of inlining them; otherwise narrow the bundle with --file <path> and --exclude 'docs/**'. Do not rely on --allow-oversize because upstream truncates prompt text.`);
     }
     throw error;
   } finally {

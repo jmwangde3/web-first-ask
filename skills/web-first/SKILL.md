@@ -7,7 +7,7 @@ description: Default web-first reasoning and complete-code delegation workflow f
 
 ## Core role split
 
-- **ChatGPT + Gemini are the default reasoning and implementation partners.** Every `wfa` call goes to both providers, serially, unless the user explicitly asks for one, or one provider is structurally unable to do the task (Gemini attachments — see Provider known limits).
+- **ChatGPT + Gemini are the default reasoning and implementation partners.** Every `wfa` call goes to both providers, serially, unless the user explicitly asks for one, or one provider is structurally unable to do the task (Gemini document attachments — see Provider known limits).
 - **You (the local coding agent) own execution only**: resolve the remote, write the requirement, apply what comes back, run tests, verify, commit. You do not pre-read the repository to build context and you do not reason the design through yourself when a provider can. Do not rewrite their answer from scratch.
 - **You submit a repository reference, not a dossier.** The default request is the requirement plus the URL/branch/commit that `wfa` resolves from the Git remote. Files, excerpts or a whole-repository bundle go out only when a provider asks for them (see Repository-first workflow).
 - Both providers receive the same prompt in one serial batch. Their answers are independent; compare them, take the stricter/safer variant on conflict, and discard any fragment that arrived corrupted.
@@ -31,7 +31,7 @@ Never spend local context assembling context the providers can obtain themselves
 
 1. **Default: send the reference.** Inside a Git repository with a remote, `wfa` injects a `REPOSITORY` block (https URL, branch, HEAD commit) into every provider prompt and both providers read the repository directly. Submit the requirement and nothing else.
 2. **`REPO_UNREADABLE` is not an answer.** If a provider replies `REPO_UNREADABLE`, `wfa` records `repoUnreadable` on that provider and prints the fallback command. Do not treat it as a completed result and do not paraphrase it into a conclusion.
-3. **Fallback: inline the tracked source.** Run the printed `wfa ask --followup <task-id> --bundle-repo …` command. The bundle is tracked UTF-8 source only, capped by the 40 KiB guard; if it exceeds the ceiling, narrow it with `--exclude` or `--file` instead of raising the limit.
+3. **Fallback: ship the tracked source as an archive.** Run the printed `wfa ask --followup <task-id> --bundle-repo=zip …` command. The archive holds tracked, non-sensitive source only and travels as a native attachment, so the 40 KiB prompt guard does not apply — a 60-file repository compresses to roughly 150 KB and uploads in seconds. Bare `--bundle-repo` keeps the older inline transport, where a prompt over 40 KiB must be narrowed with `--exclude` or `--file` rather than raised.
 4. **Later rounds: answer the question that was asked.** When a provider asks for a specific file or fact, send exactly that one thing with `--followup <task-id> --file <one-file>`. Never re-bundle, never resend the whole repository, never guess what it "probably" wanted.
 5. **No remote, or `--no-repo`:** fall back to explicit `--file`/`--dir` attachments as before.
 6. **When you cannot decide — ambiguous requirement, two providers disagreeing, a missing permission or credential — ask the user.** Do not guess and do not silently pick a side.
@@ -116,7 +116,7 @@ Multi-provider is the default, not an opt-in. `wfa` sends every request to ChatG
 Narrow to a single provider only when:
 
 - the user asks for one by name;
-- the task is structurally impossible for one of them (Gemini attachments — see Provider known limits);
+- the task is structurally impossible for one of them (Gemini document attachments — see Provider known limits);
 - you are continuing one provider's existing conversation with `--followup`, which is inherently single-provider.
 
 Do not narrow just to save time or tokens. The second answer is what catches a confident wrong answer, and that is the failure mode this workflow exists to prevent.
@@ -172,11 +172,11 @@ wfa ask --providers 'chatgpt,gemini,claude' ...
 
 Measured against ask-bridge 0.4.0; full evidence and reproductions are in `docs/known-issues.md` of the `web-first-ask` repository (U1–U10). Those are upstream defects — `wfa` detects and works around them, it does not fix them.
 
-- **Gemini attachments do not work.** Any `--file` request to Gemini fails after 50–60 s with `ATTACHMENT_UPLOAD_TIMEOUT`. `wfa` now inlines text attachments for Gemini automatically and refuses binary ones outright (`GEMINI_ATTACHMENT_UNSUPPORTED`); either way the inlined bytes count against the 40 KiB budget.
+- **Gemini document attachments do not work; archives do.** `--file` with a document (`.md`, `.txt`, `.pdf`, `.docx`, `.xlsx`) fails after 50–60 s with `ATTACHMENT_UPLOAD_TIMEOUT`, so `wfa` inlines text and refuses other binary documents (`GEMINI_ATTACHMENT_UNSUPPORTED`); inlined bytes count against the 40 KiB budget. Archives (`zip`, `tar`, `gz`, `tgz`, `7z`) upload normally — measured, a 132 KB zip arrived in 15 s — so use `--bundle-repo=zip` for whole-repository work with Gemini.
 - **Prompts over roughly 44 KiB are truncated without a signal.** This is the most dangerous failure mode: the answer looks normal and arrives faster. Always run `--dry-run` first and treat exit 2 as a stop sign.
 - **ChatGPT long answers may land in Canvas.** When the response is replaced by a download link plus a hash, `response.md` does not contain the artifact. Ask for smaller chunks, or request the content to be repeated inline in the chat.
 - **Gemini corrupts Markdown diffs.** `||` becomes `\vert{}\vert{}`, quoted variables get mangled and `diff --git` headers disappear. Never ask Gemini for a patch; ask for "file path + original block + replacement block" and apply it locally.
-- **Gemini often cannot read a public repository.** Measured today: a repository-first request came back as `REPO_UNREADABLE` in 12 seconds. That is a normal outcome, not a failure of the request — run the `--bundle-repo` fallback. Do not retry the same prompt hoping for a different result.
+- **Gemini often cannot read a public repository.** Measured today: a repository-first request came back as `REPO_UNREADABLE` in 12 seconds. That is a normal outcome, not a failure of the request — run the `--bundle-repo=zip` fallback. Do not inline a whole repository and do not retry the same prompt hoping for a different result.
 - **ChatGPT repository reading is slow, not broken.** A repository-first implementation request took 28 minutes and still finished. Do not kill it early; `--stall-timeout` only fires when the page goes completely silent.
 - **Do not assume provider-side session isolation.** See Session rules and `threadMismatch`.
 
@@ -193,9 +193,9 @@ Measured against ask-bridge 0.4.0; full evidence and reproductions are in `docs/
 
 - Prefer the repository reference over any attachment. `wfa code --requirement ...` is the whole command when a remote exists.
 - When you do need attachments, `wfa code --file <directory> --exclude "<glob>"` beats enumerating files by hand. Directory scans recurse and skip common generated/dependency folders.
-- `--bundle-repo` is the `REPO_UNREADABLE` fallback and nothing else. It enumerates tracked files, skips binary and generated content, and reports `{files, bytes, skipped}` in `--dry-run`.
+- `--bundle-repo` is the `REPO_UNREADABLE` fallback and nothing else. `--bundle-repo=zip` (preferred) packs tracked, non-sensitive files into a zip attachment and reports `repositoryArchive: {files, sourceBytes, archiveBytes, ratio, skipped}` in `--dry-run`. Bare `--bundle-repo` inlines a bounded selection and reports `bundle`.
 - Run `--dry-run` before sending a large context. Review `promptBytesByProvider`, `promptSizeRisk`, `estimatedTokens`, secret findings and unscanned native/image attachments. The token figure is heuristic, not an exact provider count.
-- Keep the prompt body at or below 40 KiB per provider. ask-bridge truncates silently at roughly 44 KiB — the provider answers from a partial prompt with no truncation signal, an exit code of 0 and a plausible-looking answer. A `--dry-run` above 40 KiB exits 2 on purpose; `--allow-oversize` is for a size you have measured and accepted, not for making the warning go away.
+- Keep the prompt **text** at or below 40 KiB per provider (attachments upload outside the prompt and are not capped). ask-bridge truncates prompt text silently at roughly 44 KiB — the provider answers from a partial prompt with no truncation signal, an exit code of 0 and a plausible-looking answer. A `--dry-run` above 40 KiB exits 2 on purpose; `--allow-oversize` is for a size you have measured and accepted, not for making the warning go away.
 - When a request legitimately needs more than 40 KiB, split it on file boundaries and state the cross-file contract in every part. Each part is a separate provider conversation, so conclusions that depend on files in another part must be verified locally rather than assumed.
 - Use `--mode spec` for large refactors or files where complete-file output is likely to be wasteful; use `full-file` for small/medium changes that should be returned as complete files.
 - Keep native documents and images as native attachments; do not try to flatten PDF/Office binary files into a text source bundle.

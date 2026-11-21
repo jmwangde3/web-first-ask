@@ -1,0 +1,206 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { crc32, deflateRawSync } from "node:zlib";
+import { WfaError } from "./errors.js";
+
+const exec = promisify(execFile);
+
+// Kept in sync with repository.js: the archive must ship exactly the files the
+// inline bundle would have shipped, so a task cannot see a different repository
+// depending on which transport it used.
+const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", ".cache", "vendor", "target", ".venv", "__pycache__"]);
+const SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|7z|rar|exe|dll|so|dylib|class|pyc|woff2?|ttf|otf|mp[34]|avi|mov|sqlite|db|bin|dat|lock)$/i;
+const SENSITIVE = /(?:^|\/)(?:\.env(?:\.|$)|\.npmrc|\.netrc|id_rsa|id_ed25519|credentials|secrets\.json|service-account\.json|[^/]*\.(?:pem|key|p12|pfx|keystore))/i;
+const MAX_ENTRIES = 60000;
+const MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024;
+
+async function git(cwd, ...args) {
+  const { stdout } = await exec("git", args, {
+    cwd, windowsHide: true, timeout: 10000, encoding: "buffer", maxBuffer: 64 * 1024 * 1024,
+  });
+  return Buffer.from(stdout).toString("utf8").trimEnd();
+}
+
+function matchesExclude(file, patterns) {
+  return patterns.some((pattern) => {
+    const p = String(pattern).replace(/\\/g, "/").replace(/^!/, "");
+    if (!p) return false;
+    const escaped = p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "\u0000")
+      .replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]").replace(/\u0000/g, ".*");
+    return new RegExp(`^(?:${escaped})(?:$|/)`).test(file)
+      || (!p.includes("/") && new RegExp(`(?:^|/)${escaped}$`).test(file));
+  });
+}
+
+export async function collectTrackedSources({ cwd = process.cwd(), excludes = [] } = {}) {
+  const root = await git(cwd, "rev-parse", "--show-toplevel").catch(() => null);
+  if (!root) throw new WfaError("BUNDLE_REPO_NOT_GIT", "--bundle-repo requires a Git working tree. Use --file <path> instead.");
+  const tracked = (await git(root, "ls-files", "-z", "--cached", "--exclude-standard")).split("\0").filter(Boolean);
+  const skipped = [];
+  const selected = [];
+  for (const relative of tracked) {
+    const label = relative.replace(/\\/g, "/");
+    let reason = null;
+    if (label.split("/").some((part) => SKIP_DIRS.has(part))) reason = "build/cache directory";
+    else if (SKIP_EXT.test(label)) reason = "binary or generated filename";
+    else if (SENSITIVE.test(label)) reason = "sensitive filename";
+    else if (matchesExclude(label, excludes)) reason = "matched --exclude";
+    if (reason) skipped.push({ path: label, reason });
+    else selected.push(relative);
+  }
+  return { root, selected, skipped };
+}
+
+function dosStamp(date) {
+  const time = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+  const day = ((Math.max(date.getFullYear(), 1980) - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return { time, day };
+}
+
+// Minimal ZIP writer: deflate each entry, fall back to store when compression
+// does not pay off. No external binary (no `zip` on Windows) and no zip64,
+// which is fine because the entry and size caps are well below the format
+// limits.
+export function buildZip(entries) {
+  const local = [];
+  const central = [];
+  let offset = 0;
+  const { time, day } = dosStamp(new Date());
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name.replace(/\\/g, "/"), "utf8");
+    const checksum = crc32(entry.data);
+    const deflated = deflateRawSync(entry.data, { level: 9 });
+    const stored = deflated.length >= entry.data.length;
+    const payload = stored ? entry.data : deflated;
+    const method = stored ? 0 : 8;
+
+    const header = Buffer.alloc(30);
+    header.writeUInt32LE(0x04034b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(0x0800, 6); // UTF-8 names
+    header.writeUInt16LE(method, 8);
+    header.writeUInt16LE(time, 10);
+    header.writeUInt16LE(day, 12);
+    header.writeUInt32LE(checksum, 14);
+    header.writeUInt32LE(payload.length, 18);
+    header.writeUInt32LE(entry.data.length, 22);
+    header.writeUInt16LE(name.length, 26);
+    header.writeUInt16LE(0, 28);
+    local.push(header, name, payload);
+
+    const directory = Buffer.alloc(46);
+    directory.writeUInt32LE(0x02014b50, 0);
+    directory.writeUInt16LE(20, 4);
+    directory.writeUInt16LE(20, 6);
+    directory.writeUInt16LE(0x0800, 8);
+    directory.writeUInt16LE(method, 10);
+    directory.writeUInt16LE(time, 12);
+    directory.writeUInt16LE(day, 14);
+    directory.writeUInt32LE(checksum, 16);
+    directory.writeUInt32LE(payload.length, 20);
+    directory.writeUInt32LE(entry.data.length, 24);
+    directory.writeUInt16LE(name.length, 28);
+    directory.writeUInt32LE(offset, 42);
+    central.push(directory, name);
+
+    offset += header.length + name.length + payload.length;
+  }
+  const directoryBytes = central.reduce((sum, chunk) => sum + chunk.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directoryBytes, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...local, ...central, end]);
+}
+
+async function pruneArchives(directory, keep) {
+  const names = await readdir(directory).catch(() => []);
+  const archives = [];
+  for (const name of names) {
+    if (!name.endsWith(".zip")) continue;
+    const info = await lstat(path.join(directory, name)).catch(() => null);
+    if (info?.isFile()) archives.push({ name, mtime: info.mtimeMs });
+  }
+  archives.sort((a, b) => b.mtime - a.mtime);
+  for (const stale of archives.slice(keep)) await rm(path.join(directory, stale.name), { force: true }).catch(() => {});
+}
+
+export async function archiveRepository({ cwd = process.cwd(), excludes = [], outDir, prompt = "",
+  maxFileBytes = 1024 * 1024, maxTotalBytes = 64 * 1024 * 1024, keepArchives = 5 } = {}) {  const { root, selected, skipped } = await collectTrackedSources({ cwd, excludes });
+  if (!selected.length) {
+    throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo=zip found no eligible tracked files. Select paths with --file or adjust --exclude.");
+  }
+  const taskText = String(prompt);
+  // Put the files the request names first so a size cap drops unrelated code
+  // rather than the sources the task is about.
+  const mentioned = [];
+  const rest = [];
+  for (const relative of selected) {
+    const base = path.posix.basename(relative);
+    if (taskText.includes(relative) || (base.length > 3 && taskText.includes(base))) mentioned.push(relative);
+    else rest.push(relative);
+  }
+  const entries = [];
+  let totalBytes = 0;
+  let uncompressed = 0;
+  for (const relative of [...mentioned, ...rest]) {
+    const absolute = path.resolve(root, relative);
+    const info = await lstat(absolute).catch(() => null);
+    if (!info?.isFile() || info.isSymbolicLink() || info.size > maxFileBytes) {
+      skipped.push({ path: relative, reason: info?.isSymbolicLink() ? "symbolic link" : "not a regular file or file-size cap" });
+      continue;
+    }
+    if (totalBytes + info.size > maxTotalBytes) {
+      skipped.push({ path: relative, reason: "archive budget" });
+      continue;
+    }
+    const data = await readFile(absolute).catch(() => null);
+    if (!data) { skipped.push({ path: relative, reason: "unreadable" }); continue; }
+    entries.push({ name: relative.replace(/\\/g, "/"), data });
+    totalBytes += data.length;
+    if (entries.length > MAX_ENTRIES) throw new WfaError("BUNDLE_REPO_TOO_LARGE", `--bundle-repo=zip selected more than ${MAX_ENTRIES} files. Narrow it with --file or --exclude.`);
+  }
+  if (!entries.length) {
+    throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo=zip found no readable tracked files. Select paths with --file or adjust --exclude.");
+  }
+  uncompressed = totalBytes;
+  const zip = buildZip(entries);
+  if (zip.length > MAX_ARCHIVE_BYTES) throw new WfaError("BUNDLE_REPO_TOO_LARGE", "--bundle-repo=zip produced an archive over 4 GiB.");
+  const directory = outDir ?? path.join(process.cwd(), ".wfa");
+  await mkdir(directory, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+  const slug = path.basename(root).replace(/[^A-Za-z0-9._-]/g, "_") || "repo";
+  const file = path.join(directory, `${slug}-${stamp}.zip`);
+  await writeFile(file, zip);
+  await pruneArchives(directory, keepArchives);
+  return {
+    file,
+    stats: {
+      files: entries.length,
+      listed: selected.length,
+      sourceBytes: uncompressed,
+      archiveBytes: zip.length,
+      ratio: uncompressed ? Number((zip.length / uncompressed).toFixed(3)) : 1,
+      skipped: skipped.length,
+    },
+    skipped,
+  };
+}
+
+export function repositoryArchiveBlock(archive, repository) {
+  const name = path.basename(archive.file);
+  const commit = repository?.commit ? ` at commit ${repository.commit}` : "";
+  const branch = repository?.branch ? ` (branch ${repository.branch})` : "";
+  return [
+    "REPOSITORY ARCHIVE",
+    `The attached file ${name} is a zip of this repository's tracked sources${commit}${branch}.`,
+    `It holds ${archive.stats.files} file(s), ${archive.stats.sourceBytes} bytes uncompressed. Paths inside the archive are repository-relative.`,
+    "Extract it and read the files you need from there. Do not wait for pasted files and do not try to fetch the repository over the network.",
+    "If a path you need is missing from the archive, name that exact path instead of guessing what it contains.",
+    "END REPOSITORY ARCHIVE",
+  ].join("\n");
+}

@@ -213,8 +213,7 @@ export function isSensitiveAttachmentPath(filePath) {
   return isSensitiveName(filePath);
 }
 
-export function isTextSourceAttachment(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
+export function isTextSourceAttachment(filePath) {  const ext = path.extname(filePath).toLowerCase();
   return new Set([
     ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
     ".py", ".pyi", ".ps1", ".psm1", ".psd1", ".cs", ".java", ".kt",
@@ -224,4 +223,13 @@ export function isTextSourceAttachment(filePath) {
     ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml",
     ".md", ".mdx", ".txt", ".rst", ".adoc", ".csv", ".tsv",
   ]).has(ext);
+}
+
+const ARCHIVE_EXTENSIONS = new Set([".zip", ".tar", ".gz", ".tgz", ".7z"]);
+
+// Archive files upload as ordinary attachments on both providers. The provider
+// only unpacks them, so no document parser is involved and the batch upload
+// path stays fast (measured: a 132 KB zip reached Gemini in 15s).
+export function isArchiveAttachment(filePath) {
+  return ARCHIVE_EXTENSIONS.has(path.extname(filePath).toLowerCase());
 }

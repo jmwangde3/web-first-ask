@@ -8,7 +8,7 @@
 
 | 编号 | 问题 | 级别 | wfa 侧现状 |
 | --- | --- | --- | --- |
-| U1 | Gemini 附件上传必然超时 | 阻断 | 文本自动内联，二进制提前拒绝 |
+| U1 | Gemini 文档附件上传超时（归档不受影响） | 阻断 | 归档原生上传；文本内联；文档类提前拒绝 |
 | U2 | prompt > 约 44 KiB 静默截断 | 阻断 | 40 KiB 拦截并给拆分计划 |
 | U3 | ChatGPT 长产物进 Canvas，`response.md` 只有链接 | 阻断 | 检测并警告 |
 | U4 | `--new-session` 复用旧会话 | 严重 | 比对 threadUrl 并警告 |
@@ -23,7 +23,9 @@
 
 ## U1 Gemini 附件上传必然超时
 
-**现象**：给 Gemini 带任意 `--file` 附件，50–54 秒后失败：
+> **2026-11-21 修正**：这条只对**需要解析的文档**（`.md` / `.txt` / `.pdf` / `.docx` / `.xlsx` 等）成立。**归档文件不受影响**：同一个 132 KB 的 `.zip` 通过 `ask-bridge --backend browser batch` 送达 Gemini 只用了 **15 秒**，回答正确说出「70 个条目，约 60 个文件」。所以 wfa 现在对 zip/tar/gz/tgz/7z 放行原生上传，只有文档类附件才内联或提前拒绝，整仓交付改走 `--bundle-repo=zip`。
+
+**现象**：给 Gemini 带需要解析的文档附件，50–54 秒后失败：
 
 ```
 Timed out waiting for Gemini to show attachment 'skein-source-bundle-191ae7c.md'   elapsed=54s
@@ -37,11 +39,11 @@ Timed out waiting for Gemini to show attachment 'source-bundle-e7430cb187f7.txt'
 wfa ask --provider gemini --prompt "读一下附件" --file note.md --timeout 300
 ```
 
-同内容内联进 prompt 就成功，说明与文件内容无关，是上传通道。
+同内容内联进 prompt 就成功，说明与文件内容无关，是上传/解析通道，不是附件体积。
 
 **期望**：上传控件选择器或完成判定已过期。要么修好，要么在上传阶段暴露可观察状态（开始/已选中/进度/UI 确认），失败时立刻报错，而不是干等 50 秒再抛一句 timeout。短期无法修时，元数据至少给 `attachmentState: not_started | uploading | attached | failed`。
 
-**影响**：Gemini 这一路完全不能用附件；只能走内联，而内联又会撞 U2。
+**影响**：Gemini 这一路的**文档**附件不可用，只能内联，而内联又会撞 U2；**归档**附件可用，所以整仓交付走 `--bundle-repo=zip`。
 
 ---
 
@@ -199,7 +201,7 @@ wfa status <第二个 task-id>   # 比较两次的 Conversation
 wfa 0.2.3 起：
 
 - 正文超 40 KiB 在发送前拦截（`PROMPT_OVERSIZE`）；`--dry-run` 给文件级 `splitPlan`；`--allow-oversize` 放行。
-- Gemini 遇到文本附件时自动内联（带行号的源码包直接内联）；二进制/原生文档提前拒绝（`GEMINI_ATTACHMENT_UNSUPPORTED`）；`--allow-gemini-attachments` 强制走原生上传。
+- Gemini 遇到归档附件（zip/tar/gz/tgz/7z）走原生上传；文本附件自动内联（带行号的源码包直接内联）；其它二进制/原生文档提前拒绝（`GEMINI_ATTACHMENT_UNSUPPORTED`）；`--allow-gemini-attachments` 强制走原生上传。
 - `response.md` 出现 Canvas 存根特征或 `\vert{}` 类转义时标记 `responseHeuristics` 并在 CLI 警告，不修改正文；stage/apply 拒绝含污染的内容。
 - `--new-session` 完成后比对上一轮 `threadUrl`，相同则记 `sessionIsolationWarning`。
 - 默认 chatgpt + gemini，多 provider 默认串行（`--concurrency 1`）；由 WFA 自行拆分为独立单 job 请求，含 `--detach` 模式。
