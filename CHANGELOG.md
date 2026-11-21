@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.9 - Unreleased
+
+Two earlier conclusions in `docs/known-issues.md` were wrong, and one of them was
+wrong in a way that stayed invisible: ask-bridge decides whether an attachment
+arrived by searching the page text for the **whole filename**, so a name longer
+than the provider's label truncation is uploaded, then reported as never
+attached about 50 s later. That is not a parser timeout, and it is not specific
+to documents: the same archive succeeded as `bundle.zip` and failed as a
+50-character timestamped name. Our own archive names were in the failing range,
+which meant `--bundle-repo=zip` never worked on Gemini without saying so.
+
+### Fixed
+- Repository archives are named `<slug8>-<hex8>.zip` (17-character stem) instead
+  of `<slug>-<timestamp>-<hex>.zip` (~50). Measured on one machine with the same
+  55,699-byte file: stems of 8, 19 and 20 characters complete in 13-17 s, a
+  21-character stem fails twice in a row at 49-52 s, and `metadata.json` records
+  no thread — the prompt was never submitted. Uniqueness now comes from eight
+  random hex characters; `pruneArchives` sorts by mtime, so the timestamp was
+  never load-bearing.
+- The Gemini attachment refusal message and `docs/known-issues.md` U1 said
+  native parsers time out. They do not: the whole-filename check does. The
+  refusal now names the real cause and the 20-character stem that
+  `--allow-gemini-attachments` needs, so the workaround no longer pushes users
+  toward inlining and the ~44 KiB prompt ceiling.
+- `docs/known-issues.md` U7 (`exit_type=Crashed`) is recorded as fixed in
+  ask-bridge 0.4.0 (`cdp_browser_close` plus `--headless` defaulting to true),
+  leaving only the externally-killed case that WFA still repairs at startup, and
+  U10 gains its source-level root cause (a finished job closes the MCP-selected
+  page, and the next job's `list_pages` reports it as "failed to open tab").
+
+
 ## 0.2.8 - Unreleased
 
 One killed run used to be enough to make a data directory permanently unusable:
@@ -52,19 +83,6 @@ transient), two concurrent sessions deadlocked each other within one request.
 - `wfa doctor` measures one overwrite and one rename in the data directory and
   flags `SLOW` above two seconds, and prints a progress line before the Chrome
   and ask-bridge checks so an empty terminal no longer reads as a hang.
-- Repository archives are named `<slug8>-<hex8>.zip` (17-character stem) instead
-  of `<slug>-<timestamp>-<hex>.zip` (~50). ask-bridge 0.4.0 confirms an
-  attachment by matching the whole filename against the page text and the
-  provider truncates the label past ~20 characters, so the old names were
-  uploaded and then reported as never attached 50 s later — which silently broke
-  `--bundle-repo=zip` for Gemini. Measured: same bytes, 20-character stem
-  succeeds in 13-17 s, 21 fails twice at 49-52 s. Uniqueness now comes from
-  eight random hex characters; file mtime still provides ordering.
-- The Gemini attachment refusal message and `docs/known-issues.md` U1 said
-  native document parsers time out. They do not: the whole-filename check does.
-  The message, README, skill guidance and U1 now describe the measured cause, and
-  U7 (`exit_type=Crashed`) is recorded as fixed in ask-bridge 0.4.0
-  (`cdp_browser_close` plus `--headless` defaulting to true).
 
 
 ## 0.2.7 - Unreleased
