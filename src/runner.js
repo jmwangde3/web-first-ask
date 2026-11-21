@@ -6,7 +6,7 @@ import { loadConfig } from "./config.js";
 import { buildJobs, normalizeProviders, resolveAttachmentPaths, validateConcurrency } from "./jobs.js";
 import { resolveAskBridge, runProcess, checkAskBridge, spawnDetached } from "./ask-bridge.js";
 import { readBatchMetadata } from "./metadata.js";
-import { rememberSession, summarizeTask, workspaceHasBlockingTask, workspaceSessions } from "./state.js";
+import { detectSessionIsolationWarning, rememberSession, summarizeTask, workspaceHasBlockingTask, workspaceSessions } from "./state.js";
 import { WfaError } from "./errors.js";
 import { assertUpstreamAvailable } from "./maintenance.js";
 import { hashFile, isPidAlive, sha256, slug, uuid } from "./util.js";
@@ -165,12 +165,44 @@ async function buildSensitiveFindings({ promptByProvider, files, images, briefTe
   return { findings, unscannedAttachments };
 }
 
+function splitAttachmentFiles(attachments, limitBytes) {
+  const groups = [];
+  let current = { group: 1, files: [], bytes: 0 };
+  for (const { filePath, bytes } of attachments) {
+    if (bytes > limitBytes) {
+      if (current.files.length) groups.push(current);
+      groups.push({ group: groups.length + 1, files: [filePath], bytes, oversizeFile: true });
+      current = { group: groups.length + 1, files: [], bytes: 0 };
+      continue;
+    }
+    if (current.files.length && current.bytes + bytes > limitBytes) {
+      groups.push(current);
+      current = { group: groups.length + 1, files: [], bytes: 0 };
+    }
+    current.files.push(filePath);
+    current.bytes += bytes;
+  }
+  if (current.files.length) groups.push(current);
+  return groups;
+}
+
+function withGeminiInline(prompts, inlineBody, inline) {
+  if (!inlineBody || !inline) return prompts;
+  return {
+    ...prompts,
+    gemini: `${prompts.gemini}\n\n## Inlined attachments (${inline.files} file(s), ${inline.bytes} bytes; ask-bridge cannot upload attachments to Gemini)\n\n${inlineBody}`,
+  };
+}
+
 export async function executeTask(input, dependencies = {}) {
   const home = dependencies.home;
   const store = dependencies.store ?? new Store(home);
   const paths = getPaths(home);
   const config = dependencies.config ?? await loadConfig(home);
-  const providers = normalizeProviders(input.providers, [input.provider ?? config.defaultProvider]);
+  const providers = normalizeProviders(
+    input.providers,
+    input.provider ? [input.provider] : config.defaultProviders,
+  );
   if (typeof input.prompt !== "string" || !input.prompt.trim()) {
     throw new WfaError("EMPTY_PROMPT", "Prompt must not be empty.");
   }
@@ -180,7 +212,7 @@ export async function executeTask(input, dependencies = {}) {
   if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > config.maxTimeoutSeconds) {
     throw new WfaError("INVALID_TIMEOUT", `timeout must be between 1 and ${config.maxTimeoutSeconds} seconds.`);
   }
-  const concurrency = validateConcurrency(input.concurrency, providers.length, config.maxConcurrency);
+  const concurrency = validateConcurrency(input.concurrency ?? config.defaultConcurrency, providers.length, config.maxConcurrency);
   const files = await validateFiles(resolveAttachmentPaths(input.files ?? [], workspaceRoot), "Attachment");
   const images = await validateFiles(resolveAttachmentPaths(input.images ?? [], workspaceRoot), "Image");
   if (providers.includes("gemini") && images.length) {
@@ -231,27 +263,70 @@ export async function executeTask(input, dependencies = {}) {
     cwd: workspaceRoot,
     shouldAutoInject: autoBriefNeeded,
   });
-  const promptByProvider = buildProviderPrompts(input, providers, sessionMap, briefText, followup);
-  const sessionFingerprint = relevantSessionFingerprint(sessionMap, providers, Boolean(input.fresh));
   const bundleLines = Boolean(input.bundleLines);
   const textFiles = bundleLines ? files.filter(isTextSourceAttachment) : [];
   const nativeFiles = bundleLines ? files.filter((filePath) => !isTextSourceAttachment(filePath)) : files;
 
   let bundlePreview = null;
   if (textFiles.length) bundlePreview = await buildLineNumberedBundle(textFiles, { cwd: workspaceRoot });
+
+  // ask-bridge cannot upload attachments to Gemini: the upload times out before
+  // the prompt is submitted. With Gemini in the default provider set, every
+  // request that carries files would therefore fail, so inline the text payload
+  // for Gemini and keep the native attachment for the other providers. Binary
+  // documents cannot be inlined and still fail fast.
+  const filesByProvider = {};
+  let geminiInline = null;
+  let geminiInlineBody = null;
+  let geminiAttachmentBlocked = false;
+  if (providers.includes("gemini") && files.length && !input.allowGeminiAttachments) {
+    let body = null;
+    if (bundleLines) {
+      body = bundlePreview?.content ?? null;
+    } else if (files.every((filePath) => isTextSourceAttachment(filePath))) {
+      const sections = [];
+      for (const filePath of files) {
+        sections.push(`===== FILE: ${filePath} =====\n${await readFile(filePath, "utf8")}`);
+      }
+      body = sections.join("\n\n");
+    }
+    if (body === null) {
+      geminiAttachmentBlocked = true;
+      if (!input.dryRun) {
+        throw new WfaError(
+          "GEMINI_ATTACHMENT_UNSUPPORTED",
+          "Gemini cannot receive attachments: ask-bridge uploads time out, and a binary or native document cannot be inlined. Inline the content yourself, drop Gemini with --providers chatgpt, or force the native upload with --allow-gemini-attachments.",
+        );
+      }
+    } else {
+      geminiInlineBody = body;
+      geminiInline = { files: files.length, bytes: Buffer.byteLength(body, "utf8") };
+      filesByProvider.gemini = [];
+    }
+  }
+
+  const basePrompts = buildProviderPrompts(input, providers, sessionMap, briefText, followup);
+  const promptByProvider = withGeminiInline(basePrompts, geminiInlineBody, geminiInline);
+  const sessionFingerprint = relevantSessionFingerprint(sessionMap, providers, Boolean(input.fresh));
+
   const sensitiveScan = await buildSensitiveFindings({
     promptByProvider,
     files,
     images,
-    briefText: Object.values(promptByProvider).some((value) => value !== input.prompt) ? briefText : "",
+    briefText: Object.values(basePrompts).some((value) => value !== input.prompt) ? briefText : "",
   });
   const sensitiveFindings = sensitiveScan.findings;
   const unscannedAttachments = sensitiveScan.unscannedAttachments;
 
   // Empirical browser-side cap measured on this machine: a prompt larger than
   // roughly 44 KiB reaches the page truncated, with no signal from ask-bridge.
-  // Warn well below that, and let --dry-run turn it into a blocker.
+  // Block at 40 KiB, which leaves room for the surfaces that wrap the prompt.
   const PROMPT_SIZE_WARN_BYTES = 40 * 1024;
+  const attachmentStats = await Promise.all(files.map(async (filePath) => ({
+    filePath: path.relative(workspaceRoot, filePath) || filePath,
+    bytes: (await stat(filePath)).size,
+  })));
+  const attachmentBytes = attachmentStats.reduce((sum, item) => sum + item.bytes, 0);
   const promptBytesByProvider = Object.fromEntries(providers.map((provider) =>
     [provider, Buffer.byteLength(promptByProvider[provider] ?? "", "utf8")]));
   const promptRiskProviders = providers.filter((provider) => promptBytesByProvider[provider] > PROMPT_SIZE_WARN_BYTES);
@@ -259,6 +334,11 @@ export async function executeTask(input, dependencies = {}) {
     thresholdBytes: PROMPT_SIZE_WARN_BYTES,
     exceedsThreshold: promptRiskProviders.length > 0,
     providers: promptRiskProviders,
+    promptBytesByProvider,
+    // Splitting is advisory: it groups files, it never rewrites the prompt body
+    // and never runs the parts. A single oversized file gets its own group.
+    splitPlan: splitAttachmentFiles(attachmentStats, PROMPT_SIZE_WARN_BYTES),
+    splitPlanNote: "Groups use the attachment sizes on disk; a source bundle or a rewritten prompt changes the transmitted size. Prompt text is never split automatically.",
     message: promptRiskProviders.length
       ? `Prompt exceeds ${PROMPT_SIZE_WARN_BYTES / 1024} KiB for: ${promptRiskProviders.join(", ")}. ask-bridge truncates silently around 44 KiB, so the provider may answer from a partial prompt.`
       : null,
@@ -268,9 +348,10 @@ export async function executeTask(input, dependencies = {}) {
     const promptBytes = Object.values(promptBytesByProvider).reduce((sum, value) => sum + value, 0);
     const actualFileAttachments = bundleLines ? nativeFiles : files;
     const actualAttachmentPaths = [...actualFileAttachments, ...images];
-    const attachmentBytes = (await Promise.all(actualAttachmentPaths.map(async (filePath) => (await stat(filePath)).size)))
+    const transportAttachmentBytes = (await Promise.all(actualAttachmentPaths.map(async (filePath) => (await stat(filePath)).size)))
       .reduce((sum, value) => sum + value, 0) + (bundlePreview?.bytes ?? 0);
-    const providerAttachmentBytes = attachmentBytes * providers.length;
+    const attachmentSendingProviders = providers.length - (geminiInline ? 1 : 0);
+    const providerAttachmentBytes = transportAttachmentBytes * attachmentSendingProviders;
     const estimatedTokens = estimateTokens(Object.values(promptByProvider).join("\n")) + Math.ceil(providerAttachmentBytes / 4);
     return {
       dryRun: true,
@@ -280,9 +361,10 @@ export async function executeTask(input, dependencies = {}) {
         workspace,
         workspaceRoot,
         providers,
+        concurrency,
         fresh: Boolean(input.fresh),
         followup: followup ? { taskId: followup.taskId, provider: followup.provider, parentJobId: followup.jobId } : null,
-        briefIncludedProviders: providers.filter((provider) => promptByProvider[provider] !== input.prompt),
+        briefIncludedProviders: providers.filter((provider) => basePrompts[provider] !== input.prompt),
         briefBytes: Buffer.byteLength(briefText, "utf8"),
         promptBytes,
         promptBytesByProvider,
@@ -291,7 +373,10 @@ export async function executeTask(input, dependencies = {}) {
         imagesCount: images.length,
         actualAttachmentCount: actualAttachmentPaths.length + (bundlePreview ? 1 : 0),
         attachmentBytes,
+        transportAttachmentBytes,
         providerAttachmentBytes,
+        geminiInline,
+        geminiAttachmentBlocked,
         bundleLines,
         bundle: bundlePreview ? {
           files: bundlePreview.files,
@@ -305,10 +390,28 @@ export async function executeTask(input, dependencies = {}) {
         unscannedAttachments,
         sendBlocked: sensitiveFindings.length > 0 && !input.allowSensitive,
         sizeBlocked: promptSizeRisk.exceedsThreshold && !input.allowOversize,
+        blockReasons: [
+          ...(sensitiveFindings.length > 0 && !input.allowSensitive ? ["SENSITIVE_CONTENT_DETECTED"] : []),
+          ...(promptSizeRisk.exceedsThreshold && !input.allowOversize ? ["PROMPT_OVERSIZE"] : []),
+          ...(geminiAttachmentBlocked ? ["GEMINI_ATTACHMENT_UNSUPPORTED"] : []),
+        ],
         blocked: (sensitiveFindings.length > 0 && !input.allowSensitive)
-          || (promptSizeRisk.exceedsThreshold && !input.allowOversize),
+          || (promptSizeRisk.exceedsThreshold && !input.allowOversize)
+          || geminiAttachmentBlocked,
       },
     };
+  }
+  if (promptSizeRisk.exceedsThreshold && !input.allowOversize) {
+    const sizes = promptRiskProviders
+      .map((provider) => `${provider}=${promptBytesByProvider[provider]} bytes`)
+      .join(", ");
+    const inlineNote = geminiInline
+      ? ` Gemini's prompt includes ${geminiInline.bytes} bytes of inlined attachments because ask-bridge cannot upload them; split those files or use --providers chatgpt.`
+      : "";
+    throw new WfaError(
+      "PROMPT_OVERSIZE",
+      `Prompt exceeds ${PROMPT_SIZE_WARN_BYTES} bytes (${sizes}).${inlineNote} ask-bridge may silently truncate it: rewrite or split the prompt body, or pass --allow-oversize to send anyway. --dry-run prints a file-level splitPlan; prompt text is never split automatically.`,
+    );
   }
   if (sensitiveFindings.length && !input.allowSensitive) {
     const locations = sensitiveFindings.slice(0, 12).map((item) => `${item.source}:${item.line} (${item.kind})`).join(", ");
@@ -383,6 +486,7 @@ export async function executeTask(input, dependencies = {}) {
     return { task: prior, replayed: true };
   }
 
+  let createdJobs = [];
   const created = await store.transaction(async ({ tasks, sessions }) => {
     const priorId = tasks.requestIndex?.[requestId];
     if (priorId) {
@@ -407,7 +511,7 @@ export async function executeTask(input, dependencies = {}) {
 
     const latestSessions = workspaceSessions(tasks.tasks, sessions, workspace, providers);
     if (followup) latestSessions[followup.provider] = followup.threadUrl;
-    const latestPrompts = buildProviderPrompts(input, providers, latestSessions, briefText, followup);
+    const latestPrompts = withGeminiInline(buildProviderPrompts(input, providers, latestSessions, briefText, followup), geminiInlineBody, geminiInline);
     const latestSessionFingerprint = relevantSessionFingerprint(latestSessions, providers, Boolean(input.fresh));
     if (JSON.stringify(latestPrompts) !== JSON.stringify(promptByProvider)
       || JSON.stringify(latestSessionFingerprint) !== JSON.stringify(sessionFingerprint)) {
@@ -437,10 +541,13 @@ export async function executeTask(input, dependencies = {}) {
       sessions: latestSessions,
       fresh: Boolean(input.fresh),
       files: jobFiles,
+      filesByProvider,
       images,
       modelByProvider,
+      allowGeminiAttachments: Boolean(input.allowGeminiAttachments),
       downloadImages: Boolean(input.downloadImages ?? config.downloadImages),
     });
+    createdJobs = jobs;
     const jsonl = `${jobs.map((job) => JSON.stringify(job)).join("\n")}\n`;
     await writeFile(inputFile, jsonl, { encoding: "utf8", mode: 0o600 });
     try { await chmod(inputFile, 0o600); } catch {}
@@ -471,6 +578,7 @@ export async function executeTask(input, dependencies = {}) {
       workspace,
       workspaceRoot,
       providers,
+      fresh: Boolean(input.fresh),
       state: "preparing",
       createdAt: now,
       updatedAt: now,
@@ -487,7 +595,7 @@ export async function executeTask(input, dependencies = {}) {
       bundleSha256: bundleInfo?.sha256 ?? null,
       briefFile: input.briefFile ? path.resolve(workspaceRoot, input.briefFile) : (briefText ? path.join(workspaceRoot, ".wfa", "active-brief.md") : null),
       briefSha256: briefText ? sha256(briefText) : null,
-      briefInjectedProviders: providers.filter((provider) => promptByProvider[provider] !== input.prompt),
+      briefInjectedProviders: providers.filter((provider) => basePrompts[provider] !== input.prompt),
       parentTaskId: followup?.taskId ?? null,
       parentProvider: followup?.provider ?? null,
       parentJobId: followup?.jobId ?? null,
@@ -634,6 +742,7 @@ export async function executeTask(input, dependencies = {}) {
         child.completionProof = result.completionProof;
         child.collectionSource = "ask-bridge-batch-terminal";
         child.collectedAt = result.completionProof.verifiedAt;
+        child.responseHeuristics = result.responseHeuristics ?? null;
       }
       child.elapsedSeconds = result.elapsedSeconds;
       child.pageId = result.pageId;
@@ -653,8 +762,9 @@ export async function executeTask(input, dependencies = {}) {
       if (child.state !== previousState || child.threadUrl !== previousThread || child.resultPath !== previousResult) {
         child.revision = (child.revision ?? 0) + 1;
       }
-      if (result.trustedCompletion && result.state === "completed" && result.threadUrl) {
-        rememberSession(tasks.tasks, sessions, current, provider);
+      if (result.trustedCompletion && result.state === "completed") {
+        child.sessionIsolationWarning = detectSessionIsolationWarning(tasks.tasks, current, provider, result.threadUrl);
+        if (result.threadUrl) rememberSession(tasks.tasks, sessions, current, provider);
       }
     }
     current.state = stateForParent(current.children);
@@ -667,6 +777,91 @@ export async function executeTask(input, dependencies = {}) {
       current.processWarning = `ask-bridge batch exited with code ${processResult.code}${processResult.signal ? ` (${processResult.signal})` : ""}. Per-provider metadata is authoritative.`;
     }
   });
+
+  // Serial batches on this ask-bridge build close the first job's tab, and the
+  // next job then fails with "list_pages failed: The selected page has been
+  // closed" before anything is submitted. That is provably pre-submit, so retry
+  // those providers one at a time in their own batch instead of leaving the task
+  // half finished. Root cause belongs upstream; this only keeps the default
+  // two-provider run usable.
+  const TAB_CLOSED = /list_pages failed|selected page has been closed/i;
+  const retryProviders = Object.entries(results)
+    .filter(([, result]) => result.state === "failed"
+      && TAB_CLOSED.test(String(result.error ?? ""))
+      && !result.threadUrl
+      && !result.responsePath)
+    .map(([provider]) => provider);
+
+  for (const provider of retryProviders) {
+    const job = createdJobs.find((item) => item.provider === provider);
+    if (!job) continue;
+    input.onProgressLine?.("stdout", `[wfa] retrying ${provider} alone: ask-bridge closed the previous job's tab`);
+    const retryFile = path.join(task.runDir, `jobs-retry-${provider}.jsonl`);
+    await writeFile(retryFile, `${JSON.stringify(job)}\n`, { encoding: "utf8", mode: 0o600 }).catch(() => {});
+    const retryArgs = [
+      "--backend", "browser",
+      `--headless=${config.browserMode !== "headful"}`,
+      "batch",
+      "--input", retryFile,
+      "--concurrency", "1",
+      "--output-dir", task.outputDir,
+    ];
+    const retryProcess = await (dependencies.runProcess ?? runProcess)(command, retryArgs, {
+      cwd: workspaceRoot,
+      inherit: false,
+      timeoutMs: (timeoutSeconds + 180) * 1000,
+      onStdoutLine: (line) => input.onProgressLine?.("stdout", line),
+      onStderrLine: (line) => input.onProgressLine?.("stderr", line),
+      onSpawn: async (pid) => {
+        await store.transaction(({ tasks }) => {
+          const current = tasks.tasks[task.taskId];
+          current.childPid = pid ?? null;
+          current.children[provider].childPid = pid ?? null;
+          current.updatedAt = new Date().toISOString();
+        });
+      },
+    });
+    if (retryProcess.spawnError) continue;
+    const retryResult = await readBatchMetadata(task.outputDir, job.id, provider, { runDir: task.runDir });
+    await store.transaction(({ tasks, sessions }) => {
+      const current = tasks.tasks[task.taskId];
+      const child = current.children[provider];
+      const classified = classifyProviderError({
+        error: retryResult.error,
+        stderr: retryProcess.stderr ?? "",
+        jobId: child.jobId,
+        state: retryResult.state,
+        hasResponse: Boolean(retryResult.responsePath),
+      });
+      child.state = stateFromProviderError(retryResult.state, classified);
+      child.threadUrl = retryResult.threadUrl ?? child.threadUrl;
+      child.error = retryResult.error;
+      child.resultPath = retryResult.responsePath ?? child.resultPath;
+      child.errorCode = classified.errorCode;
+      child.recoveryHint = classified.recoveryHint;
+      child.retryAfterSeconds = classified.retryAfterSeconds;
+      child.retryAfterAt = classified.retryAfterAt;
+      child.retryAfterEstimated = classified.retryAfterEstimated;
+      child.elapsedSeconds = retryResult.elapsedSeconds;
+      child.pageId = retryResult.pageId;
+      child.childPid = null;
+      child.retriedAsSingleBatch = true;
+      if (retryResult.trustedCompletion && retryResult.completionProof) {
+        child.completionProof = retryResult.completionProof;
+        child.collectionSource = "ask-bridge-batch-terminal";
+        child.collectedAt = retryResult.completionProof.verifiedAt;
+        child.responseHeuristics = retryResult.responseHeuristics ?? null;
+      }
+      if (retryResult.trustedCompletion && retryResult.state === "completed") {
+        child.sessionIsolationWarning = detectSessionIsolationWarning(tasks.tasks, current, provider, retryResult.threadUrl);
+        if (retryResult.threadUrl) rememberSession(tasks.tasks, sessions, current, provider);
+      }
+      child.revision = (child.revision ?? 0) + 1;
+      current.state = stateForParent(current.children);
+      current.updatedAt = new Date().toISOString();
+      current.retryWarnings = [...(current.retryWarnings ?? []), `Retried ${provider} as a single batch because ask-bridge closed the previous tab.`];
+    });
+  }
 
   const latest = await store.snapshot();
   return { task: latest.tasks.tasks[task.taskId], replayed: false };
@@ -709,6 +904,8 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
         child.completionProof = metadata.completionProof;
         child.collectionSource = "ask-bridge-batch-terminal";
         child.collectedAt = metadata.completionProof.verifiedAt;
+        child.responseHeuristics = metadata.responseHeuristics ?? null;
+        child.sessionIsolationWarning = detectSessionIsolationWarning(tasks.tasks, task, provider, metadata.threadUrl);
         child.error = null;
         child.errorCode = null;
         child.recoveryHint = null;

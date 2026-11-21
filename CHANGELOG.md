@@ -1,6 +1,32 @@
 # Changelog
 
-## 0.2.2 - Unreleased
+## 0.2.3 - Unreleased
+
+A run now asks ChatGPT **and** Gemini by default, and every default path is
+hardened against the ask-bridge limitations measured on this machine. See
+`docs/known-issues.md` for the defects that remain upstream-owned.
+
+### Added
+- `defaultProviders: ["chatgpt", "gemini"]` in config and constants: `wfa ask`, `wfa compare` and `wfa code` fan out to both providers unless `--provider`/`--providers` narrows it. `wfa login` still defaults to a single provider.
+- `defaultConcurrency: 1`; the CLI resolves the default from config instead of hardcoding it.
+- Gemini text attachments are inlined into the Gemini prompt (`===== FILE: ... =====` sections) instead of being uploaded, because the ask-bridge upload always times out. `--dry-run` reports `geminiInline: { files, bytes }`.
+- `--allow-gemini-attachments` forces the native upload for testing or for a fixed ask-bridge build.
+- `responseHeuristics` on every completed provider: `canvasStub` flags a short response that only links a downloadable artifact (ChatGPT put the body in Canvas) and `latexEscaping` flags `\vert{}` / `\lbrace{}` corruption (Gemini re-escaped the text). Reported by `wfa result`, `wfa status --json` and `wfa task`; `wfa result --stdout` writes them to stderr so the answer on stdout stays clean.
+- `sessionIsolationWarning` when a non-fresh request lands on the same conversation URL as the most recent completed task for that workspace/provider, i.e. when `--new-session` did not actually isolate the run.
+- Single-job retry for the serial-batch tab bug: when ask-bridge closes the previous job's tab and the next provider fails with `list_pages failed: The selected page has been closed` before submitting anything, that provider is re-run alone in its own `--concurrency 1` batch. Recorded as `retriedAsSingleBatch` on the provider plus a task-level `retryWarnings` entry.
+- `docs/known-issues.md` is now an upstream-only list (U1–U9) with reproduction, expectation and impact per item, ready to file against ask-bridge; wfa-side mitigations are listed separately and explicitly labelled as detection/workaround, not fixes.
+
+### Changed
+- A prompt above the size threshold is rejected **before** a task is created (`PROMPT_OVERSIZE`) instead of being sent and silently truncated at ~44 KiB. `--allow-oversize` still overrides.
+- `--dry-run` reports `promptBytesByProvider`, `transportAttachmentBytes`, `blockReasons`, `geminiInline` and `geminiAttachmentBlocked`; the preview exits 2 when any provider is blocked.
+- `wfa ask --help` documents the two-provider serial default, the `--concurrency` default of 1, and the new Gemini attachment behaviour.
+
+### Fixed
+- A Gemini binary/native attachment no longer starts a batch that is guaranteed to time out; it fails fast with `GEMINI_ATTACHMENT_UNSUPPORTED` and the exact options that work.
+- A serial two-provider run no longer ends half-finished because of the second job's closed tab.
+- `docs/known-issues.md` no longer claims ask-bridge 0.2.1; it targets the installed 0.4.0.
+
+## 0.2.2
 
 ### Added
 - `--concurrency <N>` is documented and validated as 1..3 independently of the provider count. `--concurrency 1` now runs several providers serially in one batch, which is the only safe mode on machines where concurrent browser tabs interfere with each other.
@@ -8,7 +34,7 @@
 - `--allow-oversize` keeps `--dry-run` at exit 0 when the prompt exceeds the threshold, for cases where the size is known and accepted.
 - ask-bridge stdout/stderr lines are streamed to the caller while the batch runs, so progress is visible before the process exits instead of arriving as one buffered block.
 - `ATTACHMENT_UPLOAD_TIMEOUT` classifies the observed Gemini upload failure and explains that the prompt was never submitted.
-- `docs/known-issues.md` documents reproductions, evidence and workarounds for the upstream limitations measured against ask-bridge 0.2.1.
+- `docs/known-issues.md` documents reproductions, evidence and workarounds for the upstream limitations measured against ask-bridge 0.4.0.
 
 ### Changed
 - `wfa compare` help now points at `--concurrency 1` instead of claiming concurrent execution is the only mode.

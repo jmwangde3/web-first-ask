@@ -5,6 +5,33 @@ import { sha256 } from "./util.js";
 const TERMINAL_STATES = new Set(["completed", "failed", "timed_out", "recoverable", "cancelled"]);
 const PROVIDERS = new Set(["chatgpt", "gemini", "claude"]);
 
+// ask-bridge writes the response body to response.md, but two failure modes
+// leave a plausible-looking file behind: a ChatGPT answer that lived in Canvas
+// leaves only a download link plus a hash, and Gemini re-escapes Markdown so
+// code arrives as \vert{} / \lbrace. Both are reported, never auto-corrected:
+// the text is what the provider actually returned, and guessing the original
+// would be worse than telling the caller to ask again.
+const CANVAS_STUB_MAX_CHARS = 400;
+const LATEX_ESCAPE_PATTERN = /\\vert\{\}|\\lbrace(?:\{\}|)|\\rbrace(?:\{\}|)|\\textbackslash/;
+
+export function inspectResponseHeuristics(responseText) {
+  const text = String(responseText ?? "");
+  const hasLink = /\[[^\]\n]{1,120}\]\((?:sandbox:|https?:\/\/)[^)]+\)/i.test(text);
+  const downloadCue = /下载|download|canvas/i.test(text);
+  const hashCue = /\bSHA-?256\b[^\n]{0,8}[a-f0-9]{64}\b/i.test(text);
+  const artifactName = /[\w.-]+\.(?:zip|tar|gz|md|txt|patch|diff|json|js|ts|py)\b/i.test(text);
+
+  const canvasStub = text.length < CANVAS_STUB_MAX_CHARS
+    && ((hasLink && (downloadCue || hashCue || artifactName))
+      || (downloadCue && hashCue && artifactName));
+  const latexEscaping = LATEX_ESCAPE_PATTERN.test(text);
+
+  const reasons = [];
+  if (canvasStub) reasons.push("Short response points at a downloadable artifact instead of containing the answer; the body is probably in Canvas.");
+  if (latexEscaping) reasons.push("Response contains LaTeX-escaped sequences; code and diffs in it may be corrupted.");
+  return { canvasStub, latexEscaping, reasons };
+}
+
 function sameFileVersion(before, after) {
   return Boolean(before && after
     && before.isFile() && after.isFile()
@@ -220,6 +247,7 @@ export async function readBatchMetadata(outputDir, jobId, expectedProvider, { ru
       identityVerified: true,
       trustedCompletion: true,
       completionProof,
+      responseHeuristics: inspectResponseHeuristics(responseText),
       elapsedSeconds: Number.isFinite(metadata.elapsedSeconds) ? metadata.elapsedSeconds : null,
       pageId: Number.isInteger(metadata.pageId) ? metadata.pageId : null,
       threadUrlWarning,

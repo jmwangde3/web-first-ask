@@ -97,3 +97,21 @@ export function rememberSession(tasks, sessions, task, provider) {
   sessions.workspaces[task.workspace] ??= {};
   sessions.workspaces[task.workspace][provider] = task.children[provider].threadUrl;
 }
+
+// --new-session only stops WFA from supplying a saved URL; ask-bridge can still
+// reuse an open tab. An identical conversation URL after a fresh request proves
+// the tab was reused. A different URL proves nothing, so only reuse is reported.
+export function detectSessionIsolationWarning(tasks, currentTask, provider, threadUrl) {
+  if (!currentTask?.fresh || !threadUrl) return null;
+  const entries = Object.values(tasks);
+  const currentIndex = entries.findIndex((task) => task.taskId === currentTask.taskId);
+  if (currentIndex < 0) return null;
+  const previous = entries.slice(0, currentIndex).findLast((task) => {
+    const child = task.children?.[provider];
+    return task.workspace === currentTask.workspace
+      && child?.state === "completed"
+      && Boolean(child.threadUrl);
+  });
+  if (previous?.children?.[provider]?.threadUrl !== threadUrl) return null;
+  return `--new-session returned the conversation URL of task ${previous.taskId} (${provider}); session isolation is not confirmed, check that the answer matches this request.`;
+}

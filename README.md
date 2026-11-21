@@ -1,18 +1,20 @@
 # web-first-ask
 
-**Codex-first CLI + Skill for delegating thinking and complete code implementation to ChatGPT Web, with optional parallel Gemini/Claude comparison.**
+**Codex-first CLI + Skill for delegating thinking and complete code implementation to ChatGPT and Gemini Web, serially by default.**
 
 `web-first-ask` (`wfa`) is a local Node.js CLI that calls the independently maintained [`ask-bridge`](https://github.com/doggy8088/ask-bridge) executable. It explicitly selects ask-bridge's `browser` backend because its Batch command does not support SIWC. It does not expose an MCP server to Codex and does not reimplement browser automation.
 
 - Codex calls one local command and waits while `ask-bridge batch` performs its own browser-side polling.
-- ChatGPT is the default provider. WFA does not set or change provider reasoning strength; it uses the current setting in the provider web UI.
-- `wfa compare` sends the same prompt and attachments to multiple providers concurrently, then saves each answer separately.
+- **ChatGPT and Gemini are the default provider pair**: a bare `wfa ask` / `wfa code` / `wfa compare` asks both. Use `--provider` or `--providers` to narrow. WFA does not set or change provider reasoning strength; it uses the current setting in the provider web UI.
+- Multi-provider runs are **serial by default** (`--concurrency 1`), because concurrent browser tabs interfere with each other on the same machine. `--concurrency 2..3` is available and validated.
+- `wfa compare` sends the same prompt and attachments to every selected provider, then saves each answer separately.
 - `wfa code` defaults to a path-and-line-numbered source bundle and asks for **complete replacement contents**; `--mode spec` switches to a compact implementation specification.
 - Directory recursion, quoted glob patterns, exclusions, image attachments and native document attachments are built into the CLI.
-- `--dry-run` previews per-provider prompt bytes, attachment size, estimated tokens, prompt-size risk and likely secret locations without creating a task or launching a provider. A prompt above 40 KiB per provider exits 2; `--allow-oversize` keeps it at 0.
+- `--dry-run` previews per-provider prompt bytes, attachment size, estimated tokens, prompt-size risk, block reasons and likely secret locations without creating a task or launching a provider. A prompt above 40 KiB per provider exits 2; `--allow-oversize` keeps it at 0.
 - A local task ledger records request IDs, provider states, conversation URLs, parent-task lineage, revisions and result paths.
-- Uncertain sends are never automatically repeated. An unresolved provider/workspace is locked until the user collects or explicitly abandons the old task, except for failures that provably happened before submission (tab load failure, send-button failure, attachment upload timeout), which release the lock automatically.
+- Uncertain sends are never automatically repeated. An unresolved provider/workspace is locked until the user collects or explicitly abandons the old task, except for failures that provably happened before submission (tab load failure, send-button failure, attachment upload timeout), which release the lock automatically. The single exception in the other direction: when ask-bridge closes a serial batch's tab, the stranded provider is retried once in its own batch, because nothing had been submitted.
 - ask-bridge progress lines are forwarded to stderr as `[ask-bridge stdout] …` while the batch is still running.
+- Every completed answer carries `responseHeuristics` (Canvas stub, LaTeX/escape corruption) and, when relevant, a `sessionIsolationWarning` — signals, never silent rewrites.
 - Results can be inspected and staged; writing staged code into the workspace requires an explicit `wfa apply --confirm` and SHA-256 revalidation.
 - WFA can continue an existing task conversation with `--followup`.
 - ask-bridge remains an external tool; WFA adds no runtime npm dependency.
@@ -83,19 +85,19 @@ ask-bridge can reuse an open Chrome instance. To switch an already running insta
 
 **Windows workaround for ask-bridge 0.4.0:** After switching from `headless` to `headful`, Chrome may reopen at a saved off-screen position. Press **Alt+Tab** to select the ask-bridge Chrome window, then press **Win+Up Arrow** to maximize it and bring it back on screen. [ask-bridge window launch code](https://github.com/doggy8088/ask-bridge/blob/7d4731f60f300f7cf3b98a5a92137144a17f98e9/src/main.rs#L2421-L2440)
 
-Ask ChatGPT (default) and continue the stable workspace conversation:
+Ask ChatGPT and Gemini (the default pair) and continue the stable workspace conversation:
 
 ```powershell
 wfa ask --workspace my-repository --prompt-file .\question.md
 ```
 
-Ask a specific provider:
+Ask a specific provider only:
 
 ```powershell
 wfa ask --provider gemini --workspace my-repository --prompt "Review this error and identify the likely cause."
 ```
 
-Ask ChatGPT and Gemini **at the same time**:
+Ask both providers explicitly (same thing the default does):
 
 ```powershell
 wfa compare --providers 'chatgpt,gemini' --workspace my-repository --prompt-file .\question.md
@@ -107,7 +109,7 @@ Include Claude too:
 wfa compare --providers 'chatgpt,gemini,claude' --workspace my-repository --prompt-file .\question.md
 ```
 
-Ask ChatGPT for complete modified code, attaching complete relevant source and test files:
+Ask both providers for complete modified code, attaching complete relevant source and test files:
 
 ```powershell
 wfa code `
@@ -118,7 +120,7 @@ wfa code `
   --exclude "**/*.snap"
 ```
 
-Compare complete code implementations from ChatGPT and Gemini in parallel:
+Compare complete code implementations from ChatGPT and Gemini:
 
 ```powershell
 wfa code `
@@ -130,7 +132,7 @@ wfa code `
   --exclude "**/*.snap"
 ```
 
-For provider-specific model selection in a parallel run, use `--model-map 'chatgpt=<model>,gemini=<model>'`. Reasoning-strength selection is intentionally not managed by WFA. `--download-images` enables downloading generated images; it is off by default.
+For provider-specific model selection in a multi-provider run, use `--model-map 'chatgpt=<model>,gemini=<model>'`. Reasoning-strength selection is intentionally not managed by WFA. `--download-images` enables downloading generated images; it is off by default.
 
 The answers are saved separately under the local data directory. Codex should read the returned files, review them, apply the chosen implementation, and run tests. `wfa` never writes provider-generated code into the target repository automatically.
 
@@ -143,6 +145,7 @@ The answers are saved separately under the local data directory. Codex should re
 - Directory scans skip `.git`, `node_modules`, `.wfa`, common build/cache folders, and credential-like filenames by default.
 - Images (`png`, `jpg/jpeg`, `webp`, `gif`, `bmp`, `tif/tiff`, `avif`) are routed as image attachments. If a directory contains images, they are detected automatically. Gemini image attachments are rejected before launch because the current ask-bridge batch contract does not support them.
 - Common source files and native documents (`pdf`, `doc/docx`, `xls/xlsx`, `ppt/pptx`, `odt/ods/odp`, `rtf`, `csv`, Markdown and text) are attached without flattening binary document formats into text.
+- **Gemini never receives an upload.** ask-bridge's Gemini upload times out every time, so for Gemini the CLI inlines text attachments into the prompt as `===== FILE: <path> =====` sections and keeps the native attachment for the other providers. `--dry-run` shows `geminiInline: { files, bytes }`. Binary-only attachments cannot be inlined: the run fails fast with `GEMINI_ATTACHMENT_UNSUPPORTED` and the options that work, unless `--allow-gemini-attachments` forces the native upload. Watch the inlined byte count — it counts against the ~44 KiB prompt ceiling.
 - `wfa code` bundles text source by default. The bundle uses `relative/path:line | source text`; native documents and images stay as separate files.
 
 Preview before sending:
@@ -191,8 +194,8 @@ wfa apply <task-id> --provider chatgpt --confirm
 
 | Command | Purpose |
 |---|---|
-| `wfa ask` | One provider; ChatGPT by default |
-| `wfa compare` | Same prompt to multiple providers concurrently |
+| `wfa ask` | One or both providers; ChatGPT + Gemini by default, serially |
+| `wfa compare` | Same prompt to multiple providers, serially by default |
 | `wfa code` | Build a line-numbered full-file or compact spec implementation prompt |
 | `wfa wait <task-id>` | Observe task state; adopts only verified ask-bridge terminal artifacts and never resends |
 | `wfa attach <task-id>` | Read-only reattachment to a saved task ID |
@@ -216,17 +219,19 @@ Use `--json` for machine-readable summaries. Reuse `--request-id` only when reco
 
 ## Multi-provider behavior
 
-- `wfa compare` and `wfa code --providers ...` create one ask-bridge batch job per provider.
-- Jobs run concurrently by default (`concurrency = provider count`) and each gets its own tab and output directory.
-- `--concurrency 1` runs the selected providers one after another in a single batch. Use it when concurrent browser sessions interfere with each other on the same machine; the trade-off is total wall-clock time, not correctness.
-- Each provider has a separate saved conversation URL per workspace.
+- `wfa ask`, `wfa compare` and `wfa code` default to **ChatGPT + Gemini**. `--provider <name>` narrows to one; `--providers 'a,b,c'` selects explicitly.
+- Each provider becomes one ask-bridge batch job in a single batch.
+- Jobs run **serially by default** (`--concurrency 1` → `defaultConcurrency` in config). Concurrent tabs interfere with each other on the same machine, and the serial default is what keeps a two-provider run reliable.
+- `--concurrency 2` or `3` runs jobs in parallel when you know the machine tolerates it. Validated against `maxConcurrency` (default 3).
+- Serial batches on ask-bridge 0.4.0 close the previous job's tab, so the next job fails with `list_pages failed: The selected page has been closed` before submitting. WFA detects that exact pre-submit failure and retries the stranded provider alone in its own batch; the retry is recorded as `retriedAsSingleBatch` plus a task-level `retryWarnings` entry.
+- Each provider has a separate saved conversation URL per workspace, and a `sessionIsolationWarning` fires when a non-fresh run lands on the URL of the previous completed task for the same workspace/provider.
 - The same prompt and attachments are sent independently to every selected provider; no provider sees another provider's answer.
 - Results are stored separately, for example `.../ask-bridge-output/wfa-chatgpt-<id>/response.md` and `.../wfa-chatgpt-<id>/metadata.json`.
 - Codex compares the answers and makes the final decision. It must not blindly merge or trust any provider.
 
 ## Known issues
 
-`docs/known-issues.md` records failures observed against ask-bridge 0.2.1 with reproductions and current workarounds: Gemini attachment uploads timing out, prompts above roughly 44 KiB being truncated without a signal, ChatGPT long answers landing in Canvas instead of `response.md`, `--new-session` still reusing an open tab, and Gemini escaping Markdown diffs. Read it before sending large context or relying on provider-side isolation.
+`docs/known-issues.md` is the upstream-facing list (U1–U9) of defects measured against ask-bridge 0.4.0, with reproduction, expectation and impact per item: Gemini attachment uploads timing out, prompts above roughly 44 KiB being truncated without a signal, ChatGPT long answers landing in Canvas instead of `response.md`, `--new-session` still reusing an open tab, Gemini escaping Markdown diffs, unstable concurrent tabs, the Chrome `exit_type=Crashed` restore bubble, missing log rotation, and the absence of a `submissionState`. Each item is tagged with what WFA does about it locally — detection or workaround, never a fix. Read it before sending large context or relying on provider-side isolation.
 
 ## Local data and privacy
 

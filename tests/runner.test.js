@@ -271,3 +271,128 @@ test("new task reconciles a stale completed-task cleanup lock before checking wo
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("a provider left behind by a serial batch is retried alone and the retry is recorded", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-runner-"));
+  const store = new Store(home);
+  const config = {
+    defaultProvider: "chatgpt",
+    defaultProviders: ["chatgpt", "gemini"],
+    defaultConcurrency: 1,
+    defaultTimeoutSeconds: 1200,
+    maxTimeoutSeconds: 7200,
+    maxConcurrency: 3,
+    downloadImages: false,
+  };
+  const tabClosed = "failed to open tab: list_pages failed: The selected page has been closed";
+  const progress = [];
+  const batches = [];
+  try {
+    const result = await executeTask({
+      prompt: "Explain why the second job loses its tab.",
+      providers: ["chatgpt", "gemini"],
+      workspace: "sample-repo",
+      timeoutSeconds: 1200,
+      onProgressLine: (stream, line) => progress.push(line),
+    }, {
+      home, store, config, skipPreflight: true,
+      runProcess: async (_command, args) => {
+        assert.equal(argAfter(args, "--concurrency"), "1");
+        const outputDir = argAfter(args, "--output-dir");
+        const jobs = (await readFile(argAfter(args, "--input"), "utf8"))
+          .trim().split("\n").map((line) => JSON.parse(line));
+        batches.push(jobs.map((job) => job.provider));
+
+        if (jobs.length === 2) {
+          // Serial batch: the first job completes, then ask-bridge closes the tab
+          // and the second job fails before submitting anything.
+          await mkdir(path.join(outputDir, jobs[0].id), { recursive: true });
+          await writeFile(path.join(outputDir, jobs[0].id, "response.md"), "first answer");
+          await writeFile(path.join(outputDir, jobs[0].id, "metadata.json"), JSON.stringify({
+            id: jobs[0].id, provider: jobs[0].provider, state: "completed",
+            threadUrl: "https://chatgpt.com/c/c1", elapsedSeconds: 16,
+          }));
+          await mkdir(path.join(outputDir, jobs[1].id), { recursive: true });
+          await writeFile(path.join(outputDir, jobs[1].id, "metadata.json"), JSON.stringify({
+            id: jobs[1].id, provider: jobs[1].provider, state: "failed", error: tabClosed,
+          }));
+          return { code: 1, signal: null, stdout: "", stderr: "", spawnError: null };
+        }
+
+        assert.deepEqual(jobs.map((job) => job.provider), ["gemini"]);
+        const jobDir = path.join(outputDir, jobs[0].id);
+        await mkdir(jobDir, { recursive: true });
+        await writeFile(path.join(jobDir, "response.md"), "retried answer");
+        await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({
+          id: jobs[0].id, provider: "gemini", state: "completed",
+          threadUrl: "https://gemini.google.com/app/g1", elapsedSeconds: 10,
+        }));
+        return { code: 0, signal: null, stdout: "", stderr: "", spawnError: null };
+      },
+    });
+
+    assert.deepEqual(batches, [["chatgpt", "gemini"], ["gemini"]]);
+    assert.equal(result.task.state, "completed");
+    assert.equal(result.task.children.gemini.state, "completed");
+    assert.equal(result.task.children.gemini.retriedAsSingleBatch, true);
+    assert.equal(result.task.children.chatgpt.retriedAsSingleBatch, undefined);
+    assert.equal(await readFile(result.task.children.gemini.resultPath, "utf8"), "retried answer");
+    assert.equal(result.task.retryWarnings.length, 1);
+    assert.match(result.task.retryWarnings[0], /Retried gemini as a single batch/);
+    assert.ok(progress.some((line) => line.includes("retrying gemini alone")));
+    assert.equal((await store.snapshot()).sessions.workspaces["sample-repo"].gemini, "https://gemini.google.com/app/g1");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a provider that failed after submitting is never retried automatically", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-runner-"));
+  const store = new Store(home);
+  const config = {
+    defaultProvider: "chatgpt",
+    defaultProviders: ["chatgpt", "gemini"],
+    defaultConcurrency: 1,
+    defaultTimeoutSeconds: 1200,
+    maxTimeoutSeconds: 7200,
+    maxConcurrency: 3,
+    downloadImages: false,
+  };
+  let launches = 0;
+  try {
+    const result = await executeTask({
+      prompt: "Do not double-submit.",
+      providers: ["chatgpt", "gemini"],
+      workspace: "sample-repo",
+      timeoutSeconds: 1200,
+    }, {
+      home, store, config, skipPreflight: true,
+      runProcess: async (_command, args) => {
+        launches += 1;
+        const outputDir = argAfter(args, "--output-dir");
+        const jobs = (await readFile(argAfter(args, "--input"), "utf8"))
+          .trim().split("\n").map((line) => JSON.parse(line));
+        for (const job of jobs) {
+          const jobDir = path.join(outputDir, job.id);
+          await mkdir(jobDir, { recursive: true });
+          await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({
+            id: job.id, provider: job.provider, state: "failed",
+            // Same wording, but the tab URL proves the prompt already reached a conversation.
+            threadUrl: job.provider === "gemini" ? "https://gemini.google.com/app/g1" : null,
+            error: job.provider === "gemini"
+              ? "list_pages failed: The selected page has been closed"
+              : "response did not complete",
+          }));
+        }
+        return { code: 1, signal: null, stdout: "", stderr: "", spawnError: null };
+      },
+    });
+
+    assert.equal(launches, 1);
+    assert.equal(result.task.children.gemini.state, "failed");
+    assert.equal(result.task.children.gemini.retriedAsSingleBatch, undefined);
+    assert.equal(result.task.retryWarnings, undefined);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
