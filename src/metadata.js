@@ -255,11 +255,17 @@ export async function readBatchMetadata(outputDir, jobId, expectedProvider, { ru
   }
 
   if (TERMINAL_STATES.has(state)) {
+    // ask-bridge can write the answer and then fail to finalize metadata.json
+    // (Windows "os error 5"). The text on disk is then the only copy of a
+    // finished answer, so report the path as unverified instead of reporting
+    // nothing and letting the caller treat the job as a total failure.
+    const salvage = state === "failed" ? await readStableRegularFile(path.join(jobDir, "response.md")) : null;
+    const salvagePath = salvage?.body?.length ? path.join(jobDir, "response.md") : null;
     return {
       state,
       threadUrl: safeThreadUrl,
       error: metadata.error ?? null,
-      responsePath: null,
+      responsePath: salvagePath,
       metadata,
       identityVerified: true,
       trustedCompletion: false,

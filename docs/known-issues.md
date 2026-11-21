@@ -18,6 +18,11 @@
 | U8 | `chrome-devtools-mcp.log` 无轮转 | 一般 | wfa 启动前按 64 MiB/4 MiB 门槛轮转 |
 | U9 | 缺 `submissionState` 等提交证明字段 | 设计 | 靠错误文本推断 |
 | U10 | `--concurrency 1` 串行批次也关掉上一个 job 的标签页 | 阻断 | wfa 自行拆为多个独立单 job 批次（含 detach） |
+| U11 | 僵尸 `running` 任务让 `list`/`status`/`resolve` 全部锁超时 | 阻断 | 0.2.8：读路径不再取写锁；`--no-refresh` 真正生效；锁等待打印持有者 |
+| U12 | `.store.lock` 持有者已死但无法删除或改名 | 阻断 | 0.2.8：`wfa unlock` 接管（rename 优先 + 代次复验）；失败时报 `STORE_LOCK_UNRECLAIMABLE` 并给出路 |
+| U13 | 自动把工作区 git remote 注入 `repoReference` | 严重 | 0.2.8：发送前打印被注入的 `url@commit`；默认仍注入，`--no-repo` 关闭 |
+| U14 | 写 `metadata.json` 报 `os error 5`，任务被判 failed | 严重 | 0.2.8：`response.md` 存在时记 `completed` + `degradedReason`，不再丢答案 |
+| U15 | `mkdir` 数据家目录报 `EPERM` | 严重 | 0.2.8：目录已存在即视为成功，真权限问题留到 `open` |
 
 ---
 
@@ -188,11 +193,177 @@ wfa status <第二个 task-id>   # 比较两次的 Conversation
 
 ---
 
+## U11 僵尸 `running` 任务让全部命令锁超时
+
+**现象**：`tasks.json` 里存在状态为 `running` 但进程早已退出的任务时，**所有**命令（包括只读的 `wfa list`、`wfa status <id>`、`wfa resolve`）都返回：
+
+```
+wfa: Timed out waiting for the local task-store lock. Do not start a duplicate request; retry the status command.
+```
+
+**证据**：本次会话中 `tasks.json`（107 个任务）里有两条 `running`，`createdAt` 分别是 2026-11-20T16:10:50Z 和 2026-11-21T17:17:00Z，对应的 `parentPid` / `childPid` 均已不存在。只要它们在，任何命令都进不去。
+
+**复现**：让任一任务在 `running` 状态下强杀进程（关闭终端、超时被杀、机器休眠），随后执行 `wfa list`。
+
+**影响**：`wfa resolve` 本身也需要锁，所以**无法用官方命令自救**。唯一出路是手工编辑 `tasks.json` 把 `state` 改成终态，这要求用户知道文件位置和结构。对非程序员等于 wfa 彻底报废。
+
+**期望**：
+- 启动时用 `pidAlive()` 校验所有 `running` 任务的 `parentPid`/`childPid`，死的直接转 `failed` 并写 `staleReason`
+- 或者 `wfa doctor --fix` 提供显式的僵尸清理入口
+- 锁超时的错误信息应指出「被哪个 task id / pid 占用」，而不只是一句 retry
+
+---
+
+## U12 `.store.lock` 持有者已死，但锁无法删除或改名
+
+**现象**：`.store.lock` 内容为 `{"pid":20012,...}`，`tasklist /FI "PID eq 20012"` 无匹配（进程不存在）。清理尝试全部失败：
+
+```
+$ mv .store.lock .store.lock.stale-1795282941
+mv: cannot move '...\.store.lock' to '...\.store.lock.stale-1795282941': Permission denied
+
+$ rm -f .store.lock
+[safe-delete][SAFE_DELETE_BULK_GUARD_ERROR] state lock timeout
+
+PowerShell> [System.IO.File]::Delete($p)
+（无输出，文件仍在）
+```
+
+**对比**：同一目录下 `touch .write-probe` 成功，说明目录本身可写。因此不是磁盘权限，而是该文件被某个句柄持续持有（delete-pending 或杀软扫描）。
+
+**影响**：配合 U11，形成死锁：任务状态卡住 → 锁不释放 → 手工清理锁又失败。这次最终是靠手工改 `tasks.json` 才恢复了一半，锁仍然在。
+
+**期望**：
+- 锁文件写到独立子目录（如 `.locks/store.lock`），整目录可重建
+- 或者用 `tasks.json` 旁的 `*-journal` 而非独立锁文件
+- 提供 `wfa doctor --force-unlock`，走 `rename` 到随机名再删除的路径，并在失败时打印持有句柄的进程
+- 锁超时前先做一次 `pidAlive` 强校验，而不是只依赖 `open(..., "wx")` 的 EEXIST
+
+---
+
+## U13 自动把工作区 git remote 注入 `repoReference`
+
+**现象**：`wfa ask` 未加 `--no-repo` 时，任务元数据里出现：
+
+```json
+"repoReference": {"url": "https://github.com/<owner>/<repo>", "branch": "main", "commit": "<sha>"}
+```
+
+并且 provider 会**真的去读这个远程仓库**，而不是只读 prompt。
+
+**两条实际后果**：
+
+1. Gemini 直接拒答，`response.md` 全文只有：
+
+```
+The repository URL provided (`https://github.com/...`) cannot be accessed because
+no repository-reading or web-fetching tools are available in this environment.
+
+REPO_UNREADABLE
+```
+
+而本次 prompt 里**不含任何 URL**（已 `grep -nE "https?://"` 验证为空）。也就是说 provider 拿到的是一个它读不到、又以为必须读的引用，于是放弃回答。
+
+2. ChatGPT 的回答里出现「已成功读取 `<repo>` 指定提交 `<sha>`」并据此做代码核查，但那个提交**不包含**待审的脚本文件（工作副本的未提交改动看不到）。基于旧快照得出的结论看起来权威，实则与本地现场不符。
+
+**影响**：
+- 违反「数据不上传、日常离线」的使用前提：私有仓库 URL 与 commit 被送进第三方会话
+- 用本地未提交内容提问时，provider 审的是远程旧版本，答案与现场错位
+- 对 Gemini 直接导致零产出
+
+**期望**：
+- **默认 `--no-repo`**，需要仓库引用时显式 `--repo-url` 或 `--bundle-repo`
+- 注入前打印一行提示（「已注入 repoReference: <url>@<sha>，用 --no-repo 关闭」）
+- provider 读到不可访问的 repo 时，应忽略该引用继续回答，而不是整体拒答
+
+---
+
+## U14 写 `metadata.json` 报 `os error 5`，任务被判 failed
+
+**现象**：
+
+```
+[batch] job wfa-gemini-caaea983: failed (failed to persist metadata.json:
+Failed to finalize ...\ask-bridge-output\wfa-gemini-caaea983\metadata.json: 拒绝访问。 (os error 5))
+```
+
+同目录下残留 `.metadata.json.tmp-36680`（185 字节），`metadata.json` 停在 `"state":"in_progress"`。
+
+**影响**：回答已经生成（`response.md` 存在），但因为元数据落盘失败，整个任务判 failed；随后又触发 U11 的僵尸状态。也就是说**一次写入失败会连带三件事**：结果丢失、状态卡住、锁卡住。
+
+**期望**：
+- 元数据写入失败不应否定已产出的 `response.md`；应标记 `degraded` 并把正文保留在可收集位置
+- 重试一次（换临时文件名）；仍失败时写 `.metadata.failed.json` 说明原因
+- `os error 5` 在 Windows 上常见于杀软扫描或另一个句柄未关，错误信息应带上目标路径与持有者推断
+
+---
+
+## U15 `mkdir` 数据家目录报 `EPERM`
+
+**现象**：
+
+```
+wfa: EPERM: operation not permitted, mkdir 'C:\Users\<user>\AppData\Local\web-first-ask'
+```
+
+**上下文**：该目录**已存在**且 `touch` 可写。报错发生在 `mkdir(..., {recursive:true})` 路径上，说明 wfa 把「目录已存在」判成了「无法创建」。
+
+**影响**：命令在进入业务逻辑之前就退出，用户看到的是权限错误，实际是幂等判断写错了。
+
+**期望**：`mkdir` 的 `EEXIST`（以及 Windows 的 `EPERM` 变体）在 `recursive: true` 下应视为成功；真正的权限问题留给后续 `open` 报错，并在信息里给出实际路径。
+
+---
+
+## wfa 0.2.8 修复与实测（2026-11-22 02:20）
+
+U11–U15 里只有 U14 的一半在 ask-bridge 侧，其余都在 wfa 或本机守卫，已在 0.2.8 处理。
+
+### 实测到的真实原因
+
+- **`%LOCALAPPDATA%` 的写入会被间歇性拦截**，与卷无关。同一路径同一进程：
+
+  | 操作 | 结果 |
+  | --- | --- |
+  | 新建文件 | 1 ms |
+  | 覆写已存在文件 | 15,607 ms；另一次 30,120 ms 后 `EPERM` |
+  | 追加到已存在文件 | `EPERM` |
+  | 删除文件 | `EPERM` |
+  | 覆写工作区（`H://`）文件 | 1 ms |
+
+  两小时后同一目录的覆写回到 0–6 ms。也就是说这是守卫自身 state lock 卡死期间的**瞬时**表现（它的 stale 窗口过期后自愈），不是磁盘权限，也不是 wfa 独有。U12 里 `mv` 报 Permission denied、`rm` 报 state lock timeout 都是同一状态。
+- 因此 `tasks.json` 的每次落盘（`writeJsonAtomic` = 临时文件 + rename 覆写）都可能变成 15–30 秒。一个事务写两份文件，两个会话就会互相把 15 秒的等待预算吃光——这解释了「两个会话同时调用 wfa」后立刻全盘 `STORE_LOCK_TIMEOUT`。
+
+### 已修
+
+1. **读不取写锁**：`Store.snapshot()` 直接读两份 JSON。`wfa list`、`wfa status` 在锁被占时依然可用。
+2. **`--no-refresh` 生效**：它此前被解析但从未判断，`wfa list --no-refresh` 仍会对最多 20 个任务各跑一次写事务。现在真正跳过，且刷新改为顺序执行，避免一批锁等待者。
+3. **失效锁接管**：`wfa unlock` 走「rename 到 `*.stale-<token>-<ts>` → 删除」，并先用独立 claim 文件串行化接管者、再复验锁的代次（token + pid + createdAt），避免两个等待者互相移走对方新建的锁。rename 与 unlink 都失败时报 `STORE_LOCK_UNRECLAIMABLE`，写明路径、持有者与两条出路（`wfa unlock` / 换 `WFA_HOME`）。
+4. **等待可观察**：争锁超过 750 ms 向 stderr 打一行，含持有者 pid、host、锁龄与完整路径；超时错误同样带这些字段，不再只说 retry。
+5. **按需写入**：事务只重写内容真正变化的文件。只改 `tasks.json` 的事务不再顺带覆写 `sessions.json`，在慢盘上直接省掉一次 15–30 秒。
+6. **外部探测移出锁**：`checkAskBridge` 不再在任务创建事务内执行。
+7. **`mkdir` 幂等**：目录已存在（含 Windows 的 `EPERM` 变体）即视为成功。
+8. **U14 不再丢答案**：`metadata.json` 落盘失败但 `response.md` 存在时，任务记 `completed` 并带 `degradedReason: METADATA_PERSIST_FAILED`，正文可取。
+9. **U13 发送前告知**：注入 `repoReference` 时打印 `url@commit` 并提示 `--no-repo` / `--bundle-repo=zip`。默认仍是注入——改成默认关闭会改变现有语义，留给 0.3.0 决定。
+10. **`wfa doctor` 增加存储写入探针**：分别测一次覆写和一次 rename 覆写，超过 2 秒标 `SLOW` 并提示换 `WFA_HOME`；Chrome 与 ask-bridge 检查前先打一行进度，避免「无输出=卡死」的误判。
+11. **`wfa --version`** 此前报 `Unknown command "--version"`，现在直接读 `package.json`，不建 Store。
+
+### 验证
+
+- 三个曾被判定「废掉」的 home（`web-first-ask`、`-2`、`-3`）用 `wfa unlock` 全部清掉；随后 `wfa list --no-refresh` 分别 236 / 215 / 250 ms 返回（此前 15 秒超时）。
+- 6 个进程同时抢一个失效锁，临界区写入时间戳，连跑 5 轮无一次区间重叠。
+- 全套 `node --test tests` 通过（本地 Windows，含上述竞态用例）。
+
+以上第 2、4、5、6 条来自 ask-bridge 侧评审（ChatGPT 读本仓 zip 后给出），其中「rename 自动接管不安全」的 ABA 反例成立，最终实现改成 claim + 代次复验。
+
+---
+
 ## 建议优先级
 
-- **P0**：U2（静默截断产生「看起来正常」的错误结论）、U4（答非所问且难察觉）、U1（Gemini 附件完全不可用）、U10（串行必挂一次）
-- **P1**：U3（长产物取不到）、U5（输出不可直接用）、U9（其余判定的地基）
-- **P2**：U6、U7、U8
+- **P0**：U2（静默截断产生「看起来正常」的错误结论）、U4（答非所问且难察觉）、U1（Gemini 附件完全不可用）、U10（串行必挂一次）、U11（僵尸任务让全部命令不可用）、U12（锁无法清理，与 U11 形成死锁）
+- **P1**：U3（长产物取不到）、U5（输出不可直接用）、U9（其余判定的地基）、U13（默认上传远程仓库地址，且让 Gemini 零产出）、U14（一次写失败连带丢结果+卡状态+卡锁）
+- **P2**：U6、U7、U8、U15
+
+**U11 + U12 是最致命的一组**：两者互相放大，且都没有官方自救入口。用户能看到的只有一句 `retry the status command`，而重试永远不会成功。
 
 ---
 

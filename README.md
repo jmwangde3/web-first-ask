@@ -283,6 +283,15 @@ By default, state is stored in:
 
 Set `WFA_HOME` to override the directory.
 
+If every command feels slow, run `wfa doctor`: it measures one overwrite and one
+rename in that directory and prints `SLOW` above two seconds. A filter driver,
+antivirus scanner or network redirector that intercepts writes to existing files
+turns each task transaction into a 15-30 s wait, and a run killed mid-write
+leaves a lock that costs the same again. Point `WFA_HOME` at a fast local
+volume in that case; the ledger can be copied over. `wfa unlock` clears a lock
+whose owner is gone. A killed run is never fatal: `wfa list`, `wfa status` and
+`wfa result` do not take the write lock.
+
 The directory contains prompts, task metadata, provider results, batch input and diagnostic logs. It is local data; do not sync it to a shared location unless you explicitly intend to. Do not attach secrets, credentials, tokens, private keys, personal data, or sensitive legal/arbitration materials to provider requests.
 
 ## Safety model

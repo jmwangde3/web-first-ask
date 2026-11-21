@@ -54,6 +54,22 @@ export function classifyProviderError({ error = "", stderr = "", jobId, state, h
   const text = [error, stderrForJob(stderr, jobId)].filter(Boolean).join("\n").trim();
   if (!text) return { errorCode: null, recoveryHint: null, retryAfterSeconds: null, retryAfterAt: null, retryAfterEstimated: false };
 
+  // ask-bridge can finish the answer and then fail to finalize metadata.json
+  // (Windows "os error 5": a filter driver, AV scanner or a leftover handle on
+  // the temp file). The answer is already on disk. Reporting the job as failed
+  // loses a finished result and leaves a task that needs manual repair, so this
+  // is a degraded success, not a failure.
+  if (hasResponse && state !== "completed" && /failed to persist metadata\.json/i.test(text)) {
+    return {
+      errorCode: "METADATA_PERSIST_FAILED",
+      degraded: true,
+      recoveryHint: "The answer was written to response.md but ask-bridge could not finalize metadata.json. The result is kept and treated as complete but unverified; do not resend the request.",
+      retryAfterSeconds: null,
+      retryAfterAt: null,
+      retryAfterEstimated: false,
+    };
+  }
+
   // This exact Gemini failure happens while waiting for the upload to appear,
   // i.e. before the prompt is submitted. Do not generalize it to every upload
   // error or every timeout: only this observed message is provably pre-submit.

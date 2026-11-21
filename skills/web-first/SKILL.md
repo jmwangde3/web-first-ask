@@ -155,6 +155,7 @@ wfa ask --providers 'chatgpt,gemini,claude' ...
 - Failures that provably happened before submission — the tab never loaded, the send button never became enabled, or a Gemini attachment upload timed out — release the lock automatically. Do not spend a `wfa resolve` on them; just fix the cause and retry.
 - Progress now streams: `[ask-bridge stdout] …` lines appear on stderr while the batch runs. Use them to decide whether the provider is working, and do not treat prolonged silence as failure while the process is alive.
 - If ask-bridge writes matching terminal `completed` metadata and a complete `response.md`, WFA automatically adopts the saved result during task refresh. Use `wfa collect <task-id> --provider <provider>` to return that result without another browser request or confirmation.
+- `STORE_LOCK_TIMEOUT` names the process holding the task-store lock. `wfa list`, `wfa status` and `wfa result` keep working during a lock wait because reads do not take the lock. If the named owner is gone, run `wfa unlock` once; if that reports `STORE_LOCK_UNRECLAIMABLE`, the data directory is unusable and `WFA_HOME` should point at a fast local volume.
 - If no trusted terminal artifact exists, `wfa collect --confirm-complete` uses ask-bridge `get` as a manual recovery path. Independently confirm in the browser that generation has stopped first, because `get` itself does not establish completion.
 - If the old generation is definitely no longer active and cannot be collected, unlock it only with:
   `wfa resolve <task-id> --provider <provider> --confirm`

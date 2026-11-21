@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.2.8 - Unreleased
+
+One killed run used to be enough to make a data directory permanently unusable:
+the store lock could not be taken over, and every command -- including read-only
+ones -- queued behind it. On a Windows host where writes to the data directory
+were intermittently blocked for 15-30 s (a filter driver; measured, then
+transient), two concurrent sessions deadlocked each other within one request.
+
+### Fixed
+- A read no longer takes the exclusive write lock. `wfa list`, `wfa status` and
+  every other snapshot keep working while another session holds the lock; each
+  file is still replaced atomically, so a reader sees a complete file. A
+  snapshot is a preview, never the basis for a commit.
+- `--no-refresh` was parsed and then ignored, so `wfa list --no-refresh` still
+  ran up to twenty write transactions. It is honoured now, and refreshes run
+  sequentially instead of as a burst of lock waiters.
+- `wfa unlock` clears a lock whose owner is gone: rename to
+  `.store.lock.stale-<token>-<ts>` first (a rename needs no delete, and deleting
+  is what a filter driver or antivirus refuses), unlink second. Takeover is
+  serialized through a separate claim file and re-verifies the lock generation
+  (token, pid, createdAt) before touching it, because two waiters that both saw
+  the same dead lock could otherwise rename the lock the other one just created.
+  Six processes racing one stale lock are tested on Windows; their critical
+  sections never overlap.
+- A dead owner whose lock can be neither renamed nor deleted now fails fast with
+  `STORE_LOCK_UNRECLAIMABLE`, naming the lock path, the owner and the two ways
+  out, instead of burning the full wait budget and then saying "retry".
+- Waiting for the lock prints one stderr line after 750 ms with the holder's
+  pid, host, age and the lock path. `STORE_LOCK_TIMEOUT` carries the same
+  fields. The default wait is 60 s (`WFA_LOCK_TIMEOUT_MS`), which covers one
+  holder's writes on a throttled volume; the staleness rule for an unknown owner
+  is a separate constant so raising the budget cannot make reclaim more eager.
+- A transaction only rewrites the files whose content changed. On a volume where
+  each overwrite costs 15-30 s, skipping an untouched `sessions.json` is the
+  difference between one wait and two.
+- `checkAskBridge` no longer runs inside the task-creation transaction, where it
+  held every other session out for the duration of an external process probe.
+- `mkdir` for the data directory treats "it exists" as success, including the
+  Windows `EPERM` variant; a real permission problem is still reported by the
+  following `open`, with the path.
+- A batch job whose answer was written but whose `metadata.json` could not be
+  finalized (Windows `os error 5`) is recorded as `completed` with
+  `degradedReason: METADATA_PERSIST_FAILED` and its `response.md` kept, instead
+  of being judged `failed` and losing a finished answer.
+- Injecting a repository reference now prints the `url@commit` before sending,
+  next to the reminder that `--no-repo` sends the prompt only and
+  `--bundle-repo=zip` sends the actual sources. The default is unchanged.
+- `wfa --version` answers instead of `Unknown command "--version"`, without
+  creating a store or probing a provider.
+- `wfa doctor` measures one overwrite and one rename in the data directory and
+  flags `SLOW` above two seconds, and prints a progress line before the Chrome
+  and ask-bridge checks so an empty terminal no longer reads as a hang.
+
+
 ## 0.2.7 - Unreleased
 
 The zip transport shipped in 0.2.6 was treated as an opaque blob by everything

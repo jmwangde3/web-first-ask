@@ -14,7 +14,9 @@ import { startHeartbeat } from "./util.js";
 const TAB_CLOSED = /list_pages failed|selected page has been closed/i;
 const WORKER_PATH = fileURLToPath(new URL("../bin/wfa.js", import.meta.url));
 
-function mappedState(state, classified) {
+function mappedState(state, classified, hasResponse = false) {
+  // A finished answer whose metadata write failed is complete, not failed.
+  if (classified.degraded && hasResponse) return "completed";
   if (state !== "failed" && state !== "failed_before_start") return state;
   if (classified.errorCode === "RATE_LIMITED") return "rate_limited";
   if (classified.errorCode === "LOGIN_REQUIRED") return "login_required";
@@ -37,11 +39,12 @@ async function saveResult({ store, task, provider, result, processResult, retry 
       error: result.error, stderr: processResult.stderr ?? "", jobId: child.jobId,
       state: result.state, hasResponse: Boolean(result.responsePath),
     });
-    child.state = mappedState(result.state, classified);
+    child.state = mappedState(result.state, classified, Boolean(result.responsePath));
     child.threadUrl = result.threadUrl ?? child.threadUrl;
     child.error = result.error;
     child.resultPath = result.responsePath ?? child.resultPath;
     child.errorCode = classified.errorCode;
+    child.degradedReason = classified.degraded ? classified.errorCode : null;
     child.recoveryHint = classified.recoveryHint;
     child.retryAfterSeconds = classified.retryAfterSeconds;
     child.retryAfterAt = classified.retryAfterAt;

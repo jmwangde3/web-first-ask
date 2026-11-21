@@ -346,6 +346,10 @@ export async function executeTask(input, dependencies = {}) {
     return { task: prior, replayed: true };
   }
 
+  // Ask-bridge availability is an external probe that can take a second. It
+  // used to run inside the task-store lock, which made every other session wait
+  // for it; nothing in the idempotency check depends on the result.
+  const preflight = dependencies.skipPreflight ? null : await checkAskBridge(config);
   let createdJobs = [];
   const created = await store.transaction(async ({ tasks, sessions }) => {
     const previousId = tasks.requestIndex?.[requestId];
@@ -373,7 +377,6 @@ export async function executeTask(input, dependencies = {}) {
       || JSON.stringify(latestSessionFingerprint) !== JSON.stringify(sessionFingerprint)) {
       throw new WfaError("SESSION_CHANGED_RETRY", "Workspace conversation state changed while preparing this request. Re-run the command; no provider request was sent.");
     }
-    const preflight = dependencies.skipPreflight ? null : await checkAskBridge(config);
     const command = preflight?.command ?? resolveAskBridge(config);
     const runDir = path.join(paths.runs, taskId);
     const outputDir = path.join(runDir, "ask-bridge-output");

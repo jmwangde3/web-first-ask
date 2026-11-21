@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -96,6 +96,71 @@ test("compare replay returns nonzero for a partial batch without losing the succ
     const inspection = spawnSync(process.execPath, [bin, "status", task.taskId, "--json"], options);
     assert.equal(inspection.status, 0);
     assert.equal(JSON.parse(inspection.stdout).state, "partial");
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("--version answers before any store, config or provider work", async () => {
+  const bin = fileURLToPath(new URL("../bin/wfa.js", import.meta.url));
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-version-"));
+  try {
+    const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+    const run = spawnSync(process.execPath, [bin, "--version"], {
+      env: { ...process.env, WFA_HOME: home, NODE_OPTIONS: "" }, encoding: "utf8",
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.stdout.trim(), `wfa ${pkg.version}`);
+    // No store was created just to print a version.
+    assert.deepEqual(await readdir(home).catch(() => []), []);
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("unlock clears a dead owner's lock and says so", async () => {
+  const bin = fileURLToPath(new URL("../bin/wfa.js", import.meta.url));
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-unlock-"));
+  try {
+    await writeFile(path.join(home, ".store.lock"), JSON.stringify({
+      pid: 999999, host: os.hostname(), createdAt: Date.now() - 60000, token: "dead",
+    }));
+    const cleared = spawnSync(process.execPath, [bin, "unlock", "--json"], {
+      env: { ...process.env, WFA_HOME: home, NODE_OPTIONS: "" }, encoding: "utf8",
+    });
+    assert.equal(cleared.status, 0, cleared.stderr);
+    assert.equal(JSON.parse(cleared.stdout).removed, true);
+    const idle = spawnSync(process.execPath, [bin, "unlock"], {
+      env: { ...process.env, WFA_HOME: home, NODE_OPTIONS: "" }, encoding: "utf8",
+    });
+    assert.equal(idle.status, 0);
+    assert.match(idle.stdout, /Nothing to clear/);
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("list --no-refresh reads without taking the write lock", async () => {
+  const bin = fileURLToPath(new URL("../bin/wfa.js", import.meta.url));
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-list-"));
+  try {
+    await writeFile(path.join(home, "tasks.json"), JSON.stringify({
+      version: 1, requestIndex: {},
+      tasks: { "task-1": { taskId: "task-1", workspace: "demo", kind: "ask", state: "running",
+        createdAt: new Date().toISOString(), children: { chatgpt: { state: "running", jobId: "wfa-chatgpt-1" } } } },
+    }));
+    // A lock owned by a live process: any lock-taking read would block for the
+    // whole wait budget, so a fast answer proves the read path stays lock-free.
+    await writeFile(path.join(home, ".store.lock"), JSON.stringify({
+      pid: process.pid, host: os.hostname(), createdAt: Date.now(), token: "held",
+    }));
+    const started = Date.now();
+    const run = spawnSync(process.execPath, [bin, "list", "--no-refresh"], {
+      env: { ...process.env, WFA_HOME: home, NODE_OPTIONS: "" }, encoding: "utf8", timeout: 20000,
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, /task-1/);
+    assert.ok(Date.now() - started < 10000, "list must not wait for the lock");
   } finally {
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
