@@ -9,6 +9,20 @@ same second wrote to the same path. This release closes those gaps so the two
 transports behave the same way.
 
 ### Fixed
+- `--bundle-repo` with `--file` selects the named sources again when the working
+  tree has more than one absolute spelling. `git rev-parse --show-toplevel`
+  resolves junctions, 8.3 short names (`C:\Users\RUNNER~1\…`, the temp path on
+  the Windows CI runner) and drive-letter case, but the include comparison used
+  raw `path.resolve` strings, so a mismatch selected nothing. The bundle then
+  shipped an inventory that claimed "the sources included below are
+  authoritative" while holding zero sources. Includes are now reduced to
+  repository-relative labels through `realpath` and folded by case on Windows.
+  This had been failing every `windows-latest` CI job since 0.2.5.
+- `--bundle-repo` now fails with `BUNDLE_REPO_INCLUDE_UNMATCHED` when none of the
+  `--file` paths made it into the bundle, naming the paths and the reason. It
+  used to send the empty bundle silently; in inline mode those `--file` paths are
+  consumed as includes and never attached, so the request arrived with neither
+  the sources nor any warning.
 - A `--bundle-repo=zip` task no longer records a `repoReference`, and its result
   is no longer run through the `REPO_UNREADABLE` sentinel. `task.bundleRepo`
   means "a repository payload was shipped", not "it was inlined", so it is now

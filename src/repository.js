@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { WfaError } from "./errors.js";
 
@@ -110,6 +110,37 @@ function matchesExclude(file, patterns) {
   });
 }
 
+// Git reports the toplevel with forward slashes, and one directory can have
+// several spellings on Windows: an 8.3 short name (`RUNNER~1`), a junction, a
+// different drive-letter case. Comparing absolute strings therefore fails on
+// some machines, and when it failed the bundle included nothing while still
+// calling itself authoritative. Reduce every path to a repository-relative
+// label through realpath before comparing.
+function foldPath(value) {
+  return process.platform === "win32" ? String(value).toLowerCase() : String(value);
+}
+
+async function canonicalLabel(value) {
+  const absolute = path.resolve(value);
+  const resolved = await realpath(absolute).catch(() => absolute);
+  return resolved.replace(/\\/g, "/");
+}
+
+async function includeLabelsFor({ root, cwd, includes }) {
+  const rootLabel = await canonicalLabel(root);
+  const labels = [];
+  for (const entry of includes) {
+    const requested = String(entry);
+    const target = await canonicalLabel(path.resolve(cwd, requested));
+    const relative = path.posix.relative(rootLabel, target);
+    const label = relative && !relative.startsWith("..") && !path.posix.isAbsolute(relative)
+      ? relative
+      : path.posix.normalize(requested.replace(/\\/g, "/"));
+    labels.push(foldPath(label));
+  }
+  return labels;
+}
+
 export async function bundleRepository({ cwd = process.cwd(), excludes = [], includes = [], prompt = "", maxFileBytes = 65536,
   maxTotalBytes = 8 * 1024 * 1024, maxInlineBytes = 30 * 1024 } = {}) {
   const root = await git(cwd, "rev-parse", "--show-toplevel").catch(() => null);
@@ -127,10 +158,10 @@ export async function bundleRepository({ cwd = process.cwd(), excludes = [], inc
     if (invalid) skipped.push({ path: label, reason: "excluded/generated/binary filename" });
     return !invalid;
   });
-  const selectedPaths = includes.map((entry) => path.resolve(cwd, entry));
+  const selectedPaths = await includeLabelsFor({ root, cwd, includes });
   const matchesInclude = (entry) => selectedPaths.some((item) => {
-    const absolute = path.resolve(root, entry);
-    return absolute === item || absolute.startsWith(item + path.sep);
+    const label = foldPath(entry);
+    return label === item || label.startsWith(`${item}/`);
   });
   const taskText = String(prompt);
   const mentioned = eligible.filter((item) => taskText.includes(item)
@@ -169,6 +200,16 @@ export async function bundleRepository({ cwd = process.cwd(), excludes = [], inc
     content += section;
     sourceBytes += buffer.length;
     files += 1;
+  }
+  // Every requested path is allowed to be skipped for a stated reason, but if
+  // none of them made it in there is nothing authoritative to send. Say so
+  // instead of shipping an inventory that promises sources it does not hold.
+  if (includes.length && files === 0) {
+    const unmatched = includes.filter((entry) => !eligible.some(matchesInclude));
+    const detail = unmatched.length
+      ? `none of these paths is a tracked, non-excluded file under ${path.posix.normalize(String(root).replace(/\\/g, "/"))}: ${unmatched.join(", ")}`
+      : `every requested path was skipped: ${skipped.filter((item) => priority.includes(item.path)).map((item) => `${item.path} (${item.reason})`).join(", ") || includes.join(", ")}`;
+    throw new WfaError("BUNDLE_REPO_INCLUDE_UNMATCHED", `--bundle-repo could not inline any requested file: ${detail}. A path passed with --file must be relative to the repository root, not to the current directory.`);
   }
   return { content, stats: { files, bytes: Buffer.byteLength(content, "utf8"), skipped: skipped.length,
     listed: eligible.length, sourceBytes, coreEntryPoints: core }, skipped };

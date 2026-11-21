@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { resolveRepository, repositoryBlock, bundleRepository, repositoryFallbackCommand } from "../src/repository.js";
@@ -304,3 +304,29 @@ test("a live owner with a fresh heartbeat still blocks resolve", async () => {
     );
   } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
+
+// A directory can have more than one absolute spelling: a junction or symlink,
+// an 8.3 short name such as the `RUNNER~1` temp path on the Windows CI runner,
+// or a different drive-letter case. `git rev-parse` always answers with the
+// resolved one, so comparing absolutes made `--bundle-repo` include nothing --
+// while still telling the provider its (empty) bundle was authoritative.
+test("an include reached through another spelling of the same directory still selects the file", async () => withRepo(async ({ root, home }) => {
+  const link = path.join(home, "repo-link");
+  await symlink(root, link, process.platform === "win32" ? "junction" : "dir");
+  const viaLink = await bundleRepository({ cwd: link, includes: ["src/main.js"] });
+  assert.equal(viaLink.stats.files, 1);
+  assert.match(viaLink.content, /FILE: src\/main\.js/);
+}));
+
+test("an include that matches no tracked file fails instead of sending an empty bundle", async () => withRepo(async ({ root }) => {
+  await assert.rejects(
+    () => bundleRepository({ cwd: root, includes: ["src/nope.js"] }),
+    (error) => error.code === "BUNDLE_REPO_INCLUDE_UNMATCHED" && /src\/nope\.js/.test(error.message),
+  );
+}));
+
+test("an include is matched case-insensitively on Windows", { skip: process.platform !== "win32" }, async () => withRepo(async ({ root }) => {
+  const bundled = await bundleRepository({ cwd: root, includes: ["SRC/Main.JS"] });
+  assert.equal(bundled.stats.files, 1);
+  assert.match(bundled.content, /FILE: src\/main\.js/);
+}));
