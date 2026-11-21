@@ -148,9 +148,9 @@ wfa ask --providers 'chatgpt,gemini,claude' ...
 
 ## Provider known limits
 
-Measured against ask-bridge 0.2.1; full evidence and reproductions are in `docs/known-issues.md` of the `web-first-ask` repository.
+Measured against ask-bridge 0.4.0; full evidence and reproductions are in `docs/known-issues.md` of the `web-first-ask` repository (U1–U10). Those are upstream defects — `wfa` detects and works around them, it does not fix them.
 
-- **Gemini attachments do not work.** Any `--file` request to Gemini fails after 50–60 s with `ATTACHMENT_UPLOAD_TIMEOUT`. Inline the content in the prompt instead, and keep it under 40 KiB.
+- **Gemini attachments do not work.** Any `--file` request to Gemini fails after 50–60 s with `ATTACHMENT_UPLOAD_TIMEOUT`. `wfa` now inlines text attachments for Gemini automatically and refuses binary ones outright (`GEMINI_ATTACHMENT_UNSUPPORTED`); either way the inlined bytes count against the 40 KiB budget.
 - **Prompts over roughly 44 KiB are truncated without a signal.** This is the most dangerous failure mode: the answer looks normal and arrives faster. Always run `--dry-run` first and treat exit 2 as a stop sign.
 - **ChatGPT long answers may land in Canvas.** When the response is replaced by a download link plus a hash, `response.md` does not contain the artifact. Ask for smaller chunks, or request the content to be repeated inline in the chat.
 - **Gemini corrupts Markdown diffs.** `||` becomes `\vert{}\vert{}`, quoted variables get mangled and `diff --git` headers disappear. Never ask Gemini for a patch; ask for "file path + original block + replacement block" and apply it locally.
