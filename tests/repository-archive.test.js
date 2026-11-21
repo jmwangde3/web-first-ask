@@ -169,7 +169,7 @@ test("archive attachments are recognised so Gemini accepts them natively", () =>
     prompt: "look at the document",
     timeoutSeconds: 60,
     files: [path.join(os.tmpdir(), "report.pdf")],
-  }), /GEMINI_ATTACHMENT_UNSUPPORTED|Gemini document attachments/);
+  }), (error) => error.code === "GEMINI_ATTACHMENT_UNSUPPORTED");
 });
 
 test("two archives of the same repository in the same second do not collide", async () => {
@@ -177,6 +177,8 @@ test("two archives of the same repository in the same second do not collide", as
     const first = await archiveRepository({ cwd: root, outDir: out });
     const second = await archiveRepository({ cwd: root, outDir: out });
     assert.notEqual(first.file, second.file);
+    const stem = path.basename(first.file).replace(/\.zip$/, "");
+    assert.ok(stem.length <= 20, `attachment stem ${stem} must stay within ask-bridge's 20-character verification window`);
     assert.ok((await readFile(first.file)).length > 0);
     assert.ok((await readFile(second.file)).length > 0);
   });
