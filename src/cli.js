@@ -102,6 +102,7 @@ function printTask(task, json = false, replayed = false) {
     retryAfterEstimated: child.retryAfterEstimated ?? false,
     responseHeuristics: child.responseHeuristics ?? null,
     sessionIsolationWarning: child.sessionIsolationWarning ?? null,
+    retriedAsSingleBatch: Boolean(child.retriedAsSingleBatch),
   }]));
   const summary = {
     taskId: task.taskId,
@@ -111,6 +112,7 @@ function printTask(task, json = false, replayed = false) {
     state: task.state,
     executionPending: Boolean(task.executionPending),
     replayed,
+    retryWarnings: task.retryWarnings ?? [],
     providers: children,
   };
   if (json) {
@@ -120,8 +122,9 @@ function printTask(task, json = false, replayed = false) {
   process.stdout.write(`Task: ${task.taskId}${replayed ? " (existing request; not resent)" : ""}\n`);
   process.stdout.write(`Workspace: ${task.workspace}\nState: ${task.state}\n`);
   if (task.executionPending) process.stdout.write("Execution cleanup: pending; completed results are readable but the workspace/provider lock remains active.\n");
+  for (const warning of task.retryWarnings ?? []) process.stdout.write(`Retry: ${warning}\n`);
   for (const [provider, child] of Object.entries(children)) {
-    process.stdout.write(`- ${provider}: ${child.state}\n`);
+    process.stdout.write(`- ${provider}: ${child.state}${child.retriedAsSingleBatch ? " (after a single-job retry)" : ""}\n`);
     if (child.result) process.stdout.write(`  Result: ${child.result}\n`);
     if (child.thread) process.stdout.write(`  Conversation: ${child.thread}\n`);
     if (child.errorCode) process.stdout.write(`  Error: ${child.errorCode}${child.retryAfterAt ? ` (retry after ${child.retryAfterAt}${child.retryAfterEstimated ? ", estimated" : ""})` : ""}\n`);
