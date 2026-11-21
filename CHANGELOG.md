@@ -11,6 +11,20 @@ to documents: the same archive succeeded as `bundle.zip` and failed as a
 50-character timestamped name. Our own archive names were in the failing range,
 which meant `--bundle-repo=zip` never worked on Gemini without saying so.
 
+### Added
+- `wfa gemini-mode [chat|task]` and `--gemini-mode` reach Gemini's Chat/Task
+  switch. It is page state — not in the URL, not in `localStorage`, reset to Chat
+  by a reload — and ask-bridge exposes no hook for it, so wfa attached to the CDP
+  endpoint Chrome already opens (9223) and presses the control as soon as it
+  exists, polling every 80 ms. On this host the switch is clickable ~1.4 s after
+  the page appears while ask-bridge types as soon as the editor is ready, so the
+  ordering cannot be guaranteed from outside ask-bridge; the task therefore
+  records `geminiModeReport` (`applied`, `clicks`, `clickedAt`, `pageUrl`,
+  `error`) and `wfa status` prints it. A click that landed after text was already
+  typed — which could submit an empty prompt — is reported as an error instead of
+  a clean run. A detached plain batch has no coordinator left to hold the
+  debugging session and records that it could not press the switch.
+
 ### Fixed
 - Repository archives are named `<slug8>-<hex8>.zip` (17-character stem) instead
   of `<slug>-<timestamp>-<hex>.zip` (~50). Measured on one machine with the same
