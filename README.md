@@ -97,6 +97,8 @@ wfa browser-mode headless  # Run Chrome in the background (default)
 
 ask-bridge can reuse an open Chrome instance. To switch an already running instance, wait for active tasks to finish and run `ask-bridge close`. The next request opens Chrome in the saved mode. `wfa login` opens a visible window for manual sign-in.
 
+**Gemini Chat vs Task:** Gemini's landing mode is page state, not a URL parameter, and a reload puts it back on Chat. Set it once with `wfa gemini-mode task` (or per request with `--gemini-mode task`); chat stays the default. WFA attaches to the debugging port ask-bridge's Chrome already opens and presses the switch as the page appears, before the prompt is typed. Because that ordering cannot be guaranteed from outside ask-bridge, the task stores what was observed: `wfa status` prints `Gemini mode: task (switch pressed before typing)` on success, or the reason it did not apply. A detached plain batch has no coordinator process to hold that session and records that it could not press the switch.
+
 **Chrome crash-restore repair, built into WFA:** Before each ask-bridge batch or login launch, WFA scans ask-bridge's configuration directory for Chrome `Preferences` files. If `profile.exit_type` is exactly `Crashed`, WFA resets it to `Normal` and marks `exited_cleanly`, using an atomic file replacement. It leaves healthy and malformed profiles unchanged. `wfa doctor` reports the profile inspection and any repairs, and `wfa browser-mode` displays the repair status. WFA also trims `chrome-devtools-mcp.log` above 64 MiB down to its last 4 MiB. The old `wfa-chrome-restore-fix.mjs` external wrapper is no longer required. Never run profile repair concurrently with a Chrome instance that is writing its Preferences; finish/close that instance first.
 
 **Windows workaround for ask-bridge 0.4.0:** After switching from `headless` to `headful`, Chrome may reopen at a saved off-screen position. Press **Alt+Tab** to select the ask-bridge Chrome window, then press **Win+Up Arrow** to maximize it and bring it back on screen. [ask-bridge window launch code](https://github.com/doggy8088/ask-bridge/blob/7d4731f60f300f7cf3b98a5a92137144a17f98e9/src/main.rs#L2421-L2440)
@@ -249,6 +251,7 @@ The `ANCHOR` must match exactly once, including surrounding lines. Missing and a
 | `wfa login --provider <provider>` | Interactive provider login |
 | `wfa doctor` | Check Node.js, ask-bridge and Chrome profile recovery |
 | `wfa browser-mode [headless\|headful]` | Show or save default browser mode and repair status |
+| `wfa gemini-mode [chat\|task]` | Show or save the Gemini landing mode, and whether it was pressed |
 | `wfa install-skill [--target …]` | Install the Skill to Codex, WorkBuddy or a chosen directory |
 | `wfa upstream update` | Run ask-bridge's official update command |
 
