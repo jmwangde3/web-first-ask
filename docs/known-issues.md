@@ -1,33 +1,28 @@
-# wfa 已知问题（2026-11-21 实测）
+# ask-bridge 上游问题清单
 
-> 本文只记现象、证据与影响，不写修法细节。目的是让接手的人能复现、能排序、能判断优先级。
-> 环境：Windows 11 zh-CN / Git Bash / wfa 0.2.1（`web-first-ask`）/ ask-bridge headful Chrome / providers: ChatGPT + Gemini。
-> 用法场景：把一个 77 KB 的源码包交给两个 provider 做离线审阅；以及一个 37 KB 的架构提问。
+> **范围**：只保留必须由 ask-bridge（Go 二进制）修的问题。wfa 侧能提前拦截、标注或绕过的，已经落在 wfa 0.2.3，见文末「wfa 侧已做」，不占本清单。
+> **环境**：Windows 11 zh-CN / Git Bash / ask-bridge 0.4.0 / wfa 0.2.2→0.2.3 / Chrome headful（`--window-position=-2000,-2000`）/ providers: ChatGPT + Gemini。
+> **证据**：2026-11-21 单机实测，命令与时间均为真实运行结果；run 目录可复核。
 
-## 总览
+## 汇总
 
-| 编号 | 问题 | 级别 | 是否已用外部手段绕过 |
-|---|---|---|---|
-| A1 | Gemini 附件通道不可用 | 阻断 | 是（改内联） |
-| A2 | 大 prompt 静默截断，provider 基于半份材料作答 | 阻断 | 是（手工切包） |
-| A3 | ChatGPT 长产物默认进画布，`response.md` 取不到正文 | 阻断 | 否（人工下载） |
-| A4 | 失败的 job 锁住 workspace，必须手工 `resolve` | 阻断 | 是（每次手工解锁） |
-| B1 | `--new-session` 未隔离会话，答的是上一轮的问题 | 严重 | 否（只能靠改名规避） |
-| B2 | Gemini 输出被转义污染，diff 无法 apply | 严重 | 否（只当清单用） |
-| B3 | 没有分片概念 | 一般 | 是（手工切） |
-| B4 | 两个 provider 不能并发，`compare` 不可用 | 一般 | 是（串行跑两次） |
-| B5 | 后台运行时进度被吞 | 一般 | 否 |
-| B6 | `--dry-run` 只统计附件字节 | 一般 | 否 |
-| C1 | ask-bridge 留下 Chrome「未正确关闭」状态 | 一般 | 是（外部包装器） |
-| C2 | `chrome-devtools-mcp.log` 无轮转 | 一般 | 是（外部脚本截断） |
+| 编号 | 问题 | 级别 | wfa 侧现状 |
+| --- | --- | --- | --- |
+| U1 | Gemini 附件上传必然超时 | 阻断 | 文本自动内联，二进制提前拒绝 |
+| U2 | prompt > 约 44 KiB 静默截断 | 阻断 | 40 KiB 拦截并给拆分计划 |
+| U3 | ChatGPT 长产物进 Canvas，`response.md` 只有链接 | 阻断 | 检测并警告 |
+| U4 | `--new-session` 复用旧会话 | 严重 | 比对 threadUrl 并警告 |
+| U5 | Gemini 输出被二次转义 | 严重 | 检测并警告 |
+| U6 | 双 provider 并发不稳定 | 一般 | 默认串行 |
+| U7 | Chrome `exit_type` 停在 `Crashed`，弹恢复气泡 | 一般 | 外部包装器治标 |
+| U8 | `chrome-devtools-mcp.log` 无轮转 | 一般 | 外部脚本截断 |
+| U9 | 缺 `submissionState` 等提交证明字段 | 设计 | 靠错误文本推断 |
 
 ---
 
-## A. 阻断级
+## U1 Gemini 附件上传必然超时
 
-### A1 Gemini 附件通道不可用
-
-**现象**：带 `--file` 请求 Gemini，50–54 秒后失败，状态 `failed`。
+**现象**：给 Gemini 带任意 `--file` 附件，50–54 秒后失败：
 
 ```
 Timed out waiting for Gemini to show attachment 'skein-source-bundle-191ae7c.md'   elapsed=54s
@@ -35,15 +30,23 @@ Timed out waiting for Gemini to show attachment 'skein-source-bundle-191ae7c.txt
 Timed out waiting for Gemini to show attachment 'source-bundle-e7430cb187f7.txt'   elapsed=50s
 ```
 
-**复现**：任意 `.md` 或 `.txt` 附件都会失败；改扩展名、改文件名都无效。同一个文件内联进 prompt 就能成功，说明不是内容问题，是上传通道问题。
+**复现**：
 
-**影响**：Gemini 这一路完全不能用附件，只能用内联正文——而内联又会撞上 A2。
+```bash
+wfa ask --provider gemini --prompt "读一下附件" --file note.md --timeout 300
+```
 
-**期望**：要么修上传，要么在检测到该 provider 不支持附件时立刻明确报错并给出"改写为内联"的下一步，而不是干等 50 秒再抛一句 timeout。
+同内容内联进 prompt 就成功，说明与文件内容无关，是上传通道。
 
-### A2 大 prompt 静默截断
+**期望**：上传控件选择器或完成判定已过期。要么修好，要么在上传阶段暴露可观察状态（开始/已选中/进度/UI 确认），失败时立刻报错，而不是干等 50 秒再抛一句 timeout。短期无法修时，元数据至少给 `attachmentState: not_started | uploading | attached | failed`。
 
-**现象**：84 KB 的 prompt（77 KB 源码 + 7 KB 问题）送进 Gemini，29 秒就返回。它的回答里有这么两句：
+**影响**：Gemini 这一路完全不能用附件；只能走内联，而内联又会撞 U2。
+
+---
+
+## U2 prompt > 约 44 KiB 静默截断
+
+**现象**：84 KB（77 KB 源码 + 7 KB 问题）送进 Gemini，29 秒返回。回答里写：
 
 ```
 证据：install/install.sh:158（附件末尾）—— `数`
@@ -51,141 +54,137 @@ Timed out waiting for Gemini to show attachment 'source-bundle-e7430cb187f7.txt'
 install/install.ps1、install/install.sh（截断于第 158 行），其余 22 个文件的正文未在附件中展开。
 ```
 
-实际上那个版本的 `install.sh` 有 271 行，只送到 158 行；文件清单之后本该跟着 22 个文件的正文，它一个都没看到。也就是说 provider 只收到约一半内容，然后**基于半份材料下了结论**（断言脚本被截断、目录结构缺失），这些结论全是错的。
+那个版本的 `install.sh` 有 271 行，只送到 158 行；文件清单之后的 22 个文件正文一个都没到。**整个过程没有任何截断信号**：无警告、无 metadata 字段、退出码 0。
 
-**关键点：整个过程没有任何截断信号。** 没有警告、没有 metadata 字段、返回码也是成功。只能从"它引用了哪几个文件"反推。
-
-**影响**：这是最危险的一类——错误结论看起来完全正常，且耗时更短、显得更"高效"。
-
-**期望**：发送前算总量（正文 + 附件），超过阈值时要么拒绝、要么自动分片、要么至少在 metadata 里记下 `bytesSent` / `bytesTruncated`。
-
-### A3 ChatGPT 长产物默认进画布
-
-**现象**：prompt 里明确要求"完整 diff 直接贴在聊天回复的代码块里，不要用画布/附件/下载链接"。回复共 440 行 / 17.9 KB，第 225 行是：
-
-```
-下载完整 git apply 补丁
-```
-
-补丁正文在画布产物里，`response.md` 只有链接、文件名和 SHA256。`--download-images` 只管图片，管不到这种文本产物。
-
-**影响**：自动化流程拿不到补丁，必须人工点下载。用户最终是从浏览器里手工存到桌面的。
-
-**期望**：能配置"强制内联"或提供产物落盘目录（把画布内容按文件名导出到 run 目录）。
-
-### A4 失败的 job 锁住整个 workspace
-
-**现象**：一次 `failed` 之后，同 provider、同 workspace 的后续请求直接被拒，必须先：
+**复现**：
 
 ```bash
-wfa resolve <run-id> --provider <provider> --confirm
+python -c "open('big.md','w').write('X'*86000)"
+wfa ask --provider gemini --prompt-file big.md --timeout 600
+# 看返回内容引用的文件是否止于某一行
 ```
 
-**影响**：任何自动重试都会卡住。一次上传超时（A1）能连锁堵住后面所有请求。
+**期望**：注入后回读输入框实际字节数，与原文比对；不一致就拒绝提交。元数据补：
 
-**期望**：`failed` 状态不应阻止新会话；或提供 `--allow-stale` / 超时自动释放。
+```json
+{ "promptBytesExpected": 86000, "promptBytesVerified": 44980, "promptTruncated": true }
+```
+
+**影响**：这是最危险的一类——错误结论看起来完全正常、耗时更短、显得更"高效"。
 
 ---
 
-## B. 正确性与可用性
+## U3 ChatGPT 长产物进 Canvas，`response.md` 只有链接
 
-### B1 `--new-session` 未隔离会话
+**现象**：prompt 明确要求「完整 diff 直接贴进回复，不要画布/附件/下载链接」。回复 440 行 / 17.9 KB，第 225 行是「下载完整 git apply 补丁」，补丁正文在 Canvas 产物里；`response.md` 只剩链接、文件名和 SHA256。`--download-images` 不管文本产物。
 
-**现象**：给 ChatGPT 发"建库归属与作用域模型"九个文件的问题（`jobs.jsonl` 里记录的 prompt 是新问题），它回的是上一轮"B 能否随时接管 A 的任务"的答案——连"7 个文件"这种只属于上一轮的细节都对得上。`threadUrl` 与上一轮指向同一会话。
+**复现**：要求一个 > 300 行的补丁或长文件，观察 `response.md` 是否出现 `sandbox:` 链接 + 64 位十六进制。
 
-**影响**：拿到的答案是旧问题的，浪费一整轮；而且答案本身看起来切题（都是 Skein 相关），不核对细节发现不了。
+**期望**：抓取器提取 Canvas 面板内容并落盘，元数据补 `artifacts: [{ path, type, bytes, sha256 }]`；只拿到下载链接不应算作完整结果。
 
-**现状规避**：换 workspace 名（等于换一个浏览器 page/会话）。但这是运气，不是保证。
+**影响**：自动化流程拿不到产物，必须人工点下载。
 
-**期望**：`--new-session` 应强制新建 thread；返回结果里带 `threadUrl` 与本次 prompt 的首行摘要，便于断言。
+---
 
-### B2 Gemini 输出被转义污染
+## U4 `--new-session` 复用旧会话
 
-**现象**：即使成功返回，diff 也被破坏：
+**现象**：给 ChatGPT 发新问题（`jobs.jsonl` 里记录的确实是新 prompt），回复的却是上一轮的答案，连「7 个文件」这种只属于上一轮的细节都对得上；`threadUrl` 与上一轮相同。
+
+**复现**：
+
+```bash
+wfa ask --provider chatgpt --workspace same-key --new-session --prompt "问题 A"
+wfa ask --provider chatgpt --workspace same-key --new-session --prompt "问题 B"
+wfa status <第二个 task-id>   # 比较两次的 Conversation
+```
+
+**期望**：`newSession: true` 需要真正的强制新建语义——新建标签页或新建 thread，并校验会话 URL 与上一次不同，否则拒绝发送。返回结果里带 `threadUrl` 与本次 prompt 首行摘要，便于断言。
+
+**影响**：拿到的答案属于旧问题，而且看起来切题，不核对细节发现不了。
+
+---
+
+## U5 Gemini 输出被二次转义
+
+**现象**：即使成功返回，Markdown 也被破坏：
 
 - `||` → `\vert{}\vert{}`
 - `"$STORE"` → `"STORE"update"STORE"`
 - `diff --git` 头丢失、`---`/`+++` 行不完整
 
-**影响**：`git apply` 无法执行，只能当"问题清单"读，改动全部人工重写。
+**期望**：转换链路不要对 `<pre><code>` 内容做二次 LaTeX/Markdown 转义，保留原文；或在输出前做一次反转义校验，检测到 `\vert{}`、`\lbrace`、`\textbackslash` 时标记 `transformed: true`。
 
-**现状规避**：不要求它给 diff，改要求"文件 + 替换前原文 + 替换后原文"。
-
-### B3 没有分片概念
-
-**现象**：要么整包发（撞 A2），要么自己切。手工切出来的每一片是**独立会话**，跨文件的契约类问题（例如"四个技能共享同一段路径解析"）天然审不全。
-
-**影响**：大仓库审阅只能靠人拼结论。
-
-### B4 两个 provider 不能并发
-
-**现象**：ChatGPT 与 Gemini 同时跑会互相干扰（本机已确认），`wfa compare` 实际用不了。只能串行跑两次，而且两次看到的材料可能不一致（一个用附件、一个用内联）。
-
-**影响**：所谓"双 provider 交叉验证"退化成"先后两次单 provider 审阅"。
-
-### B5 后台运行时进度被吞
-
-**现象**：`wfa ask ... | tail -30` 在后台跑时，管道要等进程结束才输出，中途完全看不到进度，只能靠外层轮询任务状态。
-
-**期望**：`--progress-file` 或结构化进度输出。
-
-### B6 `--dry-run` 只统计附件字节
-
-**现象**：`--dry-run` 输出的 `estimatedTokens` 只算 `--file` 的大小，`--prompt-file` 的正文体积与截断风险不提示（A2 正是从正文来的）。
-
-**期望**：分别给出正文、附件、合计三项字节与预估 token，并对超阈值给警告。
+**影响**：`git apply` 无法执行，返回的补丁只能当问题清单读。
 
 ---
 
-## C. ask-bridge 侧（已有外部规避，根因未修）
+## U6 双 provider 并发不稳定
 
-### C1 Chrome「未正确关闭」恢复气泡
+**现象**：ChatGPT 与 Gemini 同时跑会互相干扰（同机实测，`--concurrency 2` 下常出现 `failed to open tab: list_pages failed: The selected page has been closed`）。`wfa compare` 因此实际不可用。
 
-**根因**：`ask-bridge batch` 没有 headless 参数，实际以 headful 方式启动 Chrome（`--window-position=-2000,-2000` 把窗口挪到屏幕外），退出时强杀。于是 `chrome-profile/Default/Preferences` 里的 `profile.exit_type` 停在 `Crashed`。下次 Chrome 启动读到它就弹"恢复页面"气泡，而且这个气泡是独立窗口，不受离屏坐标约束，会直接出现在屏幕上。
+**期望**：`--concurrency > 1` 时每个 job 用独立浏览器上下文（独立 page / 独立 profile），或明确声明该模式不支持并在 CLI 层拒绝。
 
-**现状规避**：外部包装器在每次调用前把 `exit_type` 改回 `Normal`。属于治标。
-
-**期望**：进程内优雅关闭，或退出前主动写回 `exit_type`。
-
-### C2 `chrome-devtools-mcp.log` 无轮转
-
-**现象**：日志曾增长到 166 MB。
-
-**现状规避**：外部脚本在超过 64 MB 时截到尾部 4 MB。
-
-**期望**：内置轮转。
+**影响**：双 provider 交叉验证退化成「先后两次单 provider 审阅」。
 
 ---
 
-## D. 复现记录（脱敏）
+## U7 Chrome `exit_type` 停在 `Crashed`，弹恢复气泡
 
-| 时间 | 请求 | provider | 结果 |
-|---|---|---|---|
-| 14:13 | 77 KB 源码包（`--file`，`.md`） | ChatGPT | 成功，567s（9.5 分钟），19 条问题；补丁进画布（A3） |
-| 14:24 | 同一文件改 `.txt`（`--file`） | Gemini | 54s 失败（A1） |
-| 14:24 | 再试 `.txt`，第二次 | Gemini | 50s 失败（A1） |
-| 14:25 | 84 KB 内联单文件 | Gemini | 29s "成功"，基于半份源码，结论错误（A2） |
-| 14:26 | 拆成 27 KB + 24 KB 两包，内联 | Gemini | 两包都成功，内容可用；diff 被转义（B2） |
-| 14:44 | 32 KB 内联（接管机制） | ChatGPT | 成功，264s，结论与 Gemini 一致 |
-| 14:44 | 同上 | Gemini | 成功，22s |
-| 15:19 | 37 KB 内联（建库归属） | ChatGPT | 336s 后返回，但答的是 14:44 的问题（B1） |
-| 15:19 | 同上 | Gemini | 成功，34s，内容切题 |
+**根因**：`ask-bridge batch` 没有 headless 参数，实际以 headful 启动 Chrome 并用 `--window-position=-2000,-2000` 把窗口挪到屏幕外；退出时强杀进程，`chrome-profile/Default/Preferences` 里的 `profile.exit_type` 停在 `Crashed`。下次启动读到就弹「恢复页面」气泡，而该气泡是独立窗口，不受离屏坐标约束，会直接出现在屏幕上。
+
+**期望**：进程内优雅关闭（CDP `Browser.close` 后等退出），或退出前主动把 `exit_type` 写回 `Normal`；也可以直接给 Chrome 传 `--hide-crash-restore-bubble`。
+
+**影响**：每次调用都可能弹一个窗口打断用户；外部只能靠启动前改写 `Preferences` 治标。
 
 ---
 
-## E. 现在实际怎么用（规避手册，不是修复）
+## U8 `chrome-devtools-mcp.log` 无轮转
 
-1. **附件别用**，尤其 Gemini。所有源码内联进 prompt。
-2. **单包 ≤ 44 KB**，超了手工切，切口选在文件边界。
-3. **每个 provider 用独立 workspace 名**，并且每次都带 `--new-session`；仍要核对答案是否对应本次问题。
-4. **失败先解锁**：`wfa resolve <run-id> --provider <p> --confirm`。
-5. **ChatGPT 的补丁让用户手工下载**，不要指望 `response.md` 里有正文。
-6. **不要求 Gemini 出 diff**，改要"文件 + 替换前原文 + 替换后原文"。
+**现象**：该日志曾增长到 166 MB（`--logFile` 没有轮转策略）。
+
+**期望**：内置轮转（按大小或按天），或提供关闭日志的开关。
+
+**影响**：长期占用磁盘；C 盘曾因此只剩 6.8 GB。
 
 ---
 
-## F. 建议优先级
+## U9 缺 `submissionState` 等提交证明字段
 
-- **P0**：A2（静默截断会产生"看起来正常"的错误结论）、A4（一次失败连锁堵死后续请求）、A1（Gemini 附件完全不可用）
-- **P1**：B1（答非所问且难察觉）、A3（长产物取不到）、B2（输出不可用）
-- **P2**：B3、B4、B5、B6、C1、C2
+**现象**：wfa 判断「这次请求有没有发出去」只能靠错误文本匹配（`failed to open tab`、`prompt submission failed`、附件超时）。ask-bridge 一改文案，判定就失效。
+
+**期望**：任务元数据补：
+
+```json
+{
+  "submissionState": "not_submitted | submitted | unknown",
+  "promptBytesExpected": 86000,
+  "promptBytesVerified": 86000,
+  "promptTruncated": false,
+  "attachmentState": "not_started | uploading | attached | failed"
+}
+```
+
+**影响**：这是 U2/U4 能否被可靠判定的前提；有了它，wfa 的锁判定可以从「猜文案」升级为「读状态」。
+
+---
+
+## 建议优先级
+
+- **P0**：U2（静默截断产生「看起来正常」的错误结论）、U4（答非所问且难察觉）、U1（Gemini 附件完全不可用）
+- **P1**：U3（长产物取不到）、U5（输出不可直接用）、U9（其余判定的地基）
+- **P2**：U6、U7、U8
+
+---
+
+## wfa 侧已做（不在本清单）
+
+wfa 0.2.3 起：
+
+- 正文超 40 KiB 在发送前拦截（`PROMPT_OVERSIZE`）；`--dry-run` 给文件级 `splitPlan`；`--allow-oversize` 放行。
+- Gemini 遇到文本附件时自动内联（带行号的源码包直接内联）；二进制/原生文档提前拒绝（`GEMINI_ATTACHMENT_UNSUPPORTED`）；`--allow-gemini-attachments` 强制走原生上传。
+- `response.md` 出现 Canvas 存根特征或 `\vert{}` 类转义时标记 `responseHeuristics` 并在 CLI 警告，不修改正文。
+- `--new-session` 完成后比对上一轮 `threadUrl`，相同则记 `sessionIsolationWarning`。
+- 默认 chatgpt + gemini，多 provider 默认串行（`--concurrency 1`）。
+- 可证明未提交的失败（tab 打开失败、Send 按钮未激活、附件上传超时）自动解锁 workspace。
+
+以上都只是**检测与规避**，不是修复：U1–U5 的根因仍在 ask-bridge。

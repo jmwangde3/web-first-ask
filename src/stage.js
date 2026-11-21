@@ -169,9 +169,21 @@ export async function readTaskResult(taskId, {
       throw new WfaError("RESULT_INTEGRITY_FAILED", proof.error ?? "The ask-bridge terminal result changed after verification.");
     }
   }
+  const warnings = {
+    responseHeuristics: child.responseHeuristics ?? null,
+    sessionIsolationWarning: child.sessionIsolationWarning ?? null,
+  };
   return stdout
-    ? { taskId, provider: selected, resultPath, body }
-    : { taskId, provider: selected, resultPath, bytes: Buffer.byteLength(body, "utf8"), sha256: sha256(body), state: child.state };
+    ? { taskId, provider: selected, resultPath, body, ...warnings }
+    : {
+      taskId,
+      provider: selected,
+      resultPath,
+      bytes: Buffer.byteLength(body, "utf8"),
+      sha256: sha256(body),
+      state: child.state,
+      ...warnings,
+    };
 }
 
 export async function stageTaskFiles(taskId, {

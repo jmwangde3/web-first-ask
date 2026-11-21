@@ -24,8 +24,10 @@ export function buildJobs({
   sessions = {},
   fresh = false,
   files = [],
+  filesByProvider = {},
   images = [],
   modelByProvider = {},
+  allowGeminiAttachments = false,
 
   downloadImages = false,
 }) {
@@ -34,12 +36,19 @@ export function buildJobs({
     if (provider === "gemini" && images.length) {
       throw new WfaError("GEMINI_IMAGE_UNSUPPORTED", "ask-bridge batch does not support image attachments for Gemini. Use --file for supported document formats or omit Gemini from this image request.");
     }
+    const providerFiles = filesByProvider[provider] ?? files;
+    if (provider === "gemini" && providerFiles.length && !allowGeminiAttachments) {
+      throw new WfaError(
+        "GEMINI_ATTACHMENT_UNSUPPORTED",
+        "Gemini document attachments time out in ask-bridge batch. Inline the content into a prompt under 40 KiB, drop Gemini with --providers chatgpt, or force the native upload with --allow-gemini-attachments.",
+      );
+    }
     const job = {
       id: `wfa-${provider}-${suffix}`,
       provider,
       prompt: promptByProvider[provider] ?? prompt,
       timeout: timeoutSeconds,
-      files,
+      files: providerFiles,
       images,
       downloadImages,
     };
@@ -51,9 +60,11 @@ export function buildJobs({
 }
 
 export function validateConcurrency(concurrency, providerCount, maxConcurrency = 3) {
-  const value = concurrency ?? providerCount;
+  // Serial by default: concurrent browser tabs interfere with each other on the
+  // setups this tool is used on, and a corrupted answer costs more than the wait.
+  const value = concurrency ?? 1;
   if (!Number.isInteger(value) || value < 1 || value > maxConcurrency) {
-    throw new WfaError("INVALID_CONCURRENCY", `Concurrency must be an integer between 1 and ${maxConcurrency}; use --concurrency 1 to run ${providerCount} provider(s) sequentially.`);
+    throw new WfaError("INVALID_CONCURRENCY", `Concurrency must be an integer between 1 and ${maxConcurrency}; 1 runs ${providerCount} provider(s) sequentially.`);
   }
   return value;
 }

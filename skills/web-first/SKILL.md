@@ -1,26 +1,46 @@
 ---
 name: web-first
-description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Use ChatGPT Web through the local wfa CLI for nontrivial requirements, research, architecture, debugging and especially code design/implementation. Coding requests must ask ChatGPT for complete modified file contents, not a plan or diff-only response. Supports parallel ChatGPT/Gemini/Claude consultation and independent comparison.
+description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Every nontrivial request — requirements, root cause, architecture, debugging, code design or implementation — goes through the local wfa CLI to ChatGPT + Gemini by default, serially, and must return complete file contents or exact replacement blocks, not a plan or a diff. The local agent assembles evidence, applies results, runs tests and verifies.
 ---
 
 # Web-First
 
 ## Core role split
 
-- **ChatGPT Web is the default reasoning and implementation partner** for nontrivial engineering work: requirements, root-cause analysis, technical decisions, architecture, debugging and code changes.
-- **You (the local coding agent) are the execution owner**: inspect the actual repository, collect complete source evidence, call `wfa`, review returned code, edit local files, run tests, inspect diffs and report verified results.
+- **ChatGPT + Gemini are the default reasoning and implementation partners.** Every `wfa` call goes to both providers, serially, unless the user explicitly asks for one, or one provider is structurally unable to do the task (Gemini attachments — see Provider known limits).
+- **You (the local coding agent) own execution only**: inspect the actual repository, assemble the evidence the providers cannot see, apply what comes back, run tests, verify, commit. Do not reason the design through yourself when a provider can, and do not rewrite their answer from scratch.
+- Both providers receive the same prompt in one serial batch. Their answers are independent; compare them, take the stricter/safer variant on conflict, and discard any fragment that arrived corrupted.
 - Do not expose or configure an MCP server for this workflow. Call `wfa` directly as a local CLI.
-- Default provider is ChatGPT. WFA does not set or change provider reasoning strength; the current setting in the provider web UI is used.
-- Do not delegate trivial one-line changes or tasks that need no meaningful reasoning.
+- WFA does not set or change provider reasoning strength; the current setting in the provider web UI is used.
+
+## Default delegation policy
+
+Ask both providers for anything that involves:
+
+- writing or changing code beyond a trivial edit;
+- root-cause analysis, architecture, or a design decision;
+- reviewing a patch, a contract, or a compatibility boundary;
+- anything where a wrong first answer would cost a rewrite.
+
+Do it locally instead (one file, no design): reading the repository, resolving paths, checking git state, applying a returned patch, running tests, reading logs. Trivial edits stay local: typo, wording, one constant, formatting, a one-line log message, a rename confined to one file. If you are unsure whether something is trivial, it is not.
+
+## Complete-delivery contract
+
+State the delivery format in every request:
+
+- code: `FILE: relative/path` followed by complete contents, or `ANCHOR`/`REPLACE` blocks with exact surrounding lines. No unified diff, no ellipsis, no "rest unchanged", no pseudocode.
+- analysis: conclusion, evidence with `path:line`, uncertainty, and the next concrete action.
+
+Never accept "here is the approach" as the answer to an implementation request. If a provider returns a plan, a diff, or a corrupted fragment (LaTeX escaping, lost `diff --git` headers), do not repair it by hand — send one narrow follow-up asking for that file in complete form.
 
 ## Mandatory behavior for code-design and implementation tasks
 
-When the user asks to implement, fix, refactor, optimize or add code, **do not ask ChatGPT merely for a plan, checklist or proposed diff**. Ask it to produce the actual modified code.
+When the user asks to implement, fix, refactor, optimize or add code, **do not ask either provider merely for a plan, checklist or proposed diff**. Ask for the actual modified code.
 
-### Before calling ChatGPT
+### Before calling the providers
 
 1. Inspect `git status`, the relevant source files, callers, types/interfaces, configuration and focused tests.
-2. Identify the smallest complete set of files ChatGPT needs. Attach whole files, not isolated snippets. Include call sites and tests where they constrain behavior.
+2. Identify the smallest complete set of files the providers need. Attach whole files, not isolated snippets. Include call sites and tests where they constrain behavior.
 3. Do not attach the whole repository indiscriminately. Do not send secrets, credentials, tokens, private keys, personal data, or sensitive legal/arbitration materials.
 4. Write a precise requirement that states behavior, invariants, compatibility constraints and known evidence. Distinguish observed facts from hypotheses.
 5. Use a stable workspace key derived from the repository name so the provider conversation can continue across tasks.
@@ -38,7 +58,7 @@ wfa code `
   --file <focused-test-file>
 ```
 
-The command builds a strict prompt asking ChatGPT to return:
+The command builds a strict prompt asking each provider to return:
 
 - `FILE: relative/path` for each changed or new file;
 - the **complete contents** of each file, ready to save;
@@ -51,11 +71,11 @@ Do not replace `wfa code` with `wfa ask` for a code implementation request unles
 
 1. Read the saved provider result file(s).
 2. Verify every returned path against the real repository and the attached source version.
-3. Apply the code locally. ChatGPT does not modify the local repository.
+3. Apply the code locally. Providers do not modify the local repository.
 4. Resolve inconsistencies and verify imports, callers, types, platform behavior and error paths.
 5. Run focused tests and only the additional tests that provide new evidence.
 6. Inspect `git diff` and `git status`. Do not claim tests passed unless they were run locally.
-7. If ChatGPT omitted a required complete file or invented unavailable interfaces, do not fill gaps by guessing. Gather the missing complete source and make one focused follow-up request.
+7. If a provider omitted a required complete file or invented unavailable interfaces, do not fill gaps by guessing. Gather the missing complete source and make one focused follow-up request.
 
 ## General analysis and research
 
@@ -69,40 +89,36 @@ Attach relevant files with repeated `--file` arguments. Ask for a direct conclus
 
 ## Parallel multi-provider consultation
 
-Preserve and use the multi-provider comparison capability when:
+Multi-provider is the default, not an opt-in. `wfa` sends every request to ChatGPT + Gemini unless you narrow it deliberately.
 
-- the user explicitly requests multiple providers;
-- an independent second implementation/review materially reduces risk;
-- the task has a meaningful design uncertainty that benefits from independent answers.
+Narrow to a single provider only when:
 
-Use:
+- the user asks for one by name;
+- the task is structurally impossible for one of them (Gemini attachments — see Provider known limits);
+- you are continuing one provider's existing conversation with `--followup`, which is inherently single-provider.
+
+Do not narrow just to save time or tokens. The second answer is what catches a confident wrong answer, and that is the failure mode this workflow exists to prevent.
 
 ```powershell
-wfa compare --providers 'chatgpt,gemini' --workspace <repository-key> --prompt-file <prompt-file>
+wfa ask --workspace <repository-key> --prompt-file <prompt-file>
 ```
 
 For independent code implementations:
 
 ```powershell
-wfa code --providers 'chatgpt,gemini' --workspace <repository-key> `
+wfa code --workspace <repository-key> `
   --requirement "<same precise implementation requirement>" `
   --file <complete-source-file> --file <focused-test-file>
 ```
 
-The same prompt and attachments are sent independently and concurrently. Each provider has its own conversation and result file. Do not send one provider's answer to another unless explicitly doing a second-round critique. The local agent compares the results, identifies agreement and disagreement, selects or synthesizes the best implementation, then verifies it locally. Do not automatically fan out every routine task; avoid unnecessary provider cost.
+Both providers receive the same prompt and attachments in one batch and answer independently. Each gets its own conversation and result file. Do not send one provider's answer to another unless explicitly doing a second-round critique. Compare the results, identify agreement and disagreement, take the stricter variant on conflict, then verify locally.
 
-If concurrent browser sessions interfere with each other on this machine, serialise the same batch instead of running two commands:
+The default batch runs providers one after another (`--concurrency 1`), because concurrent browser tabs interfere with each other on this setup. Keep it serial. Do not work around interference by launching two separate `wfa` processes against different workspaces.
 
-```powershell
-wfa compare --providers 'chatgpt,gemini' --concurrency 1 --workspace <repository-key> --prompt-file <prompt-file>
-```
-
-`--concurrency 1` keeps one batch, one set of result files and the same comparison semantics; only the wall-clock time changes. Do not work around interference by launching two separate `wfa` processes against different workspaces.
-
-Default comparison set is ChatGPT + Gemini. Claude is available when explicitly selected:
+Claude is available when explicitly selected:
 
 ```powershell
-wfa compare --providers 'chatgpt,gemini,claude' ...
+wfa ask --providers 'chatgpt,gemini,claude' ...
 ```
 
 ## Waiting and recovery

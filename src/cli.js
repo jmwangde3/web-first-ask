@@ -100,6 +100,8 @@ function printTask(task, json = false, replayed = false) {
     autoCollected: child.completionProof?.source === "ask-bridge-batch-terminal",
     retryAfterAt: child.retryAfterAt ?? null,
     retryAfterEstimated: child.retryAfterEstimated ?? false,
+    responseHeuristics: child.responseHeuristics ?? null,
+    sessionIsolationWarning: child.sessionIsolationWarning ?? null,
   }]));
   const summary = {
     taskId: task.taskId,
@@ -125,6 +127,10 @@ function printTask(task, json = false, replayed = false) {
     if (child.errorCode) process.stdout.write(`  Error: ${child.errorCode}${child.retryAfterAt ? ` (retry after ${child.retryAfterAt}${child.retryAfterEstimated ? ", estimated" : ""})` : ""}\n`);
     if (child.error) process.stdout.write(`  Detail: ${truncate(child.error, 500)}\n`);
     if (child.recoveryHint) process.stdout.write(`  Hint: ${child.recoveryHint}\n`);
+    for (const reason of child.responseHeuristics?.reasons ?? []) {
+      process.stdout.write(`  Warning: ${reason}\n`);
+    }
+    if (child.sessionIsolationWarning) process.stdout.write(`  Warning: ${child.sessionIsolationWarning}\n`);
   }
   process.stdout.write("Verified ask-bridge completed artifacts are collected automatically. Use `wfa collect <task-id> --provider <provider>` to retrieve the saved result; --confirm-complete is only for manual recovery when no trusted terminal artifact exists.\n");
 }
@@ -133,8 +139,8 @@ function help() {
   process.stdout.write(`web-first-ask (wfa) — Codex-first web AI delegation
 
 Commands:
-  wfa ask       Ask one provider (default: ChatGPT)
-  wfa compare   Ask multiple providers; add --concurrency 1 for sequential runs
+  wfa ask       Ask the default providers (chatgpt+gemini, serial) in one batch
+  wfa compare   Ask multiple providers; sequential by default
   wfa code      Ask for complete replacement code for attached source files
   wfa status    Inspect a task by ID
   wfa list      List recent tasks
@@ -161,9 +167,9 @@ Common options:
   --image <path|glob>  Repeatable image attachment (not supported by Gemini)
   --exclude <glob>     Repeatable exclusion pattern; !pattern on --file also excludes
   --timeout <seconds>  Default 1200; maximum 7200
-  --concurrency <N>    Parallel jobs (1..3); 1 runs multiple providers serially
+  --concurrency <N>    Jobs in flight (1..3); default 1, because concurrent tabs collide
 
-  --model <name>       Single-provider request only
+  --model <name>       Single-provider request only; add --provider
   --model-map chatgpt=<name>,gemini=<name>
   --context <text>     Additional code-generation context
   --download-images    Download generated images (off by default)
@@ -177,8 +183,9 @@ Common options:
   --detach             Run ask-bridge in background with task-specific logs; never resend
   --stage              Stage completed full-file code without applying it
   --poll-ms <ms>       Polling interval for wait/attach (250..60000; default 2000)
-  --dry-run            Preview per-provider prompt bytes and risks; >40 KiB prompt exits 2
-  --allow-oversize     Keep --dry-run exit 0 even when the prompt exceeds the safe size
+  --dry-run            Preview prompt/attachment bytes and blocking risks; blocked exits 2
+  --allow-oversize     Send a prompt over 40 KiB anyway (silent truncation risk)
+  --allow-gemini-attachments  Force the native Gemini upload instead of inlining the text
   --allow-sensitive    Explicitly allow sending text flagged by the secret scanner
   --no-bundle-lines     Disable the default source bundle for wfa code
   --request-id <id>    Reuse only to recover the exact same logical request
@@ -353,6 +360,10 @@ export async function main(argv = process.argv.slice(2)) {
     if (!taskId) throw new WfaError("ARGUMENT_ERROR", "Usage: wfa result <task-id> --provider <provider> [--stdout]");
     const result = await readTaskResult(taskId, { provider: options.provider, stdout: Boolean(options.stdout), home, store });
     if (options.stdout) {
+      for (const reason of result.responseHeuristics?.reasons ?? []) {
+        process.stderr.write(`Warning: ${reason}\n`);
+      }
+      if (result.sessionIsolationWarning) process.stderr.write(`Warning: ${result.sessionIsolationWarning}\n`);
       process.stdout.write(result.body);
       if (!result.body.endsWith("\n")) process.stdout.write("\n");
     } else {
@@ -449,7 +460,10 @@ export async function main(argv = process.argv.slice(2)) {
   } else if (options.providers) {
     providers = normalizeProviders([options.providers], config.defaultCompareProviders);
   } else {
-    providers = normalizeProviders([options.provider], followupDefaultProviders ?? [config.defaultProvider]);
+    providers = normalizeProviders(
+      [options.provider],
+      followupDefaultProviders ?? config.defaultProviders,
+    );
   }
   if (providers.length > 1) prompt = buildComparePrompt(prompt, command === "code" ? mode : "full-file");
 
@@ -474,6 +488,7 @@ export async function main(argv = process.argv.slice(2)) {
     dryRun: Boolean(options["dry-run"]),
     allowSensitive: Boolean(options["allow-sensitive"]),
     allowOversize: Boolean(options["allow-oversize"]),
+    allowGeminiAttachments: Boolean(options["allow-gemini-attachments"]),
     briefFile: options["brief-file"],
     noBrief: Boolean(options["no-brief"]),
     followupTaskId: options.followup,
