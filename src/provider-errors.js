@@ -60,7 +60,7 @@ export function classifyProviderError({ error = "", stderr = "", jobId, state, h
   if (state !== "completed" && /Timed out waiting for Gemini to show attachment/i.test(String(error))) {
     return {
       errorCode: "ATTACHMENT_UPLOAD_TIMEOUT",
-      recoveryHint: "Gemini attachment upload failed before the prompt was submitted. After ask-bridge exits, drop the attachment, inline the content in the prompt under 40 KiB, then retry.",
+      recoveryHint: "Gemini timed out waiting for the attachment to appear, before the prompt was submitted. Retry once; if it repeats, send the same content as a zip/tar archive (archives upload natively and take seconds), or move the job to ChatGPT with --providers chatgpt. Inlining a large file into the prompt is the worst option: prompt text is what gets truncated.",
       retryAfterSeconds: null,
       retryAfterAt: null,
       retryAfterEstimated: false,
