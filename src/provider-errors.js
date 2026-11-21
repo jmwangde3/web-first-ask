@@ -54,6 +54,19 @@ export function classifyProviderError({ error = "", stderr = "", jobId, state, h
   const text = [error, stderrForJob(stderr, jobId)].filter(Boolean).join("\n").trim();
   if (!text) return { errorCode: null, recoveryHint: null, retryAfterSeconds: null, retryAfterAt: null, retryAfterEstimated: false };
 
+  // This exact Gemini failure happens while waiting for the upload to appear,
+  // i.e. before the prompt is submitted. Do not generalize it to every upload
+  // error or every timeout: only this observed message is provably pre-submit.
+  if (state !== "completed" && /Timed out waiting for Gemini to show attachment/i.test(String(error))) {
+    return {
+      errorCode: "ATTACHMENT_UPLOAD_TIMEOUT",
+      recoveryHint: "Gemini attachment upload failed before the prompt was submitted. After ask-bridge exits, drop the attachment, inline the content in the prompt under 40 KiB, then retry.",
+      retryAfterSeconds: null,
+      retryAfterAt: null,
+      retryAfterEstimated: false,
+    };
+  }
+
   if (CLOUDFLARE_PATTERNS.some((pattern) => pattern.test(text))) {
     return {
       errorCode: "CLOUDFLARE_BLOCKED",

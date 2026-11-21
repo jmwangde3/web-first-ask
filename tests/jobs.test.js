@@ -39,8 +39,12 @@ test("Gemini image attachments are rejected before upstream launch", () => {
   }), /image attachments for Gemini/);
 });
 
-test("parallel concurrency must cover every selected provider", () => {
+test("concurrency defaults to the provider count but may be lowered to serialize", () => {
   assert.equal(validateConcurrency(undefined, 2, 3), 2);
   assert.equal(validateConcurrency(3, 2, 3), 3);
-  assert.throws(() => validateConcurrency(1, 2, 3), /number of selected providers/);
+  // Two providers can still be run one after another: this is the only safe
+  // mode on machines where concurrent browser sessions collide.
+  assert.equal(validateConcurrency(1, 2, 3), 1);
+  assert.throws(() => validateConcurrency(0, 2, 3), /between 1 and 3/);
+  assert.throws(() => validateConcurrency(4, 2, 3), /between 1 and 3/);
 });

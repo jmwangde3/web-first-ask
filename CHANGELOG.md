@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.2 - Unreleased
+
+### Added
+- `--concurrency <N>` is documented and validated as 1..3 independently of the provider count. `--concurrency 1` now runs several providers serially in one batch, which is the only safe mode on machines where concurrent browser tabs interfere with each other.
+- `--dry-run` reports prompt bytes per provider plus a `promptSizeRisk` block. A prompt above 40 KiB for any provider marks the preview `sizeBlocked` and exits 2, because ask-bridge truncates silently around 44 KiB.
+- `--allow-oversize` keeps `--dry-run` at exit 0 when the prompt exceeds the threshold, for cases where the size is known and accepted.
+- ask-bridge stdout/stderr lines are streamed to the caller while the batch runs, so progress is visible before the process exits instead of arriving as one buffered block.
+- `ATTACHMENT_UPLOAD_TIMEOUT` classifies the observed Gemini upload failure and explains that the prompt was never submitted.
+- `docs/known-issues.md` documents reproductions, evidence and workarounds for the upstream limitations measured against ask-bridge 0.2.1.
+
+### Changed
+- `wfa compare` help now points at `--concurrency 1` instead of claiming concurrent execution is the only mode.
+- `--new-session` prints a warning that the underlying ask-bridge build may still reuse an open tab, so provider-side isolation has to be verified rather than assumed.
+- `--dry-run` exit codes are based on a single `blocked` flag covering both secret findings and prompt-size risk.
+- `WORKSPACE_PROVIDER_LOCKED` errors now name the exact `wfa status` / `wfa wait` / `wfa resolve --confirm` command to run, and state that `--new-session` does not bypass a request that may already have been submitted.
+
+### Fixed
+- A single `failed` job no longer locks the workspace/provider forever. Failures proven to happen before submission — failed tab load, failed prompt submission (send button never enabled), and Gemini attachment upload timeout — no longer block the next request. `timed_out`, `recoverable`, `interrupted_unknown`, generic `failed`, and any failure carrying a thread URL, result path or completion proof still block, because an uncertain resend is worse than an explicit resolve.
+- Multi-byte UTF-8 split across chunk boundaries is decoded correctly before line splitting.
+
 ## 0.2.1 - Unreleased
 
 ### Added

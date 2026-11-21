@@ -134,7 +134,7 @@ function help() {
 
 Commands:
   wfa ask       Ask one provider (default: ChatGPT)
-  wfa compare   Ask multiple providers concurrently and keep separate answers
+  wfa compare   Ask multiple providers; add --concurrency 1 for sequential runs
   wfa code      Ask for complete replacement code for attached source files
   wfa status    Inspect a task by ID
   wfa list      List recent tasks
@@ -161,12 +161,13 @@ Common options:
   --image <path|glob>  Repeatable image attachment (not supported by Gemini)
   --exclude <glob>     Repeatable exclusion pattern; !pattern on --file also excludes
   --timeout <seconds>  Default 1200; maximum 7200
+  --concurrency <N>    Parallel jobs (1..3); 1 runs multiple providers serially
 
   --model <name>       Single-provider request only
   --model-map chatgpt=<name>,gemini=<name>
   --context <text>     Additional code-generation context
   --download-images    Download generated images (off by default)
-  --new-session        Do not reuse the saved workspace/provider conversation
+  --new-session        Omit the saved session; ask-bridge may still reuse an open tab
   --fresh              Alias for --new-session
   --followup <id>      Continue a completed WFA task in its saved provider conversation
   --mode full-file|spec Select complete-file delivery or compact implementation specification
@@ -176,7 +177,8 @@ Common options:
   --detach             Run ask-bridge in background with task-specific logs; never resend
   --stage              Stage completed full-file code without applying it
   --poll-ms <ms>       Polling interval for wait/attach (250..60000; default 2000)
-  --dry-run            Preview attachments, size, estimated tokens and secret findings
+  --dry-run            Preview per-provider prompt bytes and risks; >40 KiB prompt exits 2
+  --allow-oversize     Keep --dry-run exit 0 even when the prompt exceeds the safe size
   --allow-sensitive    Explicitly allow sending text flagged by the secret scanner
   --no-bundle-lines     Disable the default source bundle for wfa code
   --request-id <id>    Reuse only to recover the exact same logical request
@@ -451,6 +453,9 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (providers.length > 1) prompt = buildComparePrompt(prompt, command === "code" ? mode : "full-file");
 
+  if (options["new-session"] || options.fresh) {
+    process.stderr.write("Note: --new-session omits the saved session URL, but this ask-bridge build can still reuse an open tab/conversation. Verify the provider tab before trusting isolation.\n");
+  }
 
   const modelByProvider = parseMap(options["model-map"], "model-map");
 
@@ -468,6 +473,7 @@ export async function main(argv = process.argv.slice(2)) {
       : Boolean(options["bundle-lines"]),
     dryRun: Boolean(options["dry-run"]),
     allowSensitive: Boolean(options["allow-sensitive"]),
+    allowOversize: Boolean(options["allow-oversize"]),
     briefFile: options["brief-file"],
     noBrief: Boolean(options["no-brief"]),
     followupTaskId: options.followup,
@@ -481,6 +487,9 @@ export async function main(argv = process.argv.slice(2)) {
     requestId: options["request-id"],
     fresh: Boolean(options["new-session"] || options.fresh),
     downloadImages: options["download-images"] === undefined ? undefined : Boolean(options["download-images"]),
+    onProgressLine: (stream, line) => {
+      process.stderr.write(`[ask-bridge ${stream}] ${line}\n`);
+    },
     onTaskCreated: (task) => {
       process.stderr.write(`Started task ${task.taskId} (request ${task.requestId}); ${options.detach ? "detached ask-bridge process" : "waiting inside one local CLI process"}.\n`);
     },
@@ -488,7 +497,7 @@ export async function main(argv = process.argv.slice(2)) {
 
   if (result.dryRun) {
     process.stdout.write(`${JSON.stringify(result.preview, null, 2)}\n`);
-    return result.preview.sendBlocked ? 2 : 0;
+    return result.preview.blocked ? 2 : 0;
   }
   if (options.stage && !result.detached && result.task.state === "completed") {
     for (const p of Object.keys(result.task.children ?? {})) {

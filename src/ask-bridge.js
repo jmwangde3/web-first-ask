@@ -53,6 +53,8 @@ export function runProcess(command, args, {
   env = process.env,
   onSpawn,
   onStdout,
+  onStdoutLine,
+  onStderrLine,
   input,
   timeoutMs,
   killGraceMs = 5000,
@@ -73,6 +75,30 @@ export function runProcess(command, args, {
     let watchdogHandle = null;
     let drainHandle = null;
     let spawnCallback = Promise.resolve();
+
+    // Line callbacks exist so ask-bridge progress reaches the caller while the
+    // batch is still running instead of sitting in the accumulated buffer until
+    // the process exits. A partial line is held back and flushed on close, and
+    // an upstream that never prints a newline is bounded instead of growing.
+    const pendingLine = { stdout: "", stderr: "" };
+    const lineCallback = { stdout: onStdoutLine, stderr: onStderrLine };
+    const emitLines = (stream, text, final = false) => {
+      let pending = pendingLine[stream] + text;
+      let index;
+      while ((index = pending.indexOf("\n")) !== -1) {
+        lineCallback[stream]?.(pending.slice(0, index).replace(/\r$/, ""));
+        pending = pending.slice(index + 1);
+      }
+      if (pending.length > 16384) {
+        lineCallback[stream]?.(pending);
+        pending = "";
+      }
+      if (final && pending) {
+        lineCallback[stream]?.(pending);
+        pending = "";
+      }
+      pendingLine[stream] = pending;
+    };
 
     const finish = (result) => {
       if (settled) return;
@@ -123,13 +149,21 @@ export function runProcess(command, args, {
     });
 
     if (!inherit) {
+      const stdoutDecoder = new TextDecoder("utf-8");
+      const stderrDecoder = new TextDecoder("utf-8");
       child.stdout?.on("data", (chunk) => {
-        stdout = truncate(stdout + chunk.toString("utf8"), 200000);
+        const text = stdoutDecoder.decode(chunk, { stream: true });
+        stdout = truncate(stdout + text, 200000);
         onStdout?.(stdout);
+        emitLines("stdout", text);
       });
       child.stderr?.on("data", (chunk) => {
-        stderr = truncate(stderr + chunk.toString("utf8"), 12000);
+        const text = stderrDecoder.decode(chunk, { stream: true });
+        stderr = truncate(stderr + text, 12000);
+        emitLines("stderr", text);
       });
+      child.stdout?.once("close", () => emitLines("stdout", stdoutDecoder.decode(), true));
+      child.stderr?.once("close", () => emitLines("stderr", stderrDecoder.decode(), true));
     }
 
     if (Number.isFinite(timeoutMs) && timeoutMs > 0) {

@@ -91,6 +91,14 @@ wfa code --providers 'chatgpt,gemini' --workspace <repository-key> `
 
 The same prompt and attachments are sent independently and concurrently. Each provider has its own conversation and result file. Do not send one provider's answer to another unless explicitly doing a second-round critique. The local agent compares the results, identifies agreement and disagreement, selects or synthesizes the best implementation, then verifies it locally. Do not automatically fan out every routine task; avoid unnecessary provider cost.
 
+If concurrent browser sessions interfere with each other on this machine, serialise the same batch instead of running two commands:
+
+```powershell
+wfa compare --providers 'chatgpt,gemini' --concurrency 1 --workspace <repository-key> --prompt-file <prompt-file>
+```
+
+`--concurrency 1` keeps one batch, one set of result files and the same comparison semantics; only the wall-clock time changes. Do not work around interference by launching two separate `wfa` processes against different workspaces.
+
 Default comparison set is ChatGPT + Gemini. Claude is available when explicitly selected:
 
 ```powershell
@@ -104,6 +112,10 @@ wfa compare --providers 'chatgpt,gemini,claude' ...
 - A nonzero exit from `ask`, `compare` or `code` can still include completed provider results. Read the task summary and use successful result files before deciding how to recover the unfinished providers.
 - If the terminal tool returns while the process is still running, inspect `wfa status <task-id>` once when needed. If it is still running, do not submit again.
 - `timed_out`, `recoverable`, `interrupted_unknown` and ambiguous `failed` states may mean the prompt was already submitted. Never resend automatically.
+- A `WORKSPACE_PROVIDER_LOCKED` error is not a transient failure. Read the task ID it names, run `wfa status <task-id>` once, and either collect the result or, after confirming the generation is dead in the browser, `wfa resolve <task-id> --provider <provider> --confirm`.
+- `--new-session` does not bypass the lock. A request that may already have reached the provider stays blocking on purpose; a resend into an uncertain conversation is worse than an explicit resolve.
+- Failures that provably happened before submission — the tab never loaded, the send button never became enabled, or a Gemini attachment upload timed out — release the lock automatically. Do not spend a `wfa resolve` on them; just fix the cause and retry.
+- Progress now streams: `[ask-bridge stdout] …` lines appear on stderr while the batch runs. Use them to decide whether the provider is working, and do not treat prolonged silence as failure while the process is alive.
 - If ask-bridge writes matching terminal `completed` metadata and a complete `response.md`, WFA automatically adopts the saved result during task refresh. Use `wfa collect <task-id> --provider <provider>` to return that result without another browser request or confirmation.
 - If no trusted terminal artifact exists, `wfa collect --confirm-complete` uses ask-bridge `get` as a manual recovery path. Independently confirm in the browser that generation has stopped first, because `get` itself does not establish completion.
 - If the old generation is definitely no longer active and cannot be collected, unlock it only with:
@@ -115,7 +127,18 @@ wfa compare --providers 'chatgpt,gemini,claude' ...
 - Use the same `--workspace` key for the same repository/project. Each provider has its own saved conversation URL for that workspace.
 - New tasks continue the provider's saved conversation by default.
 - Use `--new-session` only when isolation is intentional (for example, an independent second opinion).
+- `--new-session` only stops WFA from supplying a saved conversation URL. The current ask-bridge build can still reuse an already open provider tab, so isolation is not guaranteed. Verify it: check that the answer addresses this prompt, not the previous one, and compare the returned conversation URL with the previous task's. If the provider answers an older question, treat that whole task as void and rerun it under a different workspace key.
 - Parallel provider jobs use separate tabs and separate provider conversations; never point two concurrent jobs at the same conversation.
+
+## Provider known limits
+
+Measured against ask-bridge 0.2.1; full evidence and reproductions are in `docs/known-issues.md` of the `web-first-ask` repository.
+
+- **Gemini attachments do not work.** Any `--file` request to Gemini fails after 50–60 s with `ATTACHMENT_UPLOAD_TIMEOUT`. Inline the content in the prompt instead, and keep it under 40 KiB.
+- **Prompts over roughly 44 KiB are truncated without a signal.** This is the most dangerous failure mode: the answer looks normal and arrives faster. Always run `--dry-run` first and treat exit 2 as a stop sign.
+- **ChatGPT long answers may land in Canvas.** When the response is replaced by a download link plus a hash, `response.md` does not contain the artifact. Ask for smaller chunks, or request the content to be repeated inline in the chat.
+- **Gemini corrupts Markdown diffs.** `||` becomes `\vert{}\vert{}`, quoted variables get mangled and `diff --git` headers disappear. Never ask Gemini for a patch; ask for "file path + original block + replacement block" and apply it locally.
+- **Do not assume provider-side session isolation.** See the `--new-session` caveat under Session rules.
 
 ## Trust and evidence
 
@@ -130,7 +153,9 @@ wfa compare --providers 'chatgpt,gemini,claude' ...
 
 - Prefer `wfa code --file <directory> --exclude "<glob>"` over enumerating many files manually. Directory scans recurse and skip common generated/dependency folders.
 - `wfa code` line-numbers recognized text source by default. Use `--no-bundle-lines` only when separate raw source attachments are preferable.
-- Run `--dry-run` before sending a large context. Review the estimated size, secret findings and unscanned native/image attachments. The token figure is heuristic, not an exact provider count.
+- Run `--dry-run` before sending a large context. Review `promptBytesByProvider`, `promptSizeRisk`, `estimatedTokens`, secret findings and unscanned native/image attachments. The token figure is heuristic, not an exact provider count.
+- Keep the prompt body at or below 40 KiB per provider. ask-bridge truncates silently at roughly 44 KiB — the provider answers from a partial prompt with no truncation signal, an exit code of 0 and a plausible-looking answer. A `--dry-run` above 40 KiB exits 2 on purpose; `--allow-oversize` is for a size you have measured and accepted, not for making the warning go away.
+- When a request legitimately needs more than 40 KiB, split it on file boundaries and state the cross-file contract in every part. Each part is a separate provider conversation, so conclusions that depend on files in another part must be verified locally rather than assumed.
 - Use `--mode spec` for large refactors or files where complete-file output is likely to be wasteful; use `full-file` for small/medium changes that should be returned as complete files.
 - Keep native documents and images as native attachments; do not try to flatten PDF/Office binary files into a text source bundle.
 - Use `.wfa/active-brief.md` for project hot-state handoff. It is injected only for a new/fresh provider conversation. Use `--brief-file` for an explicit one-off brief.

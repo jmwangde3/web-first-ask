@@ -52,8 +52,8 @@ export function buildJobs({
 
 export function validateConcurrency(concurrency, providerCount, maxConcurrency = 3) {
   const value = concurrency ?? providerCount;
-  if (!Number.isInteger(value) || value < 1 || value > maxConcurrency || value < providerCount) {
-    throw new WfaError("INVALID_CONCURRENCY", `Concurrency must be between the number of selected providers (${providerCount}) and ${maxConcurrency}.`);
+  if (!Number.isInteger(value) || value < 1 || value > maxConcurrency) {
+    throw new WfaError("INVALID_CONCURRENCY", `Concurrency must be an integer between 1 and ${maxConcurrency}; use --concurrency 1 to run ${providerCount} provider(s) sequentially.`);
   }
   return value;
 }
