@@ -7,6 +7,8 @@ export const BLOCKING_STATES = new Set([
   "timed_out",
   "recoverable",
   "interrupted_unknown",
+  "stalled",
+  "repo_unreadable",
   "rate_limited",
   "login_required",
   "cloudflare_blocked",

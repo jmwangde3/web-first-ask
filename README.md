@@ -8,13 +8,16 @@
 - **ChatGPT and Gemini are the default provider pair**: a bare `wfa ask` / `wfa code` / `wfa compare` asks both. Use `--provider` or `--providers` to narrow. WFA does not set or change provider reasoning strength; it uses the current setting in the provider web UI.
 - Multi-provider runs are **serial by default** (`--concurrency 1`), because concurrent browser tabs interfere with each other on the same machine. `--concurrency 2..3` is available and validated.
 - `wfa compare` sends the same prompt and attachments to every selected provider, then saves each answer separately.
-- `wfa code` defaults to a path-and-line-numbered source bundle and asks for **complete replacement contents**; `--mode spec` switches to a compact implementation specification.
-- Directory recursion, quoted glob patterns, exclusions, image attachments and native document attachments are built into the CLI.
+- `wfa code` asks for **complete replacement contents**. If the working directory is a Git repository with a remote, WFA sends the repository URL, branch and HEAD commit and the providers read the repository themselves — no local file selection. `--mode spec` switches to a compact implementation specification.
+- When the repository cannot be read, a provider replies `REPO_UNREADABLE`; that is recorded as an unresolved result, not an answer, and `wfa status` prints the exact `--bundle-repo` fallback command. Whole-repository inlining is always opt-in and still bounded by the 40 KiB prompt guard.
+- Directory recursion, quoted glob patterns, exclusions, image attachments and native document attachments remain available for projects without a repository, for `--no-repo`, and for the bundle fallback.
 - `--dry-run` previews per-provider prompt bytes, attachment size, estimated tokens, prompt-size risk, block reasons and likely secret locations without creating a task or launching a provider. A prompt above 40 KiB per provider exits 2; `--allow-oversize` keeps it at 0.
 - A local task ledger records request IDs, provider states, conversation URLs, parent-task lineage, revisions and result paths.
 - Uncertain sends are never automatically repeated. An unresolved provider/workspace is locked until the user collects or explicitly abandons the old task, except for failures that provably happened before submission (tab load failure, send-button failure, attachment upload timeout), which release the lock automatically. The single exception in the other direction: when ask-bridge closes a serial batch's tab, the stranded provider is retried once in its own batch, because nothing had been submitted.
 - ask-bridge progress lines are forwarded to stderr as `[ask-bridge stdout] …` while the batch is still running.
-- Every completed answer carries `responseHeuristics` (Canvas stub, LaTeX/escape corruption) and, when relevant, a `sessionIsolationWarning` — signals, never silent rewrites.
+- Every completed answer carries `responseHeuristics` (Canvas stub, LaTeX/escape corruption) and, when relevant, `threadMismatch` — signals, never silent rewrites.
+- Every independent task starts a **fresh conversation**. `--continue-session` opts back into per-workspace conversation reuse; `--followup` continues one verified task thread. A run that lands on the wrong conversation is flagged as `threadMismatch` and its URL is never saved for reuse.
+- `--stall-timeout` (default 300 s, `0` disables) kills a batch that stops producing progress lines *and* stops advancing its metadata. The provider becomes `stalled` — blocking like an uncertain send, never auto-retried — instead of hanging until the full timeout.
 - Results can be inspected and staged; writing staged code into the workspace requires an explicit `wfa apply --confirm` and SHA-256 revalidation.
 - WFA can continue an existing task conversation with `--followup`.
 - ask-bridge remains an external tool; WFA adds no runtime npm dependency.
@@ -109,26 +112,33 @@ Include Claude too:
 wfa compare --providers 'chatgpt,gemini,claude' --workspace my-repository --prompt-file .\question.md
 ```
 
-Ask both providers for complete modified code, attaching complete relevant source and test files:
+Ask both providers for complete modified code. Inside a Git repository with a
+remote this is the whole request — no file arguments:
 
 ```powershell
 wfa code `
   --workspace my-repository `
-  --requirement "Fix the race in task recovery. Preserve existing idempotency and add focused regression coverage." `
-  --file .\src `
-  --file .\test `
-  --exclude "**/*.snap"
+  --requirement "Fix the race in task recovery. Preserve existing idempotency and add focused regression coverage."
 ```
 
-Compare complete code implementations from ChatGPT and Gemini:
+The providers receive a `REPOSITORY` block (https URL, branch, HEAD commit) and
+read the repository themselves. If one of them answers `REPO_UNREADABLE`,
+`wfa status` prints the fallback command:
+
+```powershell
+wfa ask --followup <task-id> --bundle-repo --exclude "docs/**" --exclude "**/*.snap" `
+  --prompt "Use the inline repository and complete the task."
+```
+
+Attach files explicitly only when there is no remote, when a provider asks for a
+specific file, or through the bundle fallback above:
 
 ```powershell
 wfa code `
-  --providers 'chatgpt,gemini' `
   --workspace my-repository `
-  --requirement "Implement the requested behavior. Return complete replacement contents for every changed file, not a plan or diff." `
+  --no-repo `
+  --requirement "Fix the race in task recovery." `
   --file .\src `
-  --file .\test `
   --exclude "**/*.snap"
 ```
 
@@ -196,7 +206,7 @@ wfa apply <task-id> --provider chatgpt --confirm
 |---|---|
 | `wfa ask` | One or both providers; ChatGPT + Gemini by default, serially |
 | `wfa compare` | Same prompt to multiple providers, serially by default |
-| `wfa code` | Build a line-numbered full-file or compact spec implementation prompt |
+| `wfa code` | Ask for complete implementation code; a Git remote replaces local file selection |
 | `wfa wait <task-id>` | Observe task state; adopts only verified ask-bridge terminal artifacts and never resends |
 | `wfa attach <task-id>` | Read-only reattachment to a saved task ID |
 | `wfa result <task-id>` | Read a saved provider result |
@@ -224,7 +234,10 @@ Use `--json` for machine-readable summaries. Reuse `--request-id` only when reco
 - Jobs run **serially by default** (`--concurrency 1` → `defaultConcurrency` in config). Concurrent tabs interfere with each other on the same machine, and the serial default is what keeps a two-provider run reliable.
 - `--concurrency 2` or `3` runs jobs in parallel when you know the machine tolerates it. Validated against `maxConcurrency` (default 3).
 - Serial batches on ask-bridge 0.4.0 close the previous job's tab, so the next job fails with `list_pages failed: The selected page has been closed` before submitting. WFA detects that exact pre-submit failure and retries the stranded provider alone in its own batch; the retry is recorded as `retriedAsSingleBatch` plus a task-level `retryWarnings` entry.
-- Each provider has a separate saved conversation URL per workspace, and a `sessionIsolationWarning` fires when a non-fresh run lands on the URL of the previous completed task for the same workspace/provider.
+- **Repository first.** When the working tree is a Git repository with a remote, every prompt carries a `REPOSITORY` block (https URL, branch, HEAD commit) and the providers read the repository themselves. `--repo-url` overrides detection, `--no-repo` disables it, `--bundle-repo` is the explicit inline fallback.
+- **One task, one conversation.** Each independent task starts a fresh provider conversation. `--continue-session` opts into the per-workspace saved URL; `--followup` continues one verified task thread. `sessionPolicy` and `threadMismatch` are recorded on the task, and a mismatched URL is never saved for reuse.
+- Serial batches on ask-bridge 0.4.0 close the previous job's tab, so the next job fails with `list_pages failed: The selected page has been closed` before submitting. WFA detects that exact pre-submit failure and retries the stranded provider alone in its own batch; the retry is recorded as `retriedAsSingleBatch` plus a task-level `retryWarnings` entry.
+- A provider that stops producing progress and stops advancing metadata for `--stall-timeout` seconds (default 300) is killed and recorded as `stalled`, which blocks the workspace like an uncertain send until `wfa collect` or `wfa resolve`.
 - The same prompt and attachments are sent independently to every selected provider; no provider sees another provider's answer.
 - Results are stored separately, for example `.../ask-bridge-output/wfa-chatgpt-<id>/response.md` and `.../wfa-chatgpt-<id>/metadata.json`.
 - Codex compares the answers and makes the final decision. It must not blindly merge or trust any provider.
