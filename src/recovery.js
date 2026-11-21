@@ -3,7 +3,7 @@ import { lstat, mkdir, readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { Store } from "./store.js";
 import { normalizeProviders } from "./jobs.js";
-import { isPidAlive, sha256, uuid } from "./util.js";
+import { isPidAlive, owningProcessAlive, sha256, uuid } from "./util.js";
 import { loadConfig } from "./config.js";
 import { resolveAskBridge, runProcess } from "./ask-bridge.js";
 import { WfaError } from "./errors.js";
@@ -115,7 +115,7 @@ export async function collectTask(taskId, {
     );
   }
   if (child.childPid && isPidAlive(child.childPid)) throw new WfaError("TASK_STILL_RUNNING", "The ask-bridge batch process is still running. Wait for it to exit before manual collection.");
-  if (task.parentPid && isPidAlive(task.parentPid)) throw new WfaError("WAITER_STILL_RUNNING", "The original wfa process is still running. Wait for it to exit before manual collection.");
+  if (owningProcessAlive(task)) throw new WfaError("WAITER_STILL_RUNNING", "The original wfa process is still running. Wait for it to exit before manual collection.");
   if (!isSafeProviderConversationUrl(selected, child.threadUrl)) {
     throw new WfaError("NO_RECOVERY_URL", "No verified provider conversation URL was persisted. Automatic resend is forbidden; inspect the original browser conversation manually.");
   }
@@ -242,7 +242,7 @@ export async function abandonProvider(taskId, provider, { confirm, home, store =
     if (!isBlockingChild(child)) {
       throw new WfaError("NOT_UNRESOLVED", `Provider ${provider} is not in an unresolved state (${child.state}).`);
     }
-    if ((child.childPid && isPidAlive(child.childPid)) || (task.parentPid && isPidAlive(task.parentPid))) {
+    if ((child.childPid && isPidAlive(child.childPid)) || owningProcessAlive(task)) {
       throw new WfaError("TASK_STILL_RUNNING", "The original wfa/ask-bridge process is still running. Do not unlock a live task.");
     }
     child.state = "abandoned";

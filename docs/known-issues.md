@@ -1,6 +1,6 @@
 # ask-bridge 上游问题清单
 
-> **范围**：只保留必须由 ask-bridge（Go 二进制）修的问题。wfa 侧能提前拦截、标注或绕过的，已经落在 wfa 0.2.3，见文末「wfa 侧已做」，不占本清单。
+> **范围**：只保留必须由 ask-bridge（Rust 二进制）修的问题。wfa 侧能提前拦截、标注或绕过的，已落实的规避方案见文末「wfa 侧已做」，不占本清单。
 > **环境**：Windows 11 zh-CN / Git Bash / ask-bridge 0.4.0 / wfa 0.2.2→0.2.3 / Chrome headful（`--window-position=-2000,-2000`）/ providers: ChatGPT + Gemini。
 > **证据**：2026-11-21 单机实测，命令与时间均为真实运行结果；run 目录可复核。
 
@@ -12,12 +12,12 @@
 | U2 | prompt > 约 44 KiB 静默截断 | 阻断 | 40 KiB 拦截并给拆分计划 |
 | U3 | ChatGPT 长产物进 Canvas，`response.md` 只有链接 | 阻断 | 检测并警告 |
 | U4 | `--new-session` 复用旧会话 | 严重 | 比对 threadUrl 并警告 |
-| U5 | Gemini 输出被二次转义 | 严重 | 检测并警告 |
+| U5 | Gemini 输出被二次转义 | 严重 | 检测并在 stage/apply 阻断 |
 | U6 | 双 provider 并发不稳定 | 一般 | 默认串行 |
-| U7 | Chrome `exit_type` 停在 `Crashed`，弹恢复气泡 | 一般 | 外部包装器治标 |
-| U8 | `chrome-devtools-mcp.log` 无轮转 | 一般 | 外部脚本截断 |
+| U7 | Chrome `exit_type` 停在 `Crashed`，弹恢复气泡 | 一般 | wfa 启动前修复并在 doctor 报告 |
+| U8 | `chrome-devtools-mcp.log` 无轮转 | 一般 | wfa 启动前按 64 MiB/4 MiB 门槛轮转 |
 | U9 | 缺 `submissionState` 等提交证明字段 | 设计 | 靠错误文本推断 |
-| U10 | `--concurrency 1` 串行批次也关掉上一个 job 的标签页 | 阻断 | 自动单 job 重跑一次 |
+| U10 | `--concurrency 1` 串行批次也关掉上一个 job 的标签页 | 阻断 | wfa 自行拆为多个独立单 job 批次（含 detach） |
 
 ---
 
@@ -115,7 +115,7 @@ wfa status <第二个 task-id>   # 比较两次的 Conversation
 
 **期望**：转换链路不要对 `<pre><code>` 内容做二次 LaTeX/Markdown 转义，保留原文；或在输出前做一次反转义校验，检测到 `\vert{}`、`\lbrace`、`\textbackslash` 时标记 `transformed: true`。
 
-**影响**：`git apply` 无法执行，返回的补丁只能当问题清单读。
+**影响**：`git apply` 无法执行，返回的补丁只能当问题清单读；wfa 现已在 stage/apply 阻断已识别的污染序列。
 
 ---
 
@@ -135,7 +135,7 @@ wfa status <第二个 task-id>   # 比较两次的 Conversation
 
 **期望**：进程内优雅关闭（CDP `Browser.close` 后等退出），或退出前主动把 `exit_type` 写回 `Normal`；也可以直接给 Chrome 传 `--hide-crash-restore-bubble`。
 
-**影响**：每次调用都可能弹一个窗口打断用户；外部只能靠启动前改写 `Preferences` 治标。
+**影响**：每次调用都可能弹一个窗口打断用户。wfa 现在启动前原子改写识别到的 `Preferences`，不再需要独立包装脚本；这仍不是上游优雅退出的根因修复。
 
 ---
 
@@ -145,7 +145,7 @@ wfa status <第二个 task-id>   # 比较两次的 Conversation
 
 **期望**：内置轮转（按大小或按天），或提供关闭日志的开关。
 
-**影响**：长期占用磁盘；C 盘曾因此只剩 6.8 GB。
+**影响**：长期占用磁盘；C 盘曾因此只剩 6.8 GB。wfa 现于启动前检查该日志，超过 64 MiB 时保留末尾 4 MiB。
 
 ---
 
@@ -182,7 +182,7 @@ wfa status <第二个 task-id>   # 比较两次的 Conversation
 
 **期望**：串行批次内可以复用同一个页面直到整批结束，或下一个 job 新建页面而不是拿着已关闭的 page id 去 `list_pages`。
 
-**影响**：串行是本机唯一可靠的模式（见 U6），因此这个缺陷让「默认双 provider」的第二次调用**必然**先失败一次。wfa 只能对「错误文本匹配 + 无 threadUrl + 无 responsePath」的 provider 单独重跑一次，代价是多一次进程启动和一次浏览器加载；如果将来错误文案变了，重试就静默失效。
+**影响**：原本串行是本机唯一可靠的模式（见 U6），因此这个缺陷让默认双 provider 的第二个任务必然先失败一次。wfa 现由自身对每个 provider 启动独立单 job 批次；这规避了 U10，但有多一次独立进程启动成本。ask-bridge 对批次内部 tab 的管理仍需上游修复。
 
 ---
 
@@ -200,10 +200,11 @@ wfa 0.2.3 起：
 
 - 正文超 40 KiB 在发送前拦截（`PROMPT_OVERSIZE`）；`--dry-run` 给文件级 `splitPlan`；`--allow-oversize` 放行。
 - Gemini 遇到文本附件时自动内联（带行号的源码包直接内联）；二进制/原生文档提前拒绝（`GEMINI_ATTACHMENT_UNSUPPORTED`）；`--allow-gemini-attachments` 强制走原生上传。
-- `response.md` 出现 Canvas 存根特征或 `\vert{}` 类转义时标记 `responseHeuristics` 并在 CLI 警告，不修改正文。
+- `response.md` 出现 Canvas 存根特征或 `\vert{}` 类转义时标记 `responseHeuristics` 并在 CLI 警告，不修改正文；stage/apply 拒绝含污染的内容。
 - `--new-session` 完成后比对上一轮 `threadUrl`，相同则记 `sessionIsolationWarning`。
-- 默认 chatgpt + gemini，多 provider 默认串行（`--concurrency 1`）。
-- 串行批次被关标签页时，对可证明未提交的那个 provider 单独重跑一次，记 `retriedAsSingleBatch` / `retryWarnings`，并在 `wfa status` 打出来。
+- 默认 chatgpt + gemini，多 provider 默认串行（`--concurrency 1`）；由 WFA 自行拆分为独立单 job 请求，含 `--detach` 模式。
+- 预提交 tab 关闭的有限重试保留独立 stdout/stderr 文件；不自动重试可能已提交的请求。
+- Chrome `Preferences` 崩溃恢复标志修复和日志轮转已集成到 WFA 启动路径与 `doctor`；外部 wrapper 不再是启动前提。
 - 可证明未提交的失败（tab 打开失败、Send 按钮未激活、附件上传超时）自动解锁 workspace。
 
 以上都只是**检测与规避**，不是修复：U1–U10 的根因仍在 ask-bridge。

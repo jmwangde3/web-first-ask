@@ -7,8 +7,9 @@ import { resolveRepository } from "./repository.js";
 import { getHomeDir } from "./paths.js";
 import { loadConfig, saveBrowserMode } from "./config.js";
 import { executeTask, refreshTask } from "./managed-runner.js";
+import { runDetachedBatchWorker } from "./runner.js";
 import { collectTask, listTasks, abandonProvider, waitForTask } from "./recovery.js";
-import { checkAskBridge, resolveAskBridge, runProcess } from "./ask-bridge.js";
+import { checkAskBridge, prepareChromeStartup, resolveAskBridge, runProcess } from "./ask-bridge.js";
 import { buildCodePrompt, buildComparePrompt } from "./prompts.js";
 import { normalizeProviders } from "./jobs.js";
 import { WfaError } from "./errors.js";
@@ -23,7 +24,7 @@ const VALUE_FLAGS = new Set([
   "file", "image", "timeout", "request-id", "concurrency", "reasoning",
   "reasoning-map", "model", "model-map", "context", "limit",
   "mode", "brief-file", "followup", "dir", "exclude", "poll-ms",
-  "repo-url", "stall-timeout",
+  "repo-url", "stall-timeout", "target",
 ]);
 const REPEAT_FLAGS = new Set(["file", "image", "dir", "exclude"]);
 
@@ -32,30 +33,20 @@ function parseArgs(argv) {
   const options = {};
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
-    if (!token.startsWith("--")) {
-      positional.push(token);
-      continue;
-    }
+    if (!token.startsWith("--")) { positional.push(token); continue; }
     const equalAt = token.indexOf("=");
     const name = token.slice(2, equalAt === -1 ? undefined : equalAt);
     if (!name) throw new WfaError("ARGUMENT_ERROR", `Invalid option: ${token}`);
     let value;
-    if (equalAt !== -1) {
-      value = token.slice(equalAt + 1);
-    } else if (VALUE_FLAGS.has(name)) {
+    if (equalAt !== -1) value = token.slice(equalAt + 1);
+    else if (VALUE_FLAGS.has(name)) {
       value = argv[++i];
       if (value === undefined || value.startsWith("--")) {
         throw new WfaError("ARGUMENT_ERROR", `Option --${name} requires a value.`);
       }
-    } else {
-      value = true;
-    }
-    if (REPEAT_FLAGS.has(name)) {
-      options[name] ??= [];
-      options[name].push(value);
-    } else {
-      options[name] = value;
-    }
+    } else value = true;
+    if (REPEAT_FLAGS.has(name)) { options[name] ??= []; options[name].push(value); }
+    else options[name] = value;
   }
   return { positional, options };
 }
@@ -74,9 +65,7 @@ function parseMap(value, label) {
 }
 
 async function readPrompt(options) {
-  if (options.prompt && options["prompt-file"]) {
-    throw new WfaError("ARGUMENT_ERROR", "Use only one of --prompt and --prompt-file.");
-  }
+  if (options.prompt && options["prompt-file"]) throw new WfaError("ARGUMENT_ERROR", "Use only one of --prompt and --prompt-file.");
   if (options["prompt-file"]) return (await readFile(path.resolve(options["prompt-file"]), "utf8")).trim();
   if (options.prompt) return String(options.prompt).trim();
   if (!process.stdin.isTTY) {
@@ -93,40 +82,25 @@ function defaultWorkspace(value) {
 
 function printTask(task, json = false, replayed = false) {
   const children = Object.fromEntries(Object.entries(task.children ?? {}).map(([provider, child]) => [provider, {
-    state: child.state,
-    result: child.resultPath ?? null,
-    thread: child.threadUrl ?? null,
-    error: child.error ?? null,
-    errorCode: child.errorCode ?? null,
+    state: child.state, result: child.resultPath ?? null, thread: child.threadUrl ?? null,
+    error: child.error ?? null, errorCode: child.errorCode ?? null,
     recoveryHint: child.recoveryHint ?? null,
     autoCollected: child.completionProof?.source === "ask-bridge-batch-terminal",
-    retryAfterAt: child.retryAfterAt ?? null,
-    retryAfterEstimated: child.retryAfterEstimated ?? false,
+    retryAfterAt: child.retryAfterAt ?? null, retryAfterEstimated: child.retryAfterEstimated ?? false,
     responseHeuristics: child.responseHeuristics ?? null,
     sessionIsolationWarning: child.sessionIsolationWarning ?? null,
     threadMismatch: child.threadMismatch ?? null,
-    repoUnreadable: Boolean(child.repoUnreadable),
-    repoUnreadableEvidence: child.repoUnreadableEvidence ?? null,
+    repoUnreadable: Boolean(child.repoUnreadable), repoUnreadableEvidence: child.repoUnreadableEvidence ?? null,
     repoFallbackCommand: child.repoFallbackCommand ?? null,
-    stall: child.stall ?? null,
-    retriedAsSingleBatch: Boolean(child.retriedAsSingleBatch),
+    stall: child.stall ?? null, retriedAsSingleBatch: Boolean(child.retriedAsSingleBatch),
+    retryLogs: child.retryLogs ?? null,
   }]));
-  const summary = {
-    taskId: task.taskId,
-    requestId: task.requestId,
-    workspace: task.workspace,
-    kind: task.kind,
-    state: task.state,
+  const summary = { taskId: task.taskId, requestId: task.requestId, workspace: task.workspace,
+    kind: task.kind, state: task.state,
     sessionPolicy: task.sessionPolicy ?? (task.fresh ? "fresh" : "continue"),
-    executionPending: Boolean(task.executionPending),
-    replayed,
-    retryWarnings: task.retryWarnings ?? [],
-    providers: children,
-  };
-  if (json) {
-    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
-    return;
-  }
+    executionPending: Boolean(task.executionPending), replayed,
+    retryWarnings: task.retryWarnings ?? [], providers: children };
+  if (json) { process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`); return; }
   process.stdout.write(`Task: ${task.taskId}${replayed ? " (existing request; not resent)" : ""}\n`);
   process.stdout.write(`Workspace: ${task.workspace}\nState: ${task.state}\nSession: ${summary.sessionPolicy}\n`);
   if (task.executionPending) process.stdout.write("Execution cleanup: pending; completed results are readable but the workspace/provider lock remains active.\n");
@@ -151,22 +125,22 @@ function help() {
   process.stdout.write(`web-first-ask (wfa) — Codex-first web AI delegation
 
 Commands:
-  wfa ask       Ask the default providers (chatgpt+gemini, serial) in one batch
+  wfa ask       Ask the default providers (chatgpt+gemini, serial) in separate batches
   wfa compare   Ask multiple providers; sequential by default
   wfa code      Ask for complete replacement code; repository reference by default
   wfa status    Inspect a task by ID
-  wfa list      List recent tasks
+  wfa list      List recent tasks, refreshing detached/running states
   wfa wait      Wait for a task; adopt verified results and optionally stage completed code
   wfa attach    Reattach read-only to saved task status; never resubmit
   wfa collect   Return a verified saved result; manual get requires --confirm-complete
   wfa result    Read a saved provider result
-  wfa stage     Stage complete code files for review
+  wfa stage     Stage full-file or exact ANCHOR/REPLACE code for review
   wfa apply     Apply staged code only after explicit confirmation
   wfa resolve   Abandon an unresolved provider task after confirming it is no longer running
   wfa login     Log in to a provider through ask-bridge
-  wfa browser-mode [headless|headful]  Show or save the browser mode for batch tasks
-  wfa doctor    Check Node.js and ask-bridge integration
-  wfa install-skill  Install the web-first Skill into the Codex user Skills directory
+  wfa browser-mode [headless|headful]  Show or save browser mode and Chrome repair status
+  wfa doctor    Check Node.js, ask-bridge integration and Chrome startup repair
+  wfa install-skill [--target codex|workbuddy|path]  Install web-first Skill
   wfa upstream update  Update ask-bridge using its official updater
 
 Common options:
@@ -176,48 +150,50 @@ Common options:
   --prompt <text> | --prompt-file <path> | stdin
   --repo-url <url>     Override the detected Git remote URL
   --no-repo            Do not add a repository reference
-  --bundle-repo        Explicit tracked-source inline fallback (never default)
+  --bundle-repo        Inline a directory tree and a bounded selection of tracked sources
   --file <path|glob|dir> Repeatable source/document attachment; directories recurse
-  --dir <path>         Alias for a recursive directory attachment
+  --dir <path>         Alias for recursive directory attachment
   --image <path|glob>  Repeatable image attachment (not supported by Gemini)
-  --exclude <glob>     Repeatable exclusion pattern for source or bundle
+  --exclude <glob>     Repeatable source or repository bundle exclusions
   --timeout <seconds>  Default 1200; maximum 7200
-  --stall-timeout <s>  Default 300; 0 disables the inactivity watchdog
-  --concurrency <N>    Jobs in flight (1..3); default 1, because concurrent tabs collide
+  --stall-timeout <s>  Default 300; 0 disables inactivity watchdog
+  --concurrency <N>    Jobs in flight (1..3); default 1, using separate batches
 
   --model <name>       Single-provider request only; add --provider
   --model-map chatgpt=<name>,gemini=<name>
   --context <text>     Additional code-generation context
   --download-images    Download generated images (off by default)
   --continue-session  Reuse a workspace's previous conversation (opt-in)
-  --new-session        Explicitly request a fresh conversation (the default)
+  --new-session        Explicitly request fresh conversation (default)
   --fresh              Alias for --new-session
-  --followup <id>      Continue that task's exact saved provider conversation
+  --followup <id>      Continue exact saved provider conversation
   --mode full-file|spec Select complete-file delivery or compact implementation specification
   --brief-file <path>  Explicit project handoff context
   --no-brief           Disable automatic .wfa/active-brief.md injection
   --bundle-lines       Bundle selected text files with path:line prefixes
-  --detach             Run ask-bridge in background with task-specific logs
+  --detach             Run background WFA serial worker or ask-bridge with task-specific logs
   --stage              Stage completed full-file code without applying it
   --poll-ms <ms>       Polling interval for wait/attach (250..60000; default 2000)
-  --dry-run            Preview repository reference, bundle statistics and risks
-  --allow-oversize     Send a prompt over 40 KiB anyway (truncation risk)
-  --allow-gemini-attachments  Force the native Gemini upload instead of inlining the text
-  --allow-sensitive    Explicitly allow sending text flagged by the secret scanner
-  --no-bundle-lines     Disable the selected-source bundle for wfa code
+  --dry-run            Preview repository reference, dirty/unpushed warnings and risks
+  --allow-oversize     Send prompt over 40 KiB anyway (truncation risk)
+  --allow-gemini-attachments  Force native Gemini upload instead of inlining text
+  --allow-sensitive    Explicitly allow sending text flagged by secret scanner
+  --no-bundle-lines     Disable selected-source bundle for wfa code
   --request-id <id>    Reuse only to recover the exact same logical request
-  --json               Print a machine-readable summary
+  --json               Print machine-readable summary
 
 Code mode:
   wfa code --workspace repo-name --requirement "Implement the new feature"
   wfa code --requirement "..." --no-repo --file src/a.js
-  wfa ask --provider chatgpt --followup <task-id> --bundle-repo --prompt "Use the inline repository"
+  wfa code --followup <task-id> --provider chatgpt --bundle-repo --requirement "Complete original implementation"
 
 Safety:
   Each new task requests a new conversation; ask-bridge may still reuse tabs.
   Thread mismatches and REPO_UNREADABLE are surfaced, not accepted silently.
+  Dirty/unpushed local state is warned and never silently represented as remote code.
   Stalled/uncertain tasks remain locked until collection or explicit resolve.
-  Code results are staged first; wfa apply --confirm modifies the workspace.
+  Stage/apply reject corrupted LaTeX output and require exact anchor matching.
+  wfa apply --confirm alone writes provider-generated code into the workspace.
 `);
 }
 
@@ -229,54 +205,60 @@ async function runLogin(provider, config) {
   }
 }
 
-async function installSkill() {
+async function installSkill(target = "codex") {
+  if (typeof target !== "string" || !target.trim()) throw new WfaError("ARGUMENT_ERROR", "--target must be codex, workbuddy or an explicit directory.");
   const source = path.join(ROOT, "skills", "web-first", "SKILL.md");
-  const destination = path.join(os.homedir(), ".codex", "skills", "web-first", "SKILL.md");
+  const alias = target.toLowerCase();
+  const base = alias === "codex" || alias === "workbuddy"
+    ? path.join(os.homedir(), `.${alias}`, "skills")
+    : path.resolve(target === "~" ? os.homedir()
+      : target.startsWith("~/") || target.startsWith("~\\") ? path.join(os.homedir(), target.slice(2)) : target);
+  const destination = path.join(base, "web-first", "SKILL.md");
   await mkdir(path.dirname(destination), { recursive: true });
   await copyFile(source, destination);
-  process.stdout.write(`Installed Skill: ${destination}\nRestart or refresh Codex Skill discovery if needed.\n`);
+  process.stdout.write(`Installed Skill: ${destination}\nRestart or refresh Skill discovery if needed.\n`);
+}
+
+function printChromeStatus(status, output = process.stdout) {
+  output.write(`Chrome startup profile: ${status.profileStatus}; repaired: ${status.repairedProfiles.length}; log rotated: ${status.logRotated ? "yes" : "no"}\n`);
+  for (const warning of status.warnings ?? []) output.write(`Chrome startup warning: ${warning}\n`);
 }
 
 async function doctor(config) {
   const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
   const supported = (nodeMajor === 20 && nodeMinor >= 19)
-    || (nodeMajor === 22 && nodeMinor >= 12)
-    || nodeMajor >= 23;
-  if (!supported) {
-    throw new WfaError("NODE_VERSION", `ask-bridge requires Node.js ^20.19.0, ^22.12.0 or >=23.0.0; found ${process.versions.node}.`);
-  }
+    || (nodeMajor === 22 && nodeMinor >= 12) || nodeMajor >= 23;
+  if (!supported) throw new WfaError("NODE_VERSION", `ask-bridge requires Node.js ^20.19.0, ^22.12.0 or >=23.0.0; found ${process.versions.node}.`);
+  const chrome = await prepareChromeStartup({ apply: true });
   const result = await checkAskBridge(config);
   process.stdout.write(`Node.js: ${process.versions.node} OK\n`);
-  process.stdout.write(`ask-bridge: ${result.version}\n`);
-  process.stdout.write(`Batch command: available\n`);
-  process.stdout.write(`Data directory: ${getHomeDir()}\n`);
+  process.stdout.write(`ask-bridge: ${result.version}\nBatch command: available\nData directory: ${getHomeDir()}\n`);
+  printChromeStatus(chrome);
 }
 
 export async function main(argv = process.argv.slice(2)) {
   const [command, ...rest] = argv;
-  if (!command || command === "--help" || command === "help") {
-    help();
-    return;
-  }
+  if (!command || command === "--help" || command === "help") { help(); return; }
   const { positional, options } = parseArgs(rest);
-  if (options.help) {
-    help();
-    return;
-  }
+  if (options.help) { help(); return; }
   if (Object.prototype.hasOwnProperty.call(options, "engine")) {
     throw new WfaError("UNSUPPORTED_ENGINE", "--engine is not supported. WFA uses ask-bridge only; no external engine is selected or invoked.");
   }
-  if (
-    Object.prototype.hasOwnProperty.call(options, "reasoning")
-    || Object.prototype.hasOwnProperty.call(options, "reasoning-map")
-  ) {
-    throw new WfaError(
-      "REASONING_DISABLED",
-      "Reasoning-strength selection is temporarily disabled. Remove --reasoning/--reasoning-map; WFA now uses each provider's current web UI setting.",
-    );
+  if (Object.prototype.hasOwnProperty.call(options, "reasoning")
+    || Object.prototype.hasOwnProperty.call(options, "reasoning-map")) {
+    throw new WfaError("REASONING_DISABLED", "Reasoning-strength selection is temporarily disabled. Remove --reasoning/--reasoning-map; WFA now uses each provider's current web UI setting.");
   }
   const home = getHomeDir();
   const store = new PolicyStore(home);
+
+  // Private detached-worker entry point. It only executes pre-existing tasks;
+  // no new provider submission can be triggered by a user-supplied prompt.
+  if (command === "__batch-worker") {
+    if (positional.length !== 2 || Object.keys(options).length) {
+      throw new WfaError("ARGUMENT_ERROR", "Invalid detached batch worker invocation.");
+    }
+    return runDetachedBatchWorker(positional[0], positional[1], { home, store });
+  }
   if (command === "browser-mode") {
     if (positional.length > 1 || Object.keys(options).length > 0) {
       throw new WfaError("ARGUMENT_ERROR", "Usage: wfa browser-mode [headless|headful]");
@@ -285,17 +267,26 @@ export async function main(argv = process.argv.slice(2)) {
     if (mode === undefined) {
       const config = await loadConfig(home);
       process.stdout.write(`${config.browserMode}\n`);
+      const status = await prepareChromeStartup({ apply: false });
+      // Preserve the existing stdout format (one mode) for scripts using it.
+      printChromeStatus(status, process.stderr);
       return;
     }
     await saveBrowserMode(store, mode);
+    const status = await prepareChromeStartup({ apply: true });
     process.stdout.write(`Saved browser mode: ${mode}\n`);
+    printChromeStatus(status);
     process.stdout.write("If ask-bridge is already running Chrome, wait for active tasks to finish and run `ask-bridge close` to use this mode on the next request.\n");
     return;
   }
   const config = await loadConfig(home);
-
   if (command === "doctor") return doctor(config);
-  if (command === "install-skill") return installSkill();
+  if (command === "install-skill") {
+    if (positional.length || Object.keys(options).some((key) => key !== "target")) {
+      throw new WfaError("ARGUMENT_ERROR", "Usage: wfa install-skill [--target codex|workbuddy|<skills-directory>]");
+    }
+    return installSkill(options.target);
+  }
   if (command === "login") {
     const provider = normalizeProviders([options.provider], [config.defaultProvider])[0];
     return runLogin(provider, config);
@@ -312,15 +303,21 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (command === "list") {
     const tasks = await listTasks({ home, store });
-    const result = tasks.slice(0, Number(options.limit ?? 20)).map((task) => ({
-      taskId: task.taskId,
-      workspace: task.workspace,
-      kind: task.kind,
-      state: task.state,
+    const limit = Number(options.limit ?? 20);
+    const selected = tasks.slice(0, limit);
+    const refreshed = await Promise.all(selected.map(async (task) => {
+      if (task.detached || task.executionPending || ["preparing", "running"].includes(task.state)) {
+        return refreshTask(task.taskId, { home, store });
+      }
+      return task;
+    }));
+    const result = refreshed.map((task) => ({
+      taskId: task.taskId, workspace: task.workspace, kind: task.kind, state: task.state,
       providers: Object.fromEntries(Object.entries(task.children).map(([key, value]) => [key, value.state])),
       createdAt: task.createdAt,
     }));
-    process.stdout.write(`${options.json ? JSON.stringify(result, null, 2) : result.map((item) => `${item.taskId}  ${item.state.padEnd(16)} ${item.workspace}  ${Object.entries(item.providers).map(([p, s]) => `${p}:${s}`).join(" ")}`).join("\n")}\n`);
+    process.stdout.write(`${options.json ? JSON.stringify(result, null, 2)
+      : result.map((item) => `${item.taskId}  ${item.state.padEnd(16)} ${item.workspace}  ${Object.entries(item.providers).map(([p, s]) => `${p}:${s}`).join(" ")}`).join("\n")}\n`);
     return;
   }
   if (command === "wait" || command === "attach") {
@@ -336,13 +333,7 @@ export async function main(argv = process.argv.slice(2)) {
       throw new WfaError("INVALID_POLL_INTERVAL", "--poll-ms must be an integer from 250 to 60000.");
     }
     const result = await waitForTask(taskId, {
-      provider: options.provider,
-      timeoutSeconds,
-      pollMs,
-      stage: Boolean(options.stage),
-      home,
-      store,
-      config,
+      provider: options.provider, timeoutSeconds, pollMs, stage: Boolean(options.stage), home, store, config,
     });
     printTask(result.task, Boolean(options.json), false);
     if (!options.json) {
@@ -360,11 +351,7 @@ export async function main(argv = process.argv.slice(2)) {
     const taskId = positional[0];
     if (!taskId) throw new WfaError("ARGUMENT_ERROR", "Usage: wfa collect <task-id> --provider <provider> [--confirm-complete]");
     const result = await collectTask(taskId, {
-      provider: options.provider,
-      confirmComplete: Boolean(options["confirm-complete"]),
-      home,
-      store,
-      config,
+      provider: options.provider, confirmComplete: Boolean(options["confirm-complete"]), home, store, config,
     });
     process.stdout.write(`${result.autoCollected ? "Auto-collected" : result.alreadyCollected ? "Result already saved" : "Manually collected"} (${result.provider}): ${result.resultPath}\nTask state: ${result.task.state}${result.executionPending ? " (batch cleanup pending; workspace remains locked)" : ""}\n`);
     return;
@@ -378,9 +365,7 @@ export async function main(argv = process.argv.slice(2)) {
       if (result.sessionIsolationWarning) process.stderr.write(`Warning: ${result.sessionIsolationWarning}\n`);
       process.stdout.write(result.body);
       if (!result.body.endsWith("\n")) process.stdout.write("\n");
-    } else {
-      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    }
+    } else process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return;
   }
   if (command === "stage") {
@@ -420,9 +405,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (options["continue-session"] && (options["new-session"] || options.fresh)) {
     throw new WfaError("ARGUMENT_ERROR", "--continue-session conflicts with --fresh/--new-session.");
   }
-  if (options["repo-url"] && options["no-repo"]) {
-    throw new WfaError("ARGUMENT_ERROR", "--repo-url conflicts with --no-repo.");
-  }
+  if (options["repo-url"] && options["no-repo"]) throw new WfaError("ARGUMENT_ERROR", "--repo-url conflicts with --no-repo.");
   const repository = await resolveRepository({
     cwd: process.cwd(), repoUrl: options["repo-url"], noRepo: Boolean(options["no-repo"]),
   });
@@ -449,10 +432,12 @@ export async function main(argv = process.argv.slice(2)) {
     }
     prompt = buildCodePrompt({
       requirement,
-      filePaths: files.length ? [...files, ...images].map((file) => {
-        const relative = path.relative(process.cwd(), path.resolve(file));
-        return (relative || path.basename(file)).split(path.sep).join("/");
-      }) : (repository.available ? ["Source: read the REPOSITORY reference below directly"] : []),
+      filePaths: options["bundle-repo"]
+        ? ["Source: use the inlined REPOSITORY SOURCE BUNDLE below, not a remote reference"]
+        : files.length ? [...files, ...images].map((file) => {
+          const relative = path.relative(process.cwd(), path.resolve(file));
+          return (relative || path.basename(file)).split(path.sep).join("/");
+        }) : (repository.available ? ["Source: read the REPOSITORY reference below directly"] : []),
       context: [options.context, ...(options.requirement && prompt ? [prompt] : [])].filter(Boolean).join("\n\n"),
       mode,
     });
@@ -461,7 +446,6 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.stage && (command !== "code" || mode !== "full-file")) {
     throw new WfaError("STAGE_REQUIRES_FULL_FILE", "--stage requires wfa code --mode full-file; spec and ordinary ask/compare results cannot be staged.");
   }
-
   let followupDefaultProviders = null;
   if (options.followup && !options.providers && !options.provider) {
     const snap = await store.snapshot();
@@ -471,65 +455,40 @@ export async function main(argv = process.argv.slice(2)) {
       throw new WfaError("FOLLOWUP_PROVIDER_REQUIRED", `Parent task ${options.followup} has multiple providers. Specify exactly one --provider to continue a verified conversation.`);
     }
   }
-
   let providers;
   if (command === "compare") {
-    providers = normalizeProviders(
-      options.providers ? [options.providers] : (options.provider ? [options.provider] : []),
-      config.defaultCompareProviders,
-    );
-  } else if (options.providers) {
-    providers = normalizeProviders([options.providers], config.defaultCompareProviders);
-  } else {
-    providers = normalizeProviders([options.provider], followupDefaultProviders ?? config.defaultProviders);
-  }
+    providers = normalizeProviders(options.providers ? [options.providers] : (options.provider ? [options.provider] : []), config.defaultCompareProviders);
+  } else if (options.providers) providers = normalizeProviders([options.providers], config.defaultCompareProviders);
+  else providers = normalizeProviders([options.provider], followupDefaultProviders ?? config.defaultProviders);
   if (providers.length > 1) prompt = buildComparePrompt(prompt, command === "code" ? mode : "full-file");
   if (options["new-session"] || options.fresh) {
     process.stderr.write("Note: --new-session is already the default. ask-bridge can still reuse an open tab; inspect any threadMismatch warning.\n");
   }
+  for (const warning of repository.warnings ?? []) process.stderr.write(`Repository warning: ${warning}\n`);
   const modelByProvider = parseMap(options["model-map"], "model-map");
-
   const result = await executeTask({
-    kind: command,
-    prompt,
-    providers,
-    provider: options.provider,
-    workspace: defaultWorkspace(options.workspace),
-    files,
-    images,
-    workspaceRoot: process.cwd(),
-    repository,
-    repoUrl: options["repo-url"],
-    noRepo: Boolean(options["no-repo"]),
-    bundleRepo: Boolean(options["bundle-repo"]),
-    repoExcludes: options.exclude ?? [],
+    kind: command, prompt, providers, provider: options.provider,
+    workspace: defaultWorkspace(options.workspace), files, images, workspaceRoot: process.cwd(),
+    repository, repoUrl: options["repo-url"], noRepo: Boolean(options["no-repo"]),
+    bundleRepo: Boolean(options["bundle-repo"]), repoExcludes: options.exclude ?? [],
     bundleLines: command === "code" ? options["no-bundle-lines"] !== true : Boolean(options["bundle-lines"]),
-    dryRun: Boolean(options["dry-run"]),
-    allowSensitive: Boolean(options["allow-sensitive"]),
+    dryRun: Boolean(options["dry-run"]), allowSensitive: Boolean(options["allow-sensitive"]),
     allowOversize: Boolean(options["allow-oversize"]),
     allowGeminiAttachments: Boolean(options["allow-gemini-attachments"]),
-    briefFile: options["brief-file"],
-    noBrief: Boolean(options["no-brief"]),
-    followupTaskId: options.followup,
-    continueSession: Boolean(options["continue-session"]),
+    briefFile: options["brief-file"], noBrief: Boolean(options["no-brief"]),
+    followupTaskId: options.followup, continueSession: Boolean(options["continue-session"]),
     stallTimeoutSeconds: options["stall-timeout"] === undefined ? 300 : Number(options["stall-timeout"]),
-    detach: Boolean(options.detach),
-    mode,
+    detach: Boolean(options.detach), mode,
     timeoutSeconds: options.timeout ? Number(options.timeout) : config.defaultTimeoutSeconds,
     concurrency: options.concurrency ? Number(options.concurrency) : undefined,
-    model: options.model,
-    modelByProvider,
-    requestId: options["request-id"],
+    model: options.model, modelByProvider, requestId: options["request-id"],
     fresh: Boolean(options["new-session"] || options.fresh),
     downloadImages: options["download-images"] === undefined ? undefined : Boolean(options["download-images"]),
-    onProgressLine: (stream, line) => {
-      process.stderr.write(`[ask-bridge ${stream}] ${line}\n`);
-    },
+    onProgressLine: (stream, line) => { process.stderr.write(`[ask-bridge ${stream}] ${line}\n`); },
     onTaskCreated: (task) => {
-      process.stderr.write(`Started task ${task.taskId} (request ${task.requestId}); ${options.detach ? "detached ask-bridge process" : "waiting inside one local CLI process"}.\n`);
+      process.stderr.write(`Started task ${task.taskId} (request ${task.requestId}); ${options.detach ? "detached worker" : "waiting inside one local CLI process"}.\n`);
     },
   }, { home, store, config });
-
   if (result.dryRun) {
     process.stdout.write(`${JSON.stringify(result.preview, null, 2)}\n`);
     return result.preview.blocked ? 2 : 0;

@@ -1,11 +1,10 @@
-import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { executeTask as executeLegacyTask, refreshTask as refreshLegacyTask } from "./runner.js";
+import { executeTask as executeLegacyTask } from "./runner.js";
+import { refreshTask, guardedBatch } from "./runner-stall.js";
 import { runProcess } from "./ask-bridge.js";
 import { PolicyStore } from "./policy-store.js";
 import { WfaError } from "./errors.js";
 import { bundleRepository, repositoryBlock, resolveRepository } from "./repository.js";
-import { createStallWatch } from "./stall-watch.js";
 
 function positiveInteger(value, label, allowZero = false) {
   const number = Number(value);
@@ -13,54 +12,6 @@ function positiveInteger(value, label, allowZero = false) {
     throw new WfaError("ARGUMENT_ERROR", `${label} must be ${allowZero ? "a nonnegative" : "a positive"} integer.`);
   }
   return number;
-}
-
-async function guardedBatch(run, command, args, options, store, timeoutSeconds) {
-  if (!timeoutSeconds || !args.includes("batch")) return run(command, args, options);
-  const inputFile = args[args.indexOf("--input") + 1];
-  const outputDir = args[args.indexOf("--output-dir") + 1];
-  const jobs = (await readFile(inputFile, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
-  const taskId = path.basename(path.dirname(inputFile));
-  const watch = createStallWatch(jobs, outputDir, timeoutSeconds);
-  let pid = null;
-  let settled = false;
-  let timer;
-  let settleAfterKill;
-  let stopFallback;
-  const afterKill = new Promise((resolve) => { settleAfterKill = resolve; });
-  const tick = async () => {
-    if (settled) return;
-    const evidence = await watch.check();
-    if (!evidence || settled) return;
-    settled = true;
-    store.stalls.set(taskId, { ...(store.stalls.get(taskId) ?? {}), ...evidence });
-    if (pid && pid !== process.pid) {
-      try { process.kill(pid, "SIGTERM"); } catch {}
-      const escalation = setTimeout(() => {
-        try { process.kill(pid, "SIGKILL"); } catch {}
-      }, 5000);
-      escalation.unref?.();
-    }
-    stopFallback = setTimeout(() => settleAfterKill({
-      code: null, signal: "SIGTERM", stdout: "", stderr: "", spawnError: null,
-      childMayRun: Boolean(pid), pid, stalled: evidence,
-    }), 6000);
-  };
-  const wrapped = {
-    ...options,
-    onSpawn: async (value) => { pid = value; await options.onSpawn?.(value); },
-    onStdoutLine: (line) => { watch.progress(line); options.onStdoutLine?.(line); },
-    onStderrLine: (line) => { watch.progress(line); options.onStderrLine?.(line); },
-  };
-  timer = setInterval(() => { void tick(); }, 1000);
-  try {
-    const result = await Promise.race([run(command, args, wrapped), afterKill]);
-    return result;
-  } finally {
-    settled = true;
-    clearInterval(timer);
-    clearTimeout(stopFallback);
-  }
 }
 
 export async function executeTask(input, dependencies = {}) {
@@ -83,16 +34,19 @@ export async function executeTask(input, dependencies = {}) {
   const stallTimeoutSeconds = positiveInteger(input.stallTimeoutSeconds ?? 300, "--stall-timeout", true);
   const sessionPolicy = input.followupTaskId || input.continueSession ? "continue" : "fresh";
   const bundle = input.bundleRepo ? await bundleRepository({
-    cwd: workspaceRoot, excludes: input.repoExcludes ?? [], includes: input.files ?? [],
+    cwd: workspaceRoot, excludes: input.repoExcludes ?? [], includes: input.files ?? [], prompt: input.prompt,
   }) : null;
-  if (bundle && !bundle.stats.files) {
-    throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo found no eligible tracked UTF-8 files. Use --file <path> or adjust --exclude.");
+  if (bundle && !bundle.stats.listed) {
+    throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo found no eligible tracked files. Select paths with --file or adjust --exclude.");
   }
   let prompt = input.prompt;
-  if (repository.available) prompt = `${repositoryBlock(repository)}\n\n${prompt}`;
-  if (bundle) prompt += `\n\nREPOSITORY SOURCE BUNDLE (${bundle.stats.files} tracked files, ${bundle.stats.bytes} UTF-8 bytes; ${bundle.stats.skipped} skipped)\n${bundle.content}\nEND SOURCE BUNDLE`;
+  // The inline bundle and the remote-reading contract are mutually exclusive.
+  // In particular do not ask a bundled follow-up to return REPO_UNREADABLE.
+  if (repository.available && !bundle) prompt = `${repositoryBlock(repository)}\n\n${prompt}`;
+  if (bundle) prompt += `\n\n${bundle.content}\nEND SOURCE BUNDLE`;
   const store = dependencies.store instanceof PolicyStore ? dependencies.store : new PolicyStore(dependencies.home);
-  store.intent = { sessionPolicy, followupTaskId: input.followupTaskId ?? null, stallTimeoutSeconds, repository };
+  store.intent = { sessionPolicy, followupTaskId: input.followupTaskId ?? null,
+    stallTimeoutSeconds, repository, bundleRepo: Boolean(bundle) };
   store.allowUnreadableFollowup = null;
   if (input.followupTaskId) {
     const snapshot = await store.snapshot();
@@ -109,12 +63,14 @@ export async function executeTask(input, dependencies = {}) {
       noBrief: Boolean(input.noBrief || (repository.available && !input.briefFile)),
       files: bundle ? [] : input.files,
       bundleLines: bundle ? false : input.bundleLines,
+      sequentialBatches: true,
     }, {
       ...dependencies, store,
       runProcess: (...args) => guardedBatch(dependencies.runProcess ?? runProcess, ...args, store, stallTimeoutSeconds),
     });
     if (result.dryRun) {
       result.preview.repository = repository;
+      result.preview.repositoryWarnings = repository.warnings ?? [];
       result.preview.bundleRepo = bundle?.stats ?? null;
       result.preview.sessionPolicy = sessionPolicy;
       result.preview.stallTimeoutSeconds = stallTimeoutSeconds;
@@ -122,7 +78,7 @@ export async function executeTask(input, dependencies = {}) {
     return result;
   } catch (error) {
     if (bundle && error.code === "PROMPT_OVERSIZE") {
-      throw new WfaError("PROMPT_OVERSIZE", `${error.message} Whole-repository inlining exceeded the safe 40 KiB prompt ceiling. Retry with --bundle-repo --exclude 'docs/**', select only required --file paths, or explicitly pass --allow-oversize.`);
+      throw new WfaError("PROMPT_OVERSIZE", `${error.message} Narrow --bundle-repo with --file <path> and --exclude 'docs/**'; do not rely on --allow-oversize because upstream truncates prompts.`);
     }
     throw error;
   } finally {
@@ -131,4 +87,4 @@ export async function executeTask(input, dependencies = {}) {
   }
 }
 
-export { refreshLegacyTask as refreshTask };
+export { refreshTask };

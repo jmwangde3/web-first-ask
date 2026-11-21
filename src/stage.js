@@ -5,7 +5,7 @@ import path from "node:path";
 import { Store } from "./store.js";
 import { WfaError } from "./errors.js";
 import { hashFile, sha256, uuid } from "./util.js";
-import { verifyStoredCompletion } from "./metadata.js";
+import { inspectResponseHeuristics, verifyStoredCompletion } from "./metadata.js";
 
 function isInside(root, candidate) {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
@@ -14,13 +14,15 @@ function isInside(root, candidate) {
 
 function assertSafeRelativePath(relativePath, root) {
   const value = String(relativePath ?? "").trim();
-  const normalized = value.replaceAll("\\", "/");
+  // A single leading ./ is conventional and safe. All other dot segments and
+  // traversal are still rejected rather than passed to path.resolve.
+  const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "");
   const firstSegment = normalized.split("/")[0]?.toLowerCase();
   if ([".git", ".wfa", "node_modules"].includes(firstSegment)) {
     throw new WfaError("PROTECTED_RESULT_PATH", `Provider output cannot overwrite protected workspace metadata/dependency paths: ${value}`);
   }
-  if (!value || normalized.includes("\0") || normalized.startsWith("/") || normalized.startsWith("//")
-    || /^[A-Za-z]:/.test(normalized) || normalized.includes(":")
+  if (!value || !normalized || normalized.includes("\0") || normalized.startsWith("/")
+    || normalized.startsWith("//") || /^[A-Za-z]:/.test(normalized) || normalized.includes(":")
     || normalized.split("/").some((part) => part === ".." || part === "." || part === ""
       || /[. ]$/.test(part) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(part))) {
     throw new WfaError("UNSAFE_RESULT_PATH", `Refusing unsafe path from provider output: ${value || "(empty)"}`);
@@ -58,6 +60,24 @@ async function assertNoSymlinkComponents(root, target, { allowMissing = true } =
   }
 }
 
+function parseFence(lines, at, filePath, label) {
+  let index = at;
+  while (index < lines.length && !lines[index].trim()) index += 1;
+  const fence = lines[index]?.match(/^(`{3,})([A-Za-z0-9_+.-]*)\s*$/);
+  if (!fence) throw new WfaError("INCOMPLETE_FILE_BLOCK", `${label} block "${filePath}" is not followed by a complete fenced body.`);
+  const marker = fence[1];
+  index += 1;
+  const body = [];
+  for (; index < lines.length && lines[index] !== marker; index += 1) body.push(lines[index]);
+  if (index >= lines.length) throw new WfaError("INCOMPLETE_FILE_BLOCK", `${label} block "${filePath}" has an unterminated code fence.`);
+  if (!body.length) throw new WfaError("EMPTY_FILE_BLOCK", `${label} block "${filePath}" is empty.`);
+  return { content: `${body.join("\n")}\n`, last: index, language: fence[2] };
+}
+
+// Two accepted formats:
+//   FILE: src/x.js\n```js\ncomplete source\n```
+//   FILE: src/x.js\nANCHOR:\n```js\nexact existing text\n```\nREPLACE:\n```js\nnew text\n```
+// An ANCHOR must occur exactly once, including its surrounding context.
 export function parseFileBlocks(markdown = "") {
   const lines = String(markdown).replace(/\r\n?/g, "\n").split("\n");
   const blocks = [];
@@ -65,41 +85,46 @@ export function parseFileBlocks(markdown = "") {
     const header = lines[index].match(/^FILE:\s*(.+?)\s*$/);
     if (!header) continue;
     const filePath = header[1].trim().replace(/^`(.*)`$/, "$1");
-    index += 1;
-    while (index < lines.length && lines[index].trim() === "") index += 1;
-    const fence = lines[index]?.match(/^(`{3,})([A-Za-z0-9_+.-]*)\s*$/);
-    if (!fence) {
-      throw new WfaError("INCOMPLETE_FILE_BLOCK", `FILE block "${filePath}" is not followed by a complete fenced file body.`);
-    }
-    const fenceMarker = fence[1];
-    index += 1;
-    const body = [];
-    let closed = false;
-    for (; index < lines.length; index += 1) {
-      if (lines[index] === fenceMarker) {
-        closed = true;
-        break;
+    let cursor = index + 1;
+    while (cursor < lines.length && lines[cursor].trim() === "") cursor += 1;
+    if (/^ANCHOR:\s*$/.test(lines[cursor] ?? "")) {
+      while (/^ANCHOR:\s*$/.test(lines[cursor] ?? "")) {
+        const anchor = parseFence(lines, cursor + 1, filePath, "ANCHOR");
+        cursor = anchor.last + 1;
+        while (cursor < lines.length && lines[cursor].trim() === "") cursor += 1;
+        if (!/^REPLACE:\s*$/.test(lines[cursor] ?? "")) {
+          throw new WfaError("INCOMPLETE_ANCHOR_BLOCK", `ANCHOR for ${filePath} requires a REPLACE block.`);
+        }
+        const replacement = parseFence(lines, cursor + 1, filePath, "REPLACE");
+        blocks.push({ filePath, kind: "replace", anchor: anchor.content, replacement: replacement.content });
+        index = replacement.last;
+        cursor = replacement.last + 1;
+        while (cursor < lines.length && lines[cursor].trim() === "") cursor += 1;
       }
-      body.push(lines[index]);
+    } else {
+      const file = parseFence(lines, cursor, filePath, "FILE");
+      blocks.push({ filePath, kind: "full", content: file.content, language: file.language });
+      index = file.last;
     }
-    if (!closed) {
-      throw new WfaError("INCOMPLETE_FILE_BLOCK", `FILE block "${filePath}" has an unterminated code fence; refusing to stage truncated output.`);
-    }
-    if (!body.length) {
-      throw new WfaError("EMPTY_FILE_BLOCK", `FILE block "${filePath}" is empty; refusing to stage it.`);
-    }
-    blocks.push({ filePath, content: `${body.join("\n")}\n`, language: fence[1] ?? "" });
   }
-  if (!blocks.length) {
-    throw new WfaError("NO_FILE_BLOCKS", "No complete `FILE: path` plus fenced full-file blocks were found in the response.");
-  }
-  const seen = new Set();
+  if (!blocks.length) throw new WfaError("NO_FILE_BLOCKS", "No complete FILE: path plus fenced full-file or ANCHOR/REPLACE blocks were found.");
+  const seen = new Map();
   for (const block of blocks) {
-    const key = process.platform === "win32" ? block.filePath.toLowerCase() : block.filePath;
-    if (seen.has(key)) throw new WfaError("DUPLICATE_FILE_BLOCK", `Provider returned the same file more than once: ${block.filePath}`);
-    seen.add(key);
+    const key = block.filePath.replaceAll("\\", "/").replace(/^\.\//, "");
+    const canonical = process.platform === "win32" ? key.toLowerCase() : key;
+    const previous = seen.get(canonical);
+    if (previous && (block.kind !== "replace" || previous !== "replace")) {
+      throw new WfaError("DUPLICATE_FILE_BLOCK", `Provider returned incompatible duplicate FILE blocks: ${block.filePath}`);
+    }
+    seen.set(canonical, block.kind);
   }
   return blocks;
+}
+
+function assertCleanProviderOutput(markdown, child) {
+  if (child.responseHeuristics?.latexEscaping || inspectResponseHeuristics(markdown).latexEscaping) {
+    throw new WfaError("RESPONSE_LATEX_CORRUPTED", "Provider result contains LaTeX-escaped code (\\vert{}, \\lbrace, \\rbrace, or \\textbackslash). Refusing to stage/apply; request a clean complete response.");
+  }
 }
 
 async function loadCompletedCodeTask(taskId, provider, { home, store }) {
@@ -109,11 +134,8 @@ async function loadCompletedCodeTask(taskId, provider, { home, store }) {
   if (task.kind !== "code" || task.mode === "spec") {
     throw new WfaError("NOT_APPLICABLE", "Only completed wfa code tasks in full-file mode can be staged or applied.");
   }
-  const providers = Object.entries(task.children ?? {})
-    .filter(([, child]) => child.state === "completed" && child.resultPath);
-  const selected = provider
-    ? provider.toLowerCase()
-    : (providers.length === 1 ? providers[0][0] : null);
+  const providers = Object.entries(task.children ?? {}).filter(([, child]) => child.state === "completed" && child.resultPath);
+  const selected = provider ? provider.toLowerCase() : (providers.length === 1 ? providers[0][0] : null);
   if (!selected) throw new WfaError("PROVIDER_REQUIRED", "Specify --provider when the task has multiple completed provider results.");
   const child = task.children?.[selected];
   if (!child || child.state !== "completed" || !child.resultPath) {
@@ -121,9 +143,7 @@ async function loadCompletedCodeTask(taskId, provider, { home, store }) {
   }
   const runDir = path.resolve(task.runDir);
   const resultPath = path.resolve(child.resultPath);
-  if (!isInside(runDir, resultPath)) {
-    throw new WfaError("UNSAFE_RESULT_SOURCE", "The recorded resultPath is outside this task's run directory.");
-  }
+  if (!isInside(runDir, resultPath)) throw new WfaError("UNSAFE_RESULT_SOURCE", "The recorded resultPath is outside this task's run directory.");
   await assertNoSymlinkComponents(runDir, resultPath, { allowMissing: false });
   const resultInfo = await stat(resultPath);
   if (!resultInfo.isFile()) throw new WfaError("UNSAFE_RESULT_SOURCE", "The recorded resultPath is not a regular file.");
@@ -140,6 +160,7 @@ async function loadCompletedCodeTask(taskId, provider, { home, store }) {
       throw new WfaError("RESULT_INTEGRITY_FAILED", proof.error ?? "The ask-bridge terminal result changed after verification.");
     }
   }
+  assertCleanProviderOutput(await readFile(resultPath, "utf8"), child);
   return { task, child, selected, runDir, resultPath, workspaceRoot, responseHash };
 }
 
@@ -150,9 +171,7 @@ export async function readTaskResult(taskId, {
   const task = snapshot.tasks.tasks[taskId];
   if (!task) throw new WfaError("TASK_NOT_FOUND", `Task not found: ${taskId}`);
   const candidates = Object.entries(task.children ?? {}).filter(([, child]) => child.resultPath);
-  const selected = provider
-    ? provider.toLowerCase()
-    : (candidates.length === 1 ? candidates[0][0] : null);
+  const selected = provider ? provider.toLowerCase() : (candidates.length === 1 ? candidates[0][0] : null);
   if (!selected) throw new WfaError("PROVIDER_REQUIRED", "Specify --provider when the task has multiple result files.");
   const child = task.children?.[selected];
   if (!child?.resultPath) throw new WfaError("RESULT_NOT_READY", `No saved result for ${selected}.`);
@@ -169,49 +188,50 @@ export async function readTaskResult(taskId, {
       throw new WfaError("RESULT_INTEGRITY_FAILED", proof.error ?? "The ask-bridge terminal result changed after verification.");
     }
   }
-  const warnings = {
-    responseHeuristics: child.responseHeuristics ?? null,
-    sessionIsolationWarning: child.sessionIsolationWarning ?? null,
-  };
-  return stdout
-    ? { taskId, provider: selected, resultPath, body, ...warnings }
-    : {
-      taskId,
-      provider: selected,
-      resultPath,
-      bytes: Buffer.byteLength(body, "utf8"),
-      sha256: sha256(body),
-      state: child.state,
-      ...warnings,
-    };
+  const warnings = { responseHeuristics: child.responseHeuristics ?? null,
+    sessionIsolationWarning: child.sessionIsolationWarning ?? null };
+  return stdout ? { taskId, provider: selected, resultPath, body, ...warnings }
+    : { taskId, provider: selected, resultPath, bytes: Buffer.byteLength(body, "utf8"),
+      sha256: sha256(body), state: child.state, ...warnings };
 }
 
-export async function stageTaskFiles(taskId, {
-  provider, home, store = new Store(home),
-} = {}) {
+export async function stageTaskFiles(taskId, { provider, home, store = new Store(home) } = {}) {
   const taskInfo = await loadCompletedCodeTask(taskId, provider, { home, store });
   const markdown = await readFile(taskInfo.resultPath, "utf8");
   const blocks = parseFileBlocks(markdown);
-  const prepared = [];
+  const preparedByPath = new Map();
   for (const block of blocks) {
     const safe = assertSafeRelativePath(block.filePath, taskInfo.workspaceRoot);
-    await assertNoSymlinkComponents(taskInfo.workspaceRoot, safe.target);
-    const existing = await stat(safe.target).catch((error) => {
-      if (error?.code === "ENOENT") return null;
-      throw error;
-    });
-    if (existing && !existing.isFile()) {
-      throw new WfaError("TARGET_NOT_FILE", `Target is not a regular file: ${safe.normalized}`);
+    const key = process.platform === "win32" ? safe.normalized.toLowerCase() : safe.normalized;
+    let item = preparedByPath.get(key);
+    if (!item) {
+      await assertNoSymlinkComponents(taskInfo.workspaceRoot, safe.target);
+      const existing = await stat(safe.target).catch((error) => {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      });
+      if (existing && !existing.isFile()) throw new WfaError("TARGET_NOT_FILE", `Target is not a regular file: ${safe.normalized}`);
+      item = { ...safe, content: existing ? await readFile(safe.target, "utf8") : null,
+        originalExists: Boolean(existing), originalSha256: existing ? await hashFile(safe.target) : null,
+        originalMode: existing ? (existing.mode & 0o777) : 0o644 };
+      preparedByPath.set(key, item);
     }
-    prepared.push({
-      ...block,
-      ...safe,
-      originalExists: Boolean(existing),
-      originalSha256: existing ? await hashFile(safe.target) : null,
-      originalMode: existing ? (existing.mode & 0o777) : 0o644,
-    });
+    if (block.kind === "replace") {
+      if (!item.originalExists) throw new WfaError("ANCHOR_NOT_FOUND", `Cannot replace an anchor in a missing file: ${safe.normalized}`);
+      // Match complete physical lines. A CRLF source is still an exact
+      // line-by-line match, and its original line endings remain unchanged.
+      const eol = item.content.includes("\r\n") ? "\r\n" : "\n";
+      const anchor = block.anchor.replaceAll("\n", eol);
+      const replacement = block.replacement.replaceAll("\n", eol);
+      const first = item.content.indexOf(anchor);
+      if (first === -1) throw new WfaError("ANCHOR_NOT_FOUND", `Exact ANCHOR is absent from ${safe.normalized}; do not guess the replacement location.`);
+      if (item.content.indexOf(anchor, first + 1) !== -1) {
+        throw new WfaError("ANCHOR_AMBIGUOUS", `Exact ANCHOR appears more than once in ${safe.normalized}; add more surrounding context.`);
+      }
+      item.content = item.content.slice(0, first) + replacement + item.content.slice(first + anchor.length);
+    } else item.content = block.content;
   }
-
+  const prepared = [...preparedByPath.values()];
   const stageRoot = path.join(taskInfo.runDir, "staged", taskInfo.selected);
   await assertNoSymlinkComponents(taskInfo.runDir, stageRoot);
   await rm(stageRoot, { recursive: true, force: true });
@@ -221,39 +241,19 @@ export async function stageTaskFiles(taskId, {
     const stagedPath = path.join(stageRoot, ...item.normalized.split("/"));
     await mkdir(path.dirname(stagedPath), { recursive: true });
     await writeFile(stagedPath, item.content, { encoding: "utf8", mode: 0o600 });
-    files.push({
-      path: item.normalized,
-      stagedPath,
-      bytes: Buffer.byteLength(item.content, "utf8"),
-      lines: item.content.split("\n").length - 1,
-      stagedSha256: await hashFile(stagedPath),
-      originalExists: item.originalExists,
-      originalSha256: item.originalSha256,
-      originalMode: item.originalMode,
-    });
+    files.push({ path: item.normalized, stagedPath, bytes: Buffer.byteLength(item.content, "utf8"),
+      lines: item.content.split("\n").length - 1, stagedSha256: await hashFile(stagedPath),
+      originalExists: item.originalExists, originalSha256: item.originalSha256, originalMode: item.originalMode });
   }
-  const manifest = {
-    version: 1,
-    taskId,
-    provider: taskInfo.selected,
-    workspaceRoot: taskInfo.workspaceRoot,
-    resultPath: taskInfo.resultPath,
-    responseSha256: taskInfo.responseHash,
-    createdAt: new Date().toISOString(),
-    files,
-  };
+  const manifest = { version: 1, taskId, provider: taskInfo.selected, workspaceRoot: taskInfo.workspaceRoot,
+    resultPath: taskInfo.resultPath, responseSha256: taskInfo.responseHash,
+    createdAt: new Date().toISOString(), files };
   const manifestPath = path.join(stageRoot, "manifest.json");
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  return {
-    taskId,
-    provider: taskInfo.selected,
-    stageRoot,
-    manifestPath,
-    responseSha256: taskInfo.responseHash,
+  return { taskId, provider: taskInfo.selected, stageRoot, manifestPath, responseSha256: taskInfo.responseHash,
     files: files.map(({ path: filePath, bytes, lines, originalExists, originalSha256, originalMode, stagedSha256 }) => ({
       path: filePath, bytes, lines, originalExists, originalSha256, originalMode, stagedSha256,
-    })),
-  };
+    })) };
 }
 
 export async function applyStagedFiles(taskId, {
@@ -313,12 +313,8 @@ export async function applyStagedFiles(taskId, {
   }
 
   if (!confirm) {
-    return {
-      applied: false,
-      taskId,
-      provider: taskInfo.selected,
-      files: targets.map((item) => ({ path: item.path, originalExists: item.originalExists, bytes: item.bytes })),
-    };
+    return { applied: false, taskId, provider: taskInfo.selected,
+      files: targets.map((item) => ({ path: item.path, originalExists: item.originalExists, bytes: item.bytes })) };
   }
 
   const backupRoot = path.join(taskInfo.runDir, "apply-backups", taskInfo.selected, uuid());
@@ -362,7 +358,6 @@ export async function applyStagedFiles(taskId, {
       if (await hashFile(taskInfo.resultPath) !== manifest.responseSha256) {
         throw new WfaError("STAGE_STALE", "Provider result changed after staging. Run `wfa stage` again.");
       }
-
       await mkdir(backupRoot, { recursive: true });
       for (const item of targets) {
         await assertNoSymlinkComponents(taskInfo.workspaceRoot, item.targetPath);
@@ -393,7 +388,6 @@ export async function applyStagedFiles(taskId, {
           || currentMode !== item.originalMode) {
           throw new WfaError("TARGET_CHANGED", `Target changed immediately before write: ${item.path}.`);
         }
-
         await mkdir(path.dirname(item.targetPath), { recursive: true });
         const tempPath = path.join(path.dirname(item.targetPath), `.wfa-${uuid()}.tmp`);
         const backupPath = path.join(backupRoot, ...item.path.split("/"));
@@ -412,9 +406,7 @@ export async function applyStagedFiles(taskId, {
               if (error?.code === "ENOENT") return null;
               throw error;
             });
-            if (appeared) {
-              throw new WfaError("TARGET_CHANGED", `A new target appeared immediately before write: ${item.path}.`);
-            }
+            if (appeared) throw new WfaError("TARGET_CHANGED", `A new target appeared immediately before write: ${item.path}.`);
           }
           await rename(tempPath, item.targetPath);
           applied.push({ ...item, backupPath });
@@ -423,7 +415,6 @@ export async function applyStagedFiles(taskId, {
           throw error;
         }
       }
-
       currentChild.appliedAt = new Date().toISOString();
       currentChild.appliedFiles = targets.map((item) => item.path);
       currentChild.revision = (currentChild.revision ?? 0) + 1;
@@ -439,12 +430,6 @@ export async function applyStagedFiles(taskId, {
     }
     throw error;
   }
-
-  return {
-    applied: transactionCommitted,
-    taskId,
-    provider: taskInfo.selected,
-    backupRoot,
-    files: targets.map((item) => item.path),
-  };
+  return { applied: transactionCommitted, taskId, provider: taskInfo.selected, backupRoot,
+    files: targets.map((item) => item.path) };
 }
