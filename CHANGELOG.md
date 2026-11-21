@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.2.7 - Unreleased
+
+The zip transport shipped in 0.2.6 was treated as an opaque blob by everything
+except the upload itself: the task still claimed a remote reference, the secret
+scanner could not see inside it, and two archives of the same repository in the
+same second wrote to the same path. This release closes those gaps so the two
+transports behave the same way.
+
+### Fixed
+- A `--bundle-repo=zip` task no longer records a `repoReference`, and its result
+  is no longer run through the `REPO_UNREADABLE` sentinel. `task.bundleRepo`
+  means "a repository payload was shipped", not "it was inlined", so it is now
+  set for both transports. Previously an archive task could be marked
+  `repo_unreadable` and handed a fallback command that recommended the archive
+  it had already used.
+- Archive text entries are scanned for secrets while the zip is packed, and the
+  findings go through the same gate as an inline bundle: a key-shaped line in a
+  tracked source blocks the send unless `--allow-sensitive` is passed. Binary
+  entries are still reported in `unscannedAttachments`, now with a count.
+  Before this, a zip was listed as one unscanned binary attachment, so a
+  committed credential reached the provider with only a generic warning. An
+  archive ships every tracked file rather than the inline transport's bounded
+  selection, so a test fixture that the selection happened to skip now blocks
+  the send too; `--exclude` names the file and `--allow-sensitive` accepts it.
+- Archive names carry milliseconds and a random suffix. Two archives of the same
+  repository in the same second used to resolve to the same path, so the second
+  overwrote a file the first task might still be uploading.
+- Pruning keeps archives younger than ten minutes even when the count exceeds
+  the retention limit, for the same reason: an in-flight upload must not lose
+  its attachment.
+- The archive cap is 50 MiB, matching the attachment limit, instead of 4 GiB.
+  A larger archive now fails before the task is created and names the real
+  reason; previously it failed later at upload.
+- The `REPOSITORY ARCHIVE` block admits when the working tree was dirty, with
+  the number of files involved. It is packed from the working tree, so claiming
+  only "at commit X" let the provider treat uncommitted work as the pushed
+  state.
+- `--dry-run`'s `splitPlan` no longer lists archive attachments. They upload
+  natively and are never inlined, so describing a "forced inline fallback" for
+  them was noise that made a 1 MiB zip look like an oversized prompt file.
+
 ## 0.2.6 - Unreleased
 
 The 40 KiB ceiling was never an ask-bridge limit: it applies to **prompt text**

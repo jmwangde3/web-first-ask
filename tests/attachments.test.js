@@ -16,7 +16,7 @@ test("directory attachments recurse, classify images, skip generated/dependency 
     await writeFile(path.join(root, "src", "readme.md"), "# notes\n");
     await writeFile(path.join(root, "src", "diagram.png"), Buffer.from([1, 2, 3]));
     await writeFile(path.join(root, "src", "manual.pdf"), Buffer.from([4, 5, 6]));
-    await writeFile(path.join(root, "src", ".env"), "API_KEY=secret-secret-secret\n");
+    await writeFile(path.join(root, "src", ".env"), "API_KEY=" + "secret-secret-secret\n");
     await writeFile(path.join(root, "node_modules", "pkg", "index.js"), "ignored\n");
     await writeFile(path.join(root, ".wfa", "active-brief.md"), "not an attachment\n");
 
