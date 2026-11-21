@@ -83,7 +83,8 @@ test("compare replay returns nonzero for a partial batch without losing the succ
     const options = { env: { ...process.env, WFA_HOME: home }, encoding: "utf8" };
     const result = spawnSync(process.execPath, [
       bin, "compare", "--providers", "chatgpt,gemini", "--workspace", "repo",
-      "--request-id", "partial-example", "--prompt", prompt, "--json",
+      "--request-id", "partial-example", "--prompt", prompt,
+      "--no-repo", "--continue-session", "--json",
     ], options);
     assert.ifError(result.error);
     assert.equal(result.status, 1);

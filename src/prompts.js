@@ -1,13 +1,15 @@
 export function buildCodePrompt({ requirement, filePaths, context = "", mode = "full-file" }) {
   const files = filePaths.map((file) => `- ${file}`).join("\n");
+  const sourceInstruction = files
+    ? `## 已指定本地源码或文档\n${files}`
+    : "## 源码获取\n请直接读取请求中的 REPOSITORY URL、branch 和 commit；不要等待本地 Agent 粘贴文件。若无法访问仓库，只回复 REPO_UNREADABLE。";
   if (mode === "spec") {
-    return `你是本地 Coding Agent 的技术设计负责人。请基于附件中的真实源码，输出可直接交给本地 Coding Agent 执行的精确实施规格，而不是完整文件。
+    return `你是本地 Coding Agent 的技术设计负责人。请基于实际源码，输出可直接交给本地 Coding Agent 执行的精确实施规格，而不是完整文件。
 
 ## 需求目标
 ${requirement.trim()}
 
-## 已附加文件
-${files || "- （没有附件；如果目标依赖源文件，请明确指出缺失内容，不要臆造现有实现。）"}
+${sourceInstruction}
 
 ${context.trim() ? `## 补充上下文\n${context.trim()}\n` : ""}
 
@@ -20,7 +22,7 @@ ${context.trim() ? `## 补充上下文\n${context.trim()}\n` : ""}
 6. **测试断言**：列出有信息价值的回归场景和可观察的预期结果。
 7. **实施顺序**：按依赖关系给出最短执行顺序。
 
-引用源码时使用附件中提供的精确 \`path:line\`。不确定的实现细节标记为待核实，不要编造仓库中不存在的接口。`;
+引用源码时使用真实文件路径和可验证的行号。不确定的实现细节标记为待核实，不要编造仓库中不存在的接口。`;
   }
 
   return `你是本地 Coding Agent 的直接代码实现协作者。请完成代码修改，并输出每个改动文件的完整、可直接保存的全部内容；不要只给方案或 diff。
@@ -28,15 +30,14 @@ ${context.trim() ? `## 补充上下文\n${context.trim()}\n` : ""}
 ## 修改目标
 ${requirement.trim()}
 
-## 已附加源码与文档
-${files || "- （没有附件；如果目标依赖源文件，请明确指出缺失内容，不要臆造现有实现。）"}
+${sourceInstruction}
 
 ${context.trim() ? `## 补充上下文\n${context.trim()}\n` : ""}
 
 ## 强制交付格式
 1. 对每个需要修改或新增的文件，先写 \`FILE: 相对仓库路径\`，随后给出该文件完整内容。
 2. 不得输出 diff 代替完整文件；也不得用伪代码、省略号、"其余不变"或占位符省略实现。
-3. 根据附件中的真实版本修改；不要假设未提供的代码或接口存在。
+3. 根据仓库指定 commit 中的真实版本修改；不要假设未读取的代码或接口存在。
 4. 如需新增测试、配置、文档或类型，也提供完整文件内容。
 5. 保留现有架构、依赖和兼容性；不做无关重构。
 6. 引用源码时使用准确的 \`path:line\`，不要臆造行号。

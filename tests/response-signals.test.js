@@ -36,7 +36,11 @@ test("a fresh request that returns the previous conversation URL is flagged", ()
   };
   const current = tasks.current;
 
-  assert.match(detectSessionIsolationWarning(tasks, current, "chatgpt", shared), /session isolation is not confirmed/);
+  assert.match(detectSessionIsolationWarning(tasks, current, "chatgpt", shared), /THREAD_MISMATCH \(chatgpt\)/);
+  assert.deepEqual(current.children.chatgpt.threadMismatch, {
+    expected: "a new conversation (not the previously saved thread)",
+    actual: shared,
+  });
   assert.equal(detectSessionIsolationWarning(tasks, current, "chatgpt", "https://chatgpt.com/c/new"), null);
   assert.equal(detectSessionIsolationWarning(tasks, { ...current, fresh: false }, "chatgpt", shared), null);
   assert.equal(detectSessionIsolationWarning(tasks, current, "chatgpt", null), null);
@@ -50,7 +54,7 @@ test("only the most recent prior completed task is compared", () => {
   };
   assert.match(
     detectSessionIsolationWarning(tasks, tasks.current, "chatgpt", "https://chatgpt.com/c/old"),
-    /task old/,
+    /chatgpt\.com\/c\/old/,
   );
   assert.equal(
     detectSessionIsolationWarning(tasks, tasks.current, "chatgpt", "https://chatgpt.com/c/mid"),

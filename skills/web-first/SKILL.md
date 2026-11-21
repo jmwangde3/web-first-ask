@@ -1,6 +1,6 @@
 ---
 name: web-first
-description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Every nontrivial request — requirements, root cause, architecture, debugging, code design or implementation — goes through the local wfa CLI to ChatGPT + Gemini by default, serially, and must return complete file contents or exact replacement blocks, not a plan or a diff. The local agent assembles evidence, applies results, runs tests and verifies.
+description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Every nontrivial request — requirements, root cause, architecture, debugging, code design or implementation — goes through the local wfa CLI to ChatGPT + Gemini by default, serially, and must return complete file contents or exact replacement blocks, not a plan or a diff. For a project with a Git remote the local agent submits the repository reference plus the requirement and lets the providers read the repository; it only sends code or files when a provider asks for them.
 ---
 
 # Web-First
@@ -8,7 +8,8 @@ description: Default web-first reasoning and complete-code delegation workflow f
 ## Core role split
 
 - **ChatGPT + Gemini are the default reasoning and implementation partners.** Every `wfa` call goes to both providers, serially, unless the user explicitly asks for one, or one provider is structurally unable to do the task (Gemini attachments — see Provider known limits).
-- **You (the local coding agent) own execution only**: inspect the actual repository, assemble the evidence the providers cannot see, apply what comes back, run tests, verify, commit. Do not reason the design through yourself when a provider can, and do not rewrite their answer from scratch.
+- **You (the local coding agent) own execution only**: resolve the remote, write the requirement, apply what comes back, run tests, verify, commit. You do not pre-read the repository to build context and you do not reason the design through yourself when a provider can. Do not rewrite their answer from scratch.
+- **You submit a repository reference, not a dossier.** The default request is the requirement plus the URL/branch/commit that `wfa` resolves from the Git remote. Files, excerpts or a whole-repository bundle go out only when a provider asks for them (see Repository-first workflow).
 - Both providers receive the same prompt in one serial batch. Their answers are independent; compare them, take the stricter/safer variant on conflict, and discard any fragment that arrived corrupted.
 - Do not expose or configure an MCP server for this workflow. Call `wfa` directly as a local CLI.
 - WFA does not set or change provider reasoning strength; the current setting in the provider web UI is used.
@@ -22,7 +23,18 @@ Ask both providers for anything that involves:
 - reviewing a patch, a contract, or a compatibility boundary;
 - anything where a wrong first answer would cost a rewrite.
 
-Do it locally instead (one file, no design): reading the repository, resolving paths, checking git state, applying a returned patch, running tests, reading logs. Trivial edits stay local: typo, wording, one constant, formatting, a one-line log message, a rename confined to one file. If you are unsure whether something is trivial, it is not.
+Do it locally instead (no design, no discovery): resolving the remote and HEAD, writing the requirement, applying a returned patch, running tests, reading logs, committing. Trivial edits stay local: typo, wording, one constant, formatting, a one-line log message, a rename confined to one file. If you are unsure whether something is trivial, it is not.
+
+Never spend local context assembling context the providers can obtain themselves. Reading the repository, choosing "relevant" files and bundling them is exactly the work this workflow exists to remove.
+
+## Repository-first workflow
+
+1. **Default: send the reference.** Inside a Git repository with a remote, `wfa` injects a `REPOSITORY` block (https URL, branch, HEAD commit) into every provider prompt and both providers read the repository directly. Submit the requirement and nothing else.
+2. **`REPO_UNREADABLE` is not an answer.** If a provider replies `REPO_UNREADABLE`, `wfa` records `repoUnreadable` on that provider and prints the fallback command. Do not treat it as a completed result and do not paraphrase it into a conclusion.
+3. **Fallback: inline the tracked source.** Run the printed `wfa ask --followup <task-id> --bundle-repo …` command. The bundle is tracked UTF-8 source only, capped by the 40 KiB guard; if it exceeds the ceiling, narrow it with `--exclude` or `--file` instead of raising the limit.
+4. **Later rounds: answer the question that was asked.** When a provider asks for a specific file or fact, send exactly that one thing with `--followup <task-id> --file <one-file>`. Never re-bundle, never resend the whole repository, never guess what it "probably" wanted.
+5. **No remote, or `--no-repo`:** fall back to explicit `--file`/`--dir` attachments as before.
+6. **When you cannot decide — ambiguous requirement, two providers disagreeing, a missing permission or credential — ask the user.** Do not guess and do not silently pick a side.
 
 ## Complete-delivery contract
 
@@ -33,28 +45,38 @@ State the delivery format in every request:
 
 Never accept "here is the approach" as the answer to an implementation request. If a provider returns a plan, a diff, or a corrupted fragment (LaTeX escaping, lost `diff --git` headers), do not repair it by hand — send one narrow follow-up asking for that file in complete form.
 
+**Check length before you apply.** A "complete file" that is a fraction of the original's size is a summary, not a replacement — measured example: a 292-line README returned as 18 lines and a 187-line policy returned as 24. Compare the returned line count with `wc -l` on the current file; if it shrank without being asked to shrink, reject that block and ask for the file again. Files too large to send whole (for example a 45 KB module) should be returned as `ANCHOR`/`REPLACE` blocks, not as a rewritten file.
+
 ## Mandatory behavior for code-design and implementation tasks
 
 When the user asks to implement, fix, refactor, optimize or add code, **do not ask either provider merely for a plan, checklist or proposed diff**. Ask for the actual modified code.
 
 ### Before calling the providers
 
-1. Inspect `git status`, the relevant source files, callers, types/interfaces, configuration and focused tests.
-2. Identify the smallest complete set of files the providers need. Attach whole files, not isolated snippets. Include call sites and tests where they constrain behavior.
-3. Do not attach the whole repository indiscriminately. Do not send secrets, credentials, tokens, private keys, personal data, or sensitive legal/arbitration materials.
-4. Write a precise requirement that states behavior, invariants, compatibility constraints and known evidence. Distinguish observed facts from hypotheses.
-5. Use a stable workspace key derived from the repository name so the provider conversation can continue across tasks.
+1. Confirm the working directory is the intended project and let `wfa` resolve the Git remote, branch and HEAD. Outside that tree, pass `--repo-url`; to opt out entirely, pass `--no-repo`.
+2. Do **not** read the source tree to decide what to attach. Only when there is no remote, or when a provider has already asked for something specific, attach whole files — never isolated snippets, never a hand-picked "relevant subset" chosen on speculation.
+3. Do not send secrets, credentials, tokens, private keys, personal data, or sensitive legal/arbitration materials — including through a whole-repository bundle.
+4. Write a precise requirement that states behavior, invariants, compatibility constraints and known evidence. Distinguish observed facts from hypotheses. The requirement is where your effort goes, not the packaging.
+5. Use a stable workspace key derived from the repository name; each task gets its own fresh conversation, so the key groups history rather than carrying context forward.
 
 ### Preferred command
 
-Use `wfa code` and attach the complete files:
+Inside a repository with a remote, the whole request is the requirement:
 
 ```powershell
 wfa code `
   --workspace <repository-key> `
+  --requirement "<precise implementation requirement>"
+```
+
+Attach complete files only when there is no remote, with `--no-repo`, or in the `--bundle-repo` fallback after a `REPO_UNREADABLE` answer:
+
+```powershell
+wfa code `
+  --workspace <repository-key> `
+  --no-repo `
   --requirement "<precise implementation requirement>" `
   --file <complete-source-file> `
-  --file <caller-or-interface-file> `
   --file <focused-test-file>
 ```
 
@@ -85,7 +107,7 @@ For non-code analysis, use:
 wfa ask --workspace <repository-key> --prompt-file <prompt-file>
 ```
 
-Attach relevant files with repeated `--file` arguments. Ask for a direct conclusion, evidence, uncertainty and practical implications. Keep the request focused.
+Attach files only when the question is about material the providers cannot reach: a private document, a log, a local file outside the repository. For a repository question, let the `REPOSITORY` block do the work. Ask for a direct conclusion, evidence, uncertainty and practical implications. Keep the request focused.
 
 ## Parallel multi-provider consultation
 
@@ -107,8 +129,7 @@ For independent code implementations:
 
 ```powershell
 wfa code --workspace <repository-key> `
-  --requirement "<same precise implementation requirement>" `
-  --file <complete-source-file> --file <focused-test-file>
+  --requirement "<same precise implementation requirement>"
 ```
 
 Both providers receive the same prompt and attachments in one batch and answer independently. Each gets its own conversation and result file. Do not send one provider's answer to another unless explicitly doing a second-round critique. Compare the results, identify agreement and disagreement, take the stricter variant on conflict, then verify locally.
@@ -127,7 +148,8 @@ wfa ask --providers 'chatgpt,gemini,claude' ...
 - `wfa` prints a task ID before waiting and persists it locally.
 - A nonzero exit from `ask`, `compare` or `code` can still include completed provider results. Read the task summary and use successful result files before deciding how to recover the unfinished providers.
 - If the terminal tool returns while the process is still running, inspect `wfa status <task-id>` once when needed. If it is still running, do not submit again.
-- `timed_out`, `recoverable`, `interrupted_unknown` and ambiguous `failed` states may mean the prompt was already submitted. Never resend automatically.
+- `timed_out`, `recoverable`, `interrupted_unknown`, `stalled` and ambiguous `failed` states may mean the prompt was already submitted. Never resend automatically.
+- A `stalled` provider means ask-bridge produced no progress line and no metadata change for `--stall-timeout` seconds (default 300) and the batch was killed. It still locks the workspace: inspect the browser, then `wfa collect` or `wfa resolve`.
 - A `WORKSPACE_PROVIDER_LOCKED` error is not a transient failure. Read the task ID it names, run `wfa status <task-id>` once, and either collect the result or, after confirming the generation is dead in the browser, `wfa resolve <task-id> --provider <provider> --confirm`.
 - `--new-session` does not bypass the lock. A request that may already have reached the provider stays blocking on purpose; a resend into an uncertain conversation is worse than an explicit resolve.
 - Failures that provably happened before submission — the tab never loaded, the send button never became enabled, or a Gemini attachment upload timed out — release the lock automatically. Do not spend a `wfa resolve` on them; just fix the cause and retry.
@@ -140,10 +162,10 @@ wfa ask --providers 'chatgpt,gemini,claude' ...
 
 ## Session rules
 
-- Use the same `--workspace` key for the same repository/project. Each provider has its own saved conversation URL for that workspace.
-- New tasks continue the provider's saved conversation by default.
-- Use `--new-session` only when isolation is intentional (for example, an independent second opinion).
-- `--new-session` only stops WFA from supplying a saved conversation URL. The current ask-bridge build can still reuse an already open provider tab, so isolation is not guaranteed. Verify it: check that the answer addresses this prompt, not the previous one, and compare the returned conversation URL with the previous task's. If the provider answers an older question, treat that whole task as void and rerun it under a different workspace key.
+- Use the same `--workspace` key for the same repository/project. The key groups history; it no longer feeds a saved conversation into the next task.
+- **New tasks start a fresh provider conversation by default.** Use `--continue-session` only when you deliberately want the provider to keep the previous conversation's context, and `--followup <task-id>` to continue one verified task thread.
+- A fresh task that still returns the previous conversation URL is reported as `threadMismatch` on the provider, shown by `wfa status`, and that URL is never saved for reuse. Treat a mismatched answer as unpublishable: it may belong to another task.
+- `--new-session` is now the default and is kept only as an explicit alias. It cannot guarantee isolation because ask-bridge can reuse an already open tab; `threadMismatch` is the evidence you check instead of assuming.
 - Parallel provider jobs use separate tabs and separate provider conversations; never point two concurrent jobs at the same conversation.
 
 ## Provider known limits
@@ -154,7 +176,9 @@ Measured against ask-bridge 0.4.0; full evidence and reproductions are in `docs/
 - **Prompts over roughly 44 KiB are truncated without a signal.** This is the most dangerous failure mode: the answer looks normal and arrives faster. Always run `--dry-run` first and treat exit 2 as a stop sign.
 - **ChatGPT long answers may land in Canvas.** When the response is replaced by a download link plus a hash, `response.md` does not contain the artifact. Ask for smaller chunks, or request the content to be repeated inline in the chat.
 - **Gemini corrupts Markdown diffs.** `||` becomes `\vert{}\vert{}`, quoted variables get mangled and `diff --git` headers disappear. Never ask Gemini for a patch; ask for "file path + original block + replacement block" and apply it locally.
-- **Do not assume provider-side session isolation.** See the `--new-session` caveat under Session rules.
+- **Gemini often cannot read a public repository.** Measured today: a repository-first request came back as `REPO_UNREADABLE` in 12 seconds. That is a normal outcome, not a failure of the request — run the `--bundle-repo` fallback. Do not retry the same prompt hoping for a different result.
+- **ChatGPT repository reading is slow, not broken.** A repository-first implementation request took 28 minutes and still finished. Do not kill it early; `--stall-timeout` only fires when the page goes completely silent.
+- **Do not assume provider-side session isolation.** See Session rules and `threadMismatch`.
 
 ## Trust and evidence
 
@@ -167,8 +191,9 @@ Measured against ask-bridge 0.4.0; full evidence and reproductions are in `docs/
 
 ## Context-efficient code workflow
 
-- Prefer `wfa code --file <directory> --exclude "<glob>"` over enumerating many files manually. Directory scans recurse and skip common generated/dependency folders.
-- `wfa code` line-numbers recognized text source by default. Use `--no-bundle-lines` only when separate raw source attachments are preferable.
+- Prefer the repository reference over any attachment. `wfa code --requirement ...` is the whole command when a remote exists.
+- When you do need attachments, `wfa code --file <directory> --exclude "<glob>"` beats enumerating files by hand. Directory scans recurse and skip common generated/dependency folders.
+- `--bundle-repo` is the `REPO_UNREADABLE` fallback and nothing else. It enumerates tracked files, skips binary and generated content, and reports `{files, bytes, skipped}` in `--dry-run`.
 - Run `--dry-run` before sending a large context. Review `promptBytesByProvider`, `promptSizeRisk`, `estimatedTokens`, secret findings and unscanned native/image attachments. The token figure is heuristic, not an exact provider count.
 - Keep the prompt body at or below 40 KiB per provider. ask-bridge truncates silently at roughly 44 KiB — the provider answers from a partial prompt with no truncation signal, an exit code of 0 and a plausible-looking answer. A `--dry-run` above 40 KiB exits 2 on purpose; `--allow-oversize` is for a size you have measured and accepted, not for making the warning go away.
 - When a request legitimately needs more than 40 KiB, split it on file boundaries and state the cross-file contract in every part. Each part is a separate provider conversation, so conclusions that depend on files in another part must be verified locally rather than assumed.

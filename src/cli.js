@@ -2,10 +2,11 @@ import { copyFile, mkdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "./store.js";
+import { PolicyStore } from "./policy-store.js";
+import { resolveRepository } from "./repository.js";
 import { getHomeDir } from "./paths.js";
 import { loadConfig, saveBrowserMode } from "./config.js";
-import { executeTask, refreshTask } from "./runner.js";
+import { executeTask, refreshTask } from "./managed-runner.js";
 import { collectTask, listTasks, abandonProvider, waitForTask } from "./recovery.js";
 import { checkAskBridge, resolveAskBridge, runProcess } from "./ask-bridge.js";
 import { buildCodePrompt, buildComparePrompt } from "./prompts.js";
@@ -22,6 +23,7 @@ const VALUE_FLAGS = new Set([
   "file", "image", "timeout", "request-id", "concurrency", "reasoning",
   "reasoning-map", "model", "model-map", "context", "limit",
   "mode", "brief-file", "followup", "dir", "exclude", "poll-ms",
+  "repo-url", "stall-timeout",
 ]);
 const REPEAT_FLAGS = new Set(["file", "image", "dir", "exclude"]);
 
@@ -102,6 +104,11 @@ function printTask(task, json = false, replayed = false) {
     retryAfterEstimated: child.retryAfterEstimated ?? false,
     responseHeuristics: child.responseHeuristics ?? null,
     sessionIsolationWarning: child.sessionIsolationWarning ?? null,
+    threadMismatch: child.threadMismatch ?? null,
+    repoUnreadable: Boolean(child.repoUnreadable),
+    repoUnreadableEvidence: child.repoUnreadableEvidence ?? null,
+    repoFallbackCommand: child.repoFallbackCommand ?? null,
+    stall: child.stall ?? null,
     retriedAsSingleBatch: Boolean(child.retriedAsSingleBatch),
   }]));
   const summary = {
@@ -110,6 +117,7 @@ function printTask(task, json = false, replayed = false) {
     workspace: task.workspace,
     kind: task.kind,
     state: task.state,
+    sessionPolicy: task.sessionPolicy ?? (task.fresh ? "fresh" : "continue"),
     executionPending: Boolean(task.executionPending),
     replayed,
     retryWarnings: task.retryWarnings ?? [],
@@ -120,7 +128,7 @@ function printTask(task, json = false, replayed = false) {
     return;
   }
   process.stdout.write(`Task: ${task.taskId}${replayed ? " (existing request; not resent)" : ""}\n`);
-  process.stdout.write(`Workspace: ${task.workspace}\nState: ${task.state}\n`);
+  process.stdout.write(`Workspace: ${task.workspace}\nState: ${task.state}\nSession: ${summary.sessionPolicy}\n`);
   if (task.executionPending) process.stdout.write("Execution cleanup: pending; completed results are readable but the workspace/provider lock remains active.\n");
   for (const warning of task.retryWarnings ?? []) process.stdout.write(`Retry: ${warning}\n`);
   for (const [provider, child] of Object.entries(children)) {
@@ -130,12 +138,13 @@ function printTask(task, json = false, replayed = false) {
     if (child.errorCode) process.stdout.write(`  Error: ${child.errorCode}${child.retryAfterAt ? ` (retry after ${child.retryAfterAt}${child.retryAfterEstimated ? ", estimated" : ""})` : ""}\n`);
     if (child.error) process.stdout.write(`  Detail: ${truncate(child.error, 500)}\n`);
     if (child.recoveryHint) process.stdout.write(`  Hint: ${child.recoveryHint}\n`);
-    for (const reason of child.responseHeuristics?.reasons ?? []) {
-      process.stdout.write(`  Warning: ${reason}\n`);
-    }
+    for (const reason of child.responseHeuristics?.reasons ?? []) process.stdout.write(`  Warning: ${reason}\n`);
     if (child.sessionIsolationWarning) process.stdout.write(`  Warning: ${child.sessionIsolationWarning}\n`);
+    if (child.threadMismatch) process.stdout.write(`  THREAD MISMATCH: expected ${child.threadMismatch.expected}; actual ${child.threadMismatch.actual}. Do not trust session isolation.\n`);
+    if (child.repoUnreadable) process.stdout.write(`  REPO_UNREADABLE: ${child.repoUnreadableEvidence?.matched}\n  Next: ${child.repoFallbackCommand}\n`);
+    if (child.stall) process.stdout.write(`  STALLED: ${child.stall.silentSeconds}s without progress/metadata changes.\n  Next: wfa collect ${task.taskId} --provider ${provider} OR wfa resolve ${task.taskId} --provider ${provider} --confirm (after verification).\n`);
   }
-  process.stdout.write("Verified ask-bridge completed artifacts are collected automatically. Use `wfa collect <task-id> --provider <provider>` to retrieve the saved result; --confirm-complete is only for manual recovery when no trusted terminal artifact exists.\n");
+  process.stdout.write("Verified ask-bridge completed artifacts are collected automatically. Use `wfa collect <task-id> --provider <provider>` to retrieve a saved result; --confirm-complete is only for manual recovery.\n");
 }
 
 function help() {
@@ -144,7 +153,7 @@ function help() {
 Commands:
   wfa ask       Ask the default providers (chatgpt+gemini, serial) in one batch
   wfa compare   Ask multiple providers; sequential by default
-  wfa code      Ask for complete replacement code for attached source files
+  wfa code      Ask for complete replacement code; repository reference by default
   wfa status    Inspect a task by ID
   wfa list      List recent tasks
   wfa wait      Wait for a task; adopt verified results and optionally stage completed code
@@ -165,48 +174,50 @@ Common options:
   --providers chatgpt,gemini[,claude]
   --workspace <stable-project-key>
   --prompt <text> | --prompt-file <path> | stdin
+  --repo-url <url>     Override the detected Git remote URL
+  --no-repo            Do not add a repository reference
+  --bundle-repo        Explicit tracked-source inline fallback (never default)
   --file <path|glob|dir> Repeatable source/document attachment; directories recurse
   --dir <path>         Alias for a recursive directory attachment
   --image <path|glob>  Repeatable image attachment (not supported by Gemini)
-  --exclude <glob>     Repeatable exclusion pattern; !pattern on --file also excludes
+  --exclude <glob>     Repeatable exclusion pattern for source or bundle
   --timeout <seconds>  Default 1200; maximum 7200
+  --stall-timeout <s>  Default 300; 0 disables the inactivity watchdog
   --concurrency <N>    Jobs in flight (1..3); default 1, because concurrent tabs collide
 
   --model <name>       Single-provider request only; add --provider
   --model-map chatgpt=<name>,gemini=<name>
   --context <text>     Additional code-generation context
   --download-images    Download generated images (off by default)
-  --new-session        Omit the saved session; ask-bridge may still reuse an open tab
+  --continue-session  Reuse a workspace's previous conversation (opt-in)
+  --new-session        Explicitly request a fresh conversation (the default)
   --fresh              Alias for --new-session
-  --followup <id>      Continue a completed WFA task in its saved provider conversation
+  --followup <id>      Continue that task's exact saved provider conversation
   --mode full-file|spec Select complete-file delivery or compact implementation specification
-  --brief-file <path>  Inject a project handoff brief
+  --brief-file <path>  Explicit project handoff context
   --no-brief           Disable automatic .wfa/active-brief.md injection
-  --bundle-lines       Bundle text source files with exact path:line prefixes
-  --detach             Run ask-bridge in background with task-specific logs; never resend
+  --bundle-lines       Bundle selected text files with path:line prefixes
+  --detach             Run ask-bridge in background with task-specific logs
   --stage              Stage completed full-file code without applying it
   --poll-ms <ms>       Polling interval for wait/attach (250..60000; default 2000)
-  --dry-run            Preview prompt/attachment bytes and blocking risks; blocked exits 2
-  --allow-oversize     Send a prompt over 40 KiB anyway (silent truncation risk)
+  --dry-run            Preview repository reference, bundle statistics and risks
+  --allow-oversize     Send a prompt over 40 KiB anyway (truncation risk)
   --allow-gemini-attachments  Force the native Gemini upload instead of inlining the text
   --allow-sensitive    Explicitly allow sending text flagged by the secret scanner
-  --no-bundle-lines     Disable the default source bundle for wfa code
+  --no-bundle-lines     Disable the selected-source bundle for wfa code
   --request-id <id>    Reuse only to recover the exact same logical request
-  --json               Print a compact machine-readable summary
+  --json               Print a machine-readable summary
 
 Code mode:
-  wfa code --requirement "..." --file src --exclude "**/*.snap" --workspace repo-name
-  wfa code --mode spec --requirement "..." --file "src/**/*.js"
-  --no-bundle-lines    Disable the default source bundle for wfa code
-
-Multi-provider:
-  wfa compare --providers 'chatgpt,gemini' --prompt-file question.md --workspace repo-name
-  wfa code --providers 'chatgpt,gemini' --requirement "..." --file src/a.js
+  wfa code --workspace repo-name --requirement "Implement the new feature"
+  wfa code --requirement "..." --no-repo --file src/a.js
+  wfa ask --provider chatgpt --followup <task-id> --bundle-repo --prompt "Use the inline repository"
 
 Safety:
-  A timed-out/recoverable/unknown task is never resent automatically.
-  A provider/workspace remains locked until collect or explicit resolve.
-  Code results are staged first; wfa apply --confirm is required to modify the workspace.
+  Each new task requests a new conversation; ask-bridge may still reuse tabs.
+  Thread mismatches and REPO_UNREADABLE are surfaced, not accepted silently.
+  Stalled/uncertain tasks remain locked until collection or explicit resolve.
+  Code results are staged first; wfa apply --confirm modifies the workspace.
 `);
 }
 
@@ -265,7 +276,7 @@ export async function main(argv = process.argv.slice(2)) {
     );
   }
   const home = getHomeDir();
-  const store = new Store(home);
+  const store = new PolicyStore(home);
   if (command === "browser-mode") {
     if (positional.length > 1 || Object.keys(options).length > 0) {
       throw new WfaError("ARGUMENT_ERROR", "Usage: wfa browser-mode [headless|headful]");
@@ -341,7 +352,7 @@ export async function main(argv = process.argv.slice(2)) {
       for (const s of result.staged ?? []) {
         process.stdout.write(`Staged (${s.provider}): ${s.files?.length ?? 0} file(s) -> ${s.stageRoot}\n`);
       }
-      if (result.task.executionPending) process.stdout.write("ask-bridge batch cleanup is still running; completed results are safe to read, but the workspace/provider lock remains until the process exits.\n");
+      if (result.task.executionPending) process.stdout.write("ask-bridge batch cleanup is still running; completed results are safe to read, but the workspace remains locked until the process exits.\n");
     }
     return result.task.state === "completed" ? 0 : 1;
   }
@@ -363,9 +374,7 @@ export async function main(argv = process.argv.slice(2)) {
     if (!taskId) throw new WfaError("ARGUMENT_ERROR", "Usage: wfa result <task-id> --provider <provider> [--stdout]");
     const result = await readTaskResult(taskId, { provider: options.provider, stdout: Boolean(options.stdout), home, store });
     if (options.stdout) {
-      for (const reason of result.responseHeuristics?.reasons ?? []) {
-        process.stderr.write(`Warning: ${reason}\n`);
-      }
+      for (const reason of result.responseHeuristics?.reasons ?? []) process.stderr.write(`Warning: ${reason}\n`);
       if (result.sessionIsolationWarning) process.stderr.write(`Warning: ${result.sessionIsolationWarning}\n`);
       process.stdout.write(result.body);
       if (!result.body.endsWith("\n")) process.stdout.write("\n");
@@ -408,6 +417,15 @@ export async function main(argv = process.argv.slice(2)) {
     throw new WfaError("UNKNOWN_COMMAND", `Unknown command "${command}". Run wfa --help.`);
   }
 
+  if (options["continue-session"] && (options["new-session"] || options.fresh)) {
+    throw new WfaError("ARGUMENT_ERROR", "--continue-session conflicts with --fresh/--new-session.");
+  }
+  if (options["repo-url"] && options["no-repo"]) {
+    throw new WfaError("ARGUMENT_ERROR", "--repo-url conflicts with --no-repo.");
+  }
+  const repository = await resolveRepository({
+    cwd: process.cwd(), repoUrl: options["repo-url"], noRepo: Boolean(options["no-repo"]),
+  });
   let prompt = command === "code" && options.requirement
     ? (options["prompt-file"] ? await readPrompt({ "prompt-file": options["prompt-file"] }) : "")
     : await readPrompt(options);
@@ -422,19 +440,19 @@ export async function main(argv = process.argv.slice(2)) {
   if (command === "code") {
     const requirement = options.requirement || prompt;
     if (!requirement) throw new WfaError("ARGUMENT_ERROR", "wfa code requires --requirement or --prompt.");
-    if (!files.length) throw new WfaError("ARGUMENT_ERROR", "wfa code requires at least one source/test or native document via --file/--dir.");
+    if (!files.length && !repository.available && !options["bundle-repo"]) {
+      throw new WfaError("ARGUMENT_ERROR", "wfa code requires --file/--dir or a Git repository with a remote (--repo-url also works).");
+    }
     mode = String(options.mode ?? "full-file").toLowerCase();
     if (!["full-file", "spec"].includes(mode)) {
       throw new WfaError("ARGUMENT_ERROR", `Invalid --mode "${mode}". Use "full-file" or "spec".`);
     }
     prompt = buildCodePrompt({
       requirement,
-      filePaths: [...files, ...images].map((file) => {
+      filePaths: files.length ? [...files, ...images].map((file) => {
         const relative = path.relative(process.cwd(), path.resolve(file));
         return (relative || path.basename(file)).split(path.sep).join("/");
-      }),
-      // --prompt can itself be the requirement. Do not repeat it in the
-      // supplementary context; that would waste provider input tokens.
+      }) : (repository.available ? ["Source: read the REPOSITORY reference below directly"] : []),
       context: [options.context, ...(options.requirement && prompt ? [prompt] : [])].filter(Boolean).join("\n\n"),
       mode,
     });
@@ -445,7 +463,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   let followupDefaultProviders = null;
-  if (options.followup && !options.providers && !options.provider ) {
+  if (options.followup && !options.providers && !options.provider) {
     const snap = await store.snapshot();
     const parent = snap.tasks.tasks[options.followup];
     if (parent?.providers?.length === 1) followupDefaultProviders = parent.providers;
@@ -463,17 +481,12 @@ export async function main(argv = process.argv.slice(2)) {
   } else if (options.providers) {
     providers = normalizeProviders([options.providers], config.defaultCompareProviders);
   } else {
-    providers = normalizeProviders(
-      [options.provider],
-      followupDefaultProviders ?? config.defaultProviders,
-    );
+    providers = normalizeProviders([options.provider], followupDefaultProviders ?? config.defaultProviders);
   }
   if (providers.length > 1) prompt = buildComparePrompt(prompt, command === "code" ? mode : "full-file");
-
   if (options["new-session"] || options.fresh) {
-    process.stderr.write("Note: --new-session omits the saved session URL, but this ask-bridge build can still reuse an open tab/conversation. Verify the provider tab before trusting isolation.\n");
+    process.stderr.write("Note: --new-session is already the default. ask-bridge can still reuse an open tab; inspect any threadMismatch warning.\n");
   }
-
   const modelByProvider = parseMap(options["model-map"], "model-map");
 
   const result = await executeTask({
@@ -485,9 +498,12 @@ export async function main(argv = process.argv.slice(2)) {
     files,
     images,
     workspaceRoot: process.cwd(),
-    bundleLines: command === "code"
-      ? options["no-bundle-lines"] !== true
-      : Boolean(options["bundle-lines"]),
+    repository,
+    repoUrl: options["repo-url"],
+    noRepo: Boolean(options["no-repo"]),
+    bundleRepo: Boolean(options["bundle-repo"]),
+    repoExcludes: options.exclude ?? [],
+    bundleLines: command === "code" ? options["no-bundle-lines"] !== true : Boolean(options["bundle-lines"]),
     dryRun: Boolean(options["dry-run"]),
     allowSensitive: Boolean(options["allow-sensitive"]),
     allowOversize: Boolean(options["allow-oversize"]),
@@ -495,11 +511,12 @@ export async function main(argv = process.argv.slice(2)) {
     briefFile: options["brief-file"],
     noBrief: Boolean(options["no-brief"]),
     followupTaskId: options.followup,
+    continueSession: Boolean(options["continue-session"]),
+    stallTimeoutSeconds: options["stall-timeout"] === undefined ? 300 : Number(options["stall-timeout"]),
     detach: Boolean(options.detach),
     mode,
     timeoutSeconds: options.timeout ? Number(options.timeout) : config.defaultTimeoutSeconds,
     concurrency: options.concurrency ? Number(options.concurrency) : undefined,
-
     model: options.model,
     modelByProvider,
     requestId: options["request-id"],

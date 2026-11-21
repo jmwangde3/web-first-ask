@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.4 - Unreleased
+
+A request to a project that has a Git remote now points the providers at that
+repository instead of asking the local agent to bundle source, and the two ways
+a run could hang forever are closed.
+
+### Added
+- Default `REPOSITORY` prompt context from the detected Git remote (prefer `origin`), branch and HEAD commit; `--repo-url` overrides it and `--no-repo` disables it. `wfa code` no longer requires local files when a repository reference exists.
+- A conservative `REPO_UNREADABLE` response classifier and per-provider `repoUnreadable` evidence. Such a response is not a completed answer; `wfa status` prints an explicit inline-source fallback command.
+- Explicit `--bundle-repo` fallback: tracked UTF-8 source only, size caps, binary/generated exclusions and dry-run `{files, bytes, skipped}`. The existing 40 KiB prompt guard stays authoritative because ask-bridge truncates above roughly 44 KiB.
+- `--continue-session` for explicit workspace conversation reuse; `--followup` continues the named task thread. Every independent task now defaults to a fresh conversation, and a reused conversation no longer silently absorbs a new task.
+- Per-task `sessionPolicy` and `threadMismatch` diagnostics; a contaminated conversation URL is excluded from future workspace sessions.
+- `--stall-timeout` (default 300 seconds; 0 disables), per-provider progress/metadata liveness checks, a distinct blocking `stalled` state and recovery instructions. A batch that goes silent is killed instead of waiting out the whole timeout.
+- Windows `EPERM` collision recovery for the atomic task-store lock, including dead-PID and old-owner reclamation without stealing a live process's lock.
+
+### Changed
+- The web-first Skill now asks the providers to inspect the repository directly; local source bundling is no longer the default and follow-ups attach only specifically requested evidence.
+- Updated README and CLI help for repository-first code, explicit session continuation, the fallback byte ceiling, stall recovery and the existing two-provider serial default.
+
 ## 0.2.3 - Unreleased
 
 A run now asks ChatGPT **and** Gemini by default, and every default path is
