@@ -23,6 +23,11 @@ transports behave the same way.
   used to send the empty bundle silently; in inline mode those `--file` paths are
   consumed as includes and never attached, so the request arrived with neither
   the sources nor any warning.
+- The task-store lock treats `EPERM` with no file on disk the same way it treats
+  `EEXIST`: the previous holder is mid-release and the file is in Windows'
+  delete-pending state, so retry. Previously that race escaped as a raw `EPERM`
+  and failed a concurrent `wfa` invocation outright. A directory that is really
+  unwritable still fails, now as `STORE_LOCK_UNWRITABLE` with the path.
 - A `--bundle-repo=zip` task no longer records a `repoReference`, and its result
   is no longer run through the `REPO_UNREADABLE` sentinel. `task.bundleRepo`
   means "a repository payload was shipped", not "it was inlined", so it is now

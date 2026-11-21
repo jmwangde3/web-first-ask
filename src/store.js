@@ -27,6 +27,10 @@ function lockTimeout() {
   return new WfaError("STORE_LOCK_TIMEOUT", "Timed out waiting for the local task-store lock. Do not start a duplicate request; retry the status command.");
 }
 
+function lockUnwritable(lockPath, error) {
+  return new WfaError("STORE_LOCK_UNWRITABLE", `Cannot create the task-store lock at ${lockPath} (${error?.code ?? "unknown error"}). Check that the directory is writable.`, { details: { code: error?.code ?? null, path: lockPath } });
+}
+
 export class Store {
   constructor(home) { this.paths = getPaths(home); }
 
@@ -55,14 +59,17 @@ export class Store {
         // unrelated permission failure when the lock path does not exist.
         const info = await stat(this.paths.lock).catch(() => null);
         if (!info) {
-          // EEXIST followed by a missing file means the holder released the
-          // lock between open() and stat(). That is the normal race, not an
-          // error: retry immediately instead of surfacing EEXIST to the caller.
-          if (error?.code === "EEXIST") {
-            if (Date.now() - started > timeoutMs) throw lockTimeout();
-            continue;
+          // A missing lock after a collision means the holder released it
+          // between open() and stat(). That is the normal hand-off, not an
+          // error: retry instead of surfacing EEXIST/EPERM to the caller. On
+          // Windows the release also shows up as EPERM while the file sits in
+          // delete-pending state, so both codes land here. A genuinely
+          // unwritable directory keeps failing and is reported at the timeout.
+          if (Date.now() - started > timeoutMs) {
+            throw error?.code === "EPERM" ? lockUnwritable(this.paths.lock, error) : lockTimeout();
           }
-          throw error;
+          if (error?.code === "EPERM") await sleep(10);
+          continue;
         }
         const owner = await lockOwner(this.paths.lock);
         const knownLocalPid = owner?.host === os.hostname() && Number.isInteger(owner.pid);
