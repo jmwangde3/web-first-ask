@@ -39,12 +39,13 @@ export function buildJobs({
     }
     const providerFiles = filesByProvider[provider] ?? files;
     // Archives are exempt: they upload as opaque attachments and measured fast
-    // in batch, unlike binary documents whose parsers time out.
+    // in batch. Everything else would hit ask-bridge's whole-filename check,
+    // which reports ordinary names as never attached (known-issues U1).
     const archiveOnly = providerFiles.length > 0 && providerFiles.every((file) => isArchiveAttachment(file));
     if (provider === "gemini" && providerFiles.length && !allowGeminiAttachments && !archiveOnly) {
       throw new WfaError(
         "GEMINI_ATTACHMENT_UNSUPPORTED",
-        "Gemini document attachments time out in ask-bridge batch. Use a zip/tar archive (those upload natively), inline the content into a prompt under 40 KiB, drop Gemini with --providers chatgpt, or force the native upload with --allow-gemini-attachments.",
+        "Gemini receives text attachments inline, not as uploads: ask-bridge confirms an attachment by matching the whole filename against the page text, so ordinary names are reported as never attached about 50 s later (known issue U1). Use a zip/tar archive (those upload natively), inline the content into a prompt under 40 KiB, drop Gemini with --providers chatgpt, or force the upload with --allow-gemini-attachments and a filename stem of 20 characters or fewer.",
       );
     }
     const job = {

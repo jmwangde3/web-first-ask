@@ -197,12 +197,14 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
   }
   const directory = outDir ?? path.join(process.cwd(), ".wfa");
   await mkdir(directory, { recursive: true });
-  // Milliseconds plus a random suffix: two archives of the same repository in
-  // the same second must not overwrite each other, because the first may still
-  // be uploading.
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 23);
-  const slug = path.basename(root).replace(/[^A-Za-z0-9._-]/g, "_") || "repo";
-  const file = path.join(directory, `${slug}-${stamp}-${randomBytes(2).toString("hex")}.zip`);
+  // Keep the stem at 20 characters or fewer. ask-bridge confirms an attachment
+  // by matching the whole filename against the page text, and Gemini truncates
+  // the attachment label past that point, so a timestamped name is uploaded and
+  // then reported as never attached 50 s later (docs/known-issues.md U1). The
+  // random suffix is what keeps two archives of the same repository in the same
+  // second apart; file mtime carries the ordering a timestamp would have given.
+  const slug = (path.basename(root).replace(/[^A-Za-z0-9._-]/g, "_") || "repo").slice(0, 8);
+  const file = path.join(directory, `${slug}-${randomBytes(4).toString("hex")}.zip`);
   await writeFile(file, zip);
   await pruneArchives(directory, keepArchives);
   return {

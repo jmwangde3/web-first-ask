@@ -221,13 +221,13 @@ export async function executeTask(input, dependencies = {}) {
       body = sections.join("\n\n");
     }
     if (body === null) {
-      // Archives upload natively on both providers and are not parsed, so the
-      // documented batch upload timeout does not apply to them. Binary
-      // documents still are blocked: their parsers time out before submit.
+      // Archives upload natively on both providers and are not checked by name,
+      // so known issue U1 does not apply to them. Binary documents are still
+      // blocked: ask-bridge would report them as never attached (U1).
       if (!files.every((filePath) => isArchiveAttachment(filePath))) {
         geminiAttachmentBlocked = true;
         if (!input.dryRun) {
-          throw new WfaError("GEMINI_ATTACHMENT_UNSUPPORTED", "Gemini cannot receive this attachment in batch mode: document parsers time out before the prompt is submitted, and a binary or native document cannot be inlined. Inline the content yourself, drop Gemini with --providers chatgpt, or force the native upload with --allow-gemini-attachments.");
+          throw new WfaError("GEMINI_ATTACHMENT_UNSUPPORTED", "Gemini cannot receive this attachment in batch mode: ask-bridge confirms an attachment by matching the whole filename against the page text, so an ordinary name is reported as never attached, and a binary or native document cannot be inlined. Inline the content yourself, drop Gemini with --providers chatgpt, or force the upload with --allow-gemini-attachments and a filename stem of 20 characters or fewer.");
         }
       }
     } else {

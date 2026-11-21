@@ -1,20 +1,20 @@
 # ask-bridge 上游问题清单
 
 > **范围**：只保留必须由 ask-bridge（Rust 二进制）修的问题。wfa 侧能提前拦截、标注或绕过的，已落实的规避方案见文末「wfa 侧已做」，不占本清单。
-> **环境**：Windows 11 zh-CN / Git Bash / ask-bridge 0.4.0 / wfa 0.2.2→0.2.3 / Chrome headful（`--window-position=-2000,-2000`）/ providers: ChatGPT + Gemini。
-> **证据**：2026-11-21 单机实测，命令与时间均为真实运行结果；run 目录可复核。
+> **环境**：Windows 11 24H2 zh-CN / Git Bash / ask-bridge 0.4.0（`7d4731f`）/ wfa 0.2.2→0.2.8 / Chrome stable / providers: ChatGPT + Gemini。
+> **证据**：2026-11-21 与 2026-11-22 两次单机实测，命令与耗时均为真实运行结果。U1、U7 已于 11-22 用对照实验与源码复核修正（见各条）。
 
 ## 汇总
 
 | 编号 | 问题 | 级别 | wfa 侧现状 |
 | --- | --- | --- | --- |
-| U1 | Gemini 文档附件上传超时（归档不受影响） | 阻断 | 归档原生上传；文本内联；文档类提前拒绝 |
+| U1 | 附件校验按完整文件名匹配页面文本，普通文件名被判成未附加 | 阻断 | 文本内联；归档名压到 17 字符后原生上传 |
 | U2 | prompt > 约 44 KiB 静默截断 | 阻断 | 40 KiB 拦截并给拆分计划 |
 | U3 | ChatGPT 长产物进 Canvas，`response.md` 只有链接 | 阻断 | 检测并警告 |
 | U4 | `--new-session` 复用旧会话 | 严重 | 比对 threadUrl 并警告 |
 | U5 | Gemini 输出被二次转义 | 严重 | 检测并在 stage/apply 阻断 |
 | U6 | 双 provider 并发不稳定 | 一般 | 默认串行 |
-| U7 | Chrome `exit_type` 停在 `Crashed`，弹恢复气泡 | 一般 | wfa 启动前修复并在 doctor 报告 |
+| U7 | Chrome `exit_type` 停在 `Crashed`，弹恢复气泡 | 已修（0.4.0） | 启动前兜底保留，通常是空操作 |
 | U8 | `chrome-devtools-mcp.log` 无轮转 | 一般 | wfa 启动前按 64 MiB/4 MiB 门槛轮转 |
 | U9 | 缺 `submissionState` 等提交证明字段 | 设计 | 靠错误文本推断 |
 | U10 | `--concurrency 1` 串行批次也关掉上一个 job 的标签页 | 阻断 | wfa 自行拆为多个独立单 job 批次（含 detach） |
@@ -26,29 +26,64 @@
 
 ---
 
-## U1 Gemini 附件上传必然超时
+## U1 附件校验按完整文件名匹配页面文本，普通文件名被判成未附加
 
-> **2026-11-21 修正**：这条只对**需要解析的文档**（`.md` / `.txt` / `.pdf` / `.docx` / `.xlsx` 等）成立。**归档文件不受影响**：同一个 132 KB 的 `.zip` 通过 `ask-bridge --backend browser batch` 送达 Gemini 只用了 **15 秒**，回答正确说出「70 个条目，约 60 个文件」。所以 wfa 现在对 zip/tar/gz/tgz/7z 放行原生上传，只有文档类附件才内联或提前拒绝，整仓交付改走 `--bundle-repo=zip`。
+> **2026-11-22 更正**：11-21 的结论「Gemini 文档附件不可用」是错的。同一份文件、同一段内容，只改文件名：stem ≤ 20 字符全部成功，21 字符连续两次失败。归档「能用」也不是因为 zip 特殊，只是因为它叫 `bundle.zip`。当时的误判记录留在本条末尾，不再作为结论。
 
-**现象**：给 Gemini 带需要解析的文档附件，50–54 秒后失败：
+**现象**：单 job、单附件、Gemini。同一份 55,699 B 的 `.md`（600 个小节），同一句 prompt，唯一变量是文件名：
+
+| 文件名 | stem 长度 | 结果 |
+| --- | --- | --- |
+| `notes.md` | 8 | 15 秒成功，答 `600` |
+| `bundle-notes-191ae.md` | 18 | 14 秒成功 |
+| `bundle-notes-191ae7.md` | 19 | 16 秒成功 |
+| `source-bundle-191ae7.md` | 20 | 13 秒成功 |
+| `source-bundle-191ae7c.md` | 21 | **52 秒失败**，重跑 **49 秒再失败** |
+| `aaaaaaaaaaaaaaaaaaaaaaaaa.md` | 25 | **失败**（排除了「名字里带 bundle/hash 才出问题」） |
+| `bundle.zip` | 10 | 17 秒成功，答 `100` |
+| `repro-repo-2026-11-22_02-30-11-123-ab12.zip` | 38 | **49 秒失败** |
+
+两次失败信息一致：
 
 ```
-Timed out waiting for Gemini to show attachment 'skein-source-bundle-191ae7c.md'   elapsed=54s
-Timed out waiting for Gemini to show attachment 'skein-source-bundle-191ae7c.txt'  elapsed=50s
-Timed out waiting for Gemini to show attachment 'source-bundle-e7430cb187f7.txt'   elapsed=50s
+[batch] job <id>: failed (Timed out waiting for Gemini to show attachment 'source-bundle-191ae7c.md')
 ```
 
-**复现**：
+`metadata.json` 为 `{"state":"failed","elapsedSeconds":49,"threadUrl":"https://gemini.google.com/app"}`：`threadUrl` 停在应用根路径，说明**从未提交**，不是 provider 拒收。
+
+**归档同样受影响**，最后两行是同一份 135 KB、100 条目的 zip，只是换了名字。11-21 那次「归档 15 秒送达」用的是手工命名的 `bundle.zip`，所以看起来像「归档免疫」——实际是短名免疫。
+
+**根因**：`wait_for_attachment_indicator`（`src/main.rs:6934-6989`）用「完整文件名或主干是 `document.body.innerText` 的子串」判定已附加：
+
+```js
+const text = document.body.innerText || '';
+return text.includes(fileName) || text.includes(fileStem);
+```
+
+Gemini 附件 chip 的标签到 20 字符左右就截断，完整 stem 永远不出现。随后 30 × 500 ms 轮询耗尽，再走 file chooser 兜底又等 15 秒，`run_job` 记 `failed`。
+
+合成上传路径本身只证明「脚本跑过」——`__upload_images_status = 'success:file-input'` 在 dispatch 完 `change` 事件后立刻写入（`src/main.rs:7274-7280`）——所以这个子串检查是唯一真实确认，也就成了唯一误伤点。
+
+**复现**：同内容、只改文件名。
 
 ```bash
-wfa ask --provider gemini --prompt "读一下附件" --file note.md --timeout 300
+cp note.md bundle-notes-191ae.md    # stem 18 字符 → 成功
+cp note.md source-bundle-191ae7c.md # stem 21 字符 → 50 秒后失败
+
+wfa ask --provider gemini --prompt "读一下附件" --file source-bundle-191ae7c.md --timeout 300
 ```
 
-同内容内联进 prompt 就成功，说明与文件内容无关，是上传/解析通道，不是附件体积。
+**期望**：
+- 不要求完整文件名：前缀匹配前 12–16 字符，或统计 chip 数量前后差值，或等 provider 自己的「上传完成」状态
+- 「无法验证」不等于「失败」；未提交时应记 `recoverable` / `unknown`，而不是 `failed`
+- 用 `DOM.setFileInputFiles` 传真实路径，避免合成 `DataTransfer`
+- 元数据补 `attachmentState: not_started | uploading | attached | failed`
 
-**期望**：上传控件选择器或完成判定已过期。要么修好，要么在上传阶段暴露可观察状态（开始/已选中/进度/UI 确认），失败时立刻报错，而不是干等 50 秒再抛一句 timeout。短期无法修时，元数据至少给 `attachmentState: not_started | uploading | attached | failed`。
+**影响**：一个本来能答的 job 白等 50 秒后被丢弃，错误文案指向 provider。wfa 的对策是把文本内联进 prompt，而内联又会撞 U2 的 44 KiB 上限——这条缺陷的实际代价是「大文本只能二选一：截断或丢弃」。
 
-**影响**：Gemini 这一路的**文档**附件不可用，只能内联，而内联又会撞 U2；**归档**附件可用，所以整仓交付走 `--bundle-repo=zip`。
+wfa 自己生成的归档原本叫 `<slug>-<时间戳>-<hex>.zip`（约 50 字符），同样踩中，等于把 `--bundle-repo=zip` 一起废掉。0.2.8 起归档名压到 17 字符（`<slug8>-<hex8>.zip`），落在实测通过区间内。
+
+**误判记录（2026-11-21）**：当时用 31 字符和 32 字符的文件名发包，50–54 秒失败，于是判成「需要解析的文档不可用、归档不受影响」。而用来证明「归档没问题」的那个 zip，是手工命名为 `bundle.zip` 直接调 ask-bridge 的——短名掩盖了同一缺陷。真正的变量是文件名长度，既不是 MIME，也不是解析器。
 
 ---
 
@@ -136,13 +171,18 @@ wfa status <第二个 task-id>   # 比较两次的 Conversation
 
 ---
 
-## U7 Chrome `exit_type` 停在 `Crashed`，弹恢复气泡
+## U7 Chrome `exit_type` 停在 `Crashed`，弹恢复气泡（0.4.0 已修）
 
-**根因**：`ask-bridge batch` 没有 headless 参数，实际以 headful 启动 Chrome 并用 `--window-position=-2000,-2000` 把窗口挪到屏幕外；退出时强杀进程，`chrome-profile/Default/Preferences` 里的 `profile.exit_type` 停在 `Crashed`。下次启动读到就弹「恢复页面」气泡，而该气泡是独立窗口，不受离屏坐标约束，会直接出现在屏幕上。
+**现象（历史）**：`batch` 退出时 Chrome 被强杀，`chrome-profile/Default/Preferences` 里的 `profile.exit_type` 停在 `Crashed`。下次启动读到就弹「恢复页面」气泡，而该气泡是独立窗口，不受离屏坐标约束，会直接出现在屏幕上。
 
-**期望**：进程内优雅关闭（CDP `Browser.close` 后等退出），或退出前主动把 `exit_type` 写回 `Normal`；也可以直接给 Chrome 传 `--hide-crash-restore-bubble`。
+**0.4.0 的状态**：根因已修，两处。
 
-**影响**：每次调用都可能弹一个窗口打断用户。wfa 现在启动前原子改写识别到的 `Preferences`，不再需要独立包装脚本；这仍不是上游优雅退出的根因修复。
+- **退出走 CDP**：`cdp_browser_close()` 用一条裸 WebSocket 发 `Browser.close`，再等调试端口释放最多 5 秒才考虑强杀（`src/main.rs:2053-2137`）。让 Chrome 自己 flush profile，`exit_type` 落回 `Normal`。
+- **`--headless` 是全局参数，默认 `true`**，`batch` 也遵守。Windows 上的「headless」实现为 `--ask-bridge-background --window-position=-2000,-2000`（`src/main.rs:2435-2440`）：仍是真实窗口，只是移到屏幕外——所以 11-21 记的「batch 没有 headless 参数」也是错的。
+
+**残留**：`batch` 结束时不关浏览器（Chrome 长期驻留供下次复用），所以「进程被外部强杀」这条路径仍可能把 profile 留在 `Crashed`。wfa 因此保留启动前兜底：只在 `profile.exit_type` 恰好为 `Crashed` 时原子改写成 `Normal`（`src/ask-bridge.js:36-50`），对 0.4.0 通常是空操作；`doctor` 会报告发现了几处。
+
+**影响**：不再需要独立包装脚本，也不再需要 `--hide-crash-restore-bubble`。本条从「待上游修」转为「已修，保留兜底」。
 
 ---
 
@@ -185,9 +225,11 @@ wfa status <第二个 task-id>   # 比较两次的 Conversation
 [batch] job wfa-gemini-699d3563: failed (failed to open tab: list_pages failed: The selected page has been closed. Call list_pages to see open pages.)
 ```
 
-**复现**：任意两 provider 串行批次。两种顺序（`chatgpt,gemini` 与 `gemini,chatgpt`）都复现，**总是第二个 job 挂**，与 provider 无关。
+**复现**：任意两 provider 串行批次。两种顺序（`chatgpt,gemini` 与 `gemini,chatgpt`）都复现，**总是第二个 job 挂**，与 provider 无关。2026-11-22 用同 provider 两个 job 再复现一次，第二个 job 的 `metadata.json` 为 `{"state":"failed","elapsedSeconds":0,"pageId":null}`——零耗时、无 page，一个字节都没提交。
 
-**期望**：串行批次内可以复用同一个页面直到整批结束，或下一个 job 新建页面而不是拿着已关闭的 page id 去 `list_pages`。
+**根因**：`run_job` 在除 `Recoverable` 以外的所有终态关掉该 job 的标签页（`src/batch.rs:659-670`），而它关的正是 MCP 会话的**当前选中页**；下一个 job 的第一件事是 `list_pages_snapshot`（`src/batch.rs:727-728`），此时 `list_pages` 因选中页已不存在而失败，错误再被 `src/batch.rs:774` 包成 `failed to open tab: ...`，指向了错误的操作。
+
+**期望**：串行批次内可以复用同一个页面直到整批结束，或下一个 job 新建页面而不是拿着已关闭的 page id 去 `list_pages`；至少要在 `close_page` 之后重选一个存活页面。
 
 **影响**：原本串行是本机唯一可靠的模式（见 U6），因此这个缺陷让默认双 provider 的第二个任务必然先失败一次。wfa 现由自身对每个 provider 启动独立单 job 批次；这规避了 U10，但有多一次独立进程启动成本。ask-bridge 对批次内部 tab 的管理仍需上游修复。
 
@@ -359,9 +401,10 @@ U11–U15 里只有 U14 的一半在 ask-bridge 侧，其余都在 wfa 或本机
 
 ## 建议优先级
 
-- **P0**：U2（静默截断产生「看起来正常」的错误结论）、U4（答非所问且难察觉）、U1（Gemini 附件完全不可用）、U10（串行必挂一次）、U11（僵尸任务让全部命令不可用）、U12（锁无法清理，与 U11 形成死锁）
+- **P0**：U2（静默截断产生「看起来正常」的错误结论）、U4（答非所问且难察觉）、U1（文件名匹配把正常附件判成未附加，白扔 50 秒）、U10（串行必挂一次）、U11（僵尸任务让全部命令不可用）、U12（锁无法清理，与 U11 形成死锁）
 - **P1**：U3（长产物取不到）、U5（输出不可直接用）、U9（其余判定的地基）、U13（默认上传远程仓库地址，且让 Gemini 零产出）、U14（一次写失败连带丢结果+卡状态+卡锁）
-- **P2**：U6、U7、U8、U15
+- **P2**：U6、U8、U15
+- **已修（0.4.0）**：U7（CDP `Browser.close` + `--headless` 默认 `true`）
 
 **U11 + U12 是最致命的一组**：两者互相放大，且都没有官方自救入口。用户能看到的只有一句 `retry the status command`，而重试永远不会成功。
 
@@ -372,7 +415,7 @@ U11–U15 里只有 U14 的一半在 ask-bridge 侧，其余都在 wfa 或本机
 wfa 0.2.3 起：
 
 - 正文超 40 KiB 在发送前拦截（`PROMPT_OVERSIZE`）；`--dry-run` 给文件级 `splitPlan`；`--allow-oversize` 放行。
-- Gemini 遇到归档附件（zip/tar/gz/tgz/7z）走原生上传；文本附件自动内联（带行号的源码包直接内联）；其它二进制/原生文档提前拒绝（`GEMINI_ATTACHMENT_UNSUPPORTED`）；`--allow-gemini-attachments` 强制走原生上传。
+- Gemini 遇到归档附件（zip/tar/gz/tgz/7z）走原生上传，且归档名压到 17 字符（`<slug8>-<hex8>.zip`），否则会撞 U1；文本附件自动内联（带行号的源码包直接内联），既避开 U1 的整名匹配，也避免把上传通道当传输层；其它二进制/原生文档提前拒绝（`GEMINI_ATTACHMENT_UNSUPPORTED`）；`--allow-gemini-attachments` 强制走原生上传——此时附件名同样要保持 stem ≤ 20 字符。
 - `response.md` 出现 Canvas 存根特征或 `\vert{}` 类转义时标记 `responseHeuristics` 并在 CLI 警告，不修改正文；stage/apply 拒绝含污染的内容。
 - `--new-session` 完成后比对上一轮 `threadUrl`，相同则记 `sessionIsolationWarning`。
 - 默认 chatgpt + gemini，多 provider 默认串行（`--concurrency 1`）；由 WFA 自行拆分为独立单 job 请求，含 `--detach` 模式。
