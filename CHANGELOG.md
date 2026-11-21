@@ -28,7 +28,9 @@ makes that path first-class and stops paying for a constraint that did not exist
 - The `--bundle-repo` fallback command now recommends `--bundle-repo=zip`
   instead of asking for `--exclude` tuning against a 40 KiB budget.
 - Every message that called 40 KiB an attachment limit now says prompt text.
-  `--dry-run`'s `splitPlan` note states that attachments are not cut at 40 KiB.
+  `--dry-run`'s `splitPlan` note states that attachments are not cut at 40 KiB,
+  and the `ATTACHMENT_UPLOAD_TIMEOUT` hint offers the archive transport first
+  instead of telling the user to inline the file under 40 KiB.
 - `Store.withLock` no longer surfaces a raw `EEXIST` when the holder releases
   the lock between `open()` and `stat()`. That race failed 3 out of 5 suite runs
   before it was fixed. `Store.transaction(callback, timeoutMs)` also accepts an
