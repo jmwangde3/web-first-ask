@@ -1,7 +1,7 @@
 # ask-bridge 上游问题清单
 
 > **范围**：只保留必须由 ask-bridge（Rust 二进制）修的问题。wfa 侧能提前拦截、标注或绕过的，已落实的规避方案见文末「wfa 侧已做」，不占本清单。
-> **环境**：Windows 11 24H2 zh-CN / Git Bash / ask-bridge 0.4.0（`7d4731f`）/ wfa 0.2.2→0.2.8 / Chrome stable / providers: ChatGPT + Gemini。
+> **环境**：Windows 11 24H2 zh-CN / Git Bash / ask-bridge 0.4.0（`7d4731f`）/ wfa 0.2.2→0.2.9 / Chrome stable / providers: ChatGPT + Gemini。
 > **证据**：2026-11-21 与 2026-11-22 两次单机实测，命令与耗时均为真实运行结果。U1、U7 已于 11-22 用对照实验与源码复核修正（见各条）。
 
 ## 汇总
@@ -81,7 +81,7 @@ wfa ask --provider gemini --prompt "读一下附件" --file source-bundle-191ae7
 
 **影响**：一个本来能答的 job 白等 50 秒后被丢弃，错误文案指向 provider。wfa 的对策是把文本内联进 prompt，而内联又会撞 U2 的 44 KiB 上限——这条缺陷的实际代价是「大文本只能二选一：截断或丢弃」。
 
-wfa 自己生成的归档原本叫 `<slug>-<时间戳>-<hex>.zip`（约 50 字符），同样踩中，等于把 `--bundle-repo=zip` 一起废掉。0.2.8 起归档名压到 17 字符（`<slug8>-<hex8>.zip`），落在实测通过区间内。
+wfa 自己生成的归档原本叫 `<slug>-<时间戳>-<hex>.zip`（约 50 字符），同样踩中，等于把 `--bundle-repo=zip` 一起废掉。0.2.9 起归档名压到 17 字符（`<slug8>-<hex8>.zip`），落在实测通过区间内。
 
 **误判记录（2026-11-21）**：当时用 31 字符和 32 字符的文件名发包，50–54 秒失败，于是判成「需要解析的文档不可用、归档不受影响」。而用来证明「归档没问题」的那个 zip，是手工命名为 `bundle.zip` 直接调 ask-bridge 的——短名掩盖了同一缺陷。真正的变量是文件名长度，既不是 MIME，也不是解析器。
 
