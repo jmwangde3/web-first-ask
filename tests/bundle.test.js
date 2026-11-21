@@ -23,7 +23,7 @@ test("line-numbered bundle preserves relative paths, blank lines and CRLF line n
     assert.equal(bundle.files[0].lines, 3);
     assert.equal(bundle.sha256.length, 64);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -37,7 +37,7 @@ test("bundle rejects binary and invalid UTF-8 input instead of silently corrupti
     await writeFile(invalid, Buffer.from([0xc3, 0x28]));
     await assert.rejects(() => buildLineNumberedBundle([invalid], { cwd: root }), { code: "BUNDLE_INVALID_UTF8" });
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -50,7 +50,7 @@ test("brief auto-discovery is optional while an explicitly requested missing bri
     await writeFile(path.join(root, ".wfa", "active-brief.md"), "# Hot state\nTask: recovery\n");
     assert.match(await resolveBriefText({ cwd: root, shouldAutoInject: true }), /Hot state/);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 

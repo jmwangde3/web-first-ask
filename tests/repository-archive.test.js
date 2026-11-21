@@ -68,8 +68,8 @@ async function withRepo(fn) {
     git(root, "commit", "-q", "-m", "init");
     return await fn({ root, out });
   } finally {
-    await rm(root, { recursive: true, force: true });
-    await rm(out, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(out, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 

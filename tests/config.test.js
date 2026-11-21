@@ -17,6 +17,6 @@ test("legacy defaultReasoning config is ignored", async () => {
     assert.equal(config.defaultProvider, "gemini");
     assert.equal(Object.hasOwn(config, "defaultReasoning"), false);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

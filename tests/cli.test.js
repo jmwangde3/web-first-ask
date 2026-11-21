@@ -45,7 +45,7 @@ test("browser-mode persists across CLI processes and preserves other config fiel
     assert.equal(run("headless").status, 0);
     assert.equal(run().stdout.trim(), "headless");
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -97,6 +97,6 @@ test("compare replay returns nonzero for a partial batch without losing the succ
     assert.equal(inspection.status, 0);
     assert.equal(JSON.parse(inspection.stdout).state, "partial");
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

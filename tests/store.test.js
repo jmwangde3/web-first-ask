@@ -19,6 +19,6 @@ test("store transactions serialize concurrent writes", async () => {
     const snapshot = await store.snapshot();
     assert.equal(Object.keys(snapshot.tasks.tasks).length, 12);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

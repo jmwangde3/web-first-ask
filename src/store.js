@@ -23,6 +23,10 @@ export function isLockCollision(error) {
   return error?.code === "EEXIST" || error?.code === "EPERM";
 }
 
+function lockTimeout() {
+  return new WfaError("STORE_LOCK_TIMEOUT", "Timed out waiting for the local task-store lock. Do not start a duplicate request; retry the status command.");
+}
+
 export class Store {
   constructor(home) { this.paths = getPaths(home); }
 
@@ -50,7 +54,16 @@ export class Store {
         // Windows can return EPERM for an existing lock. Do not swallow an
         // unrelated permission failure when the lock path does not exist.
         const info = await stat(this.paths.lock).catch(() => null);
-        if (!info) throw error;
+        if (!info) {
+          // EEXIST followed by a missing file means the holder released the
+          // lock between open() and stat(). That is the normal race, not an
+          // error: retry immediately instead of surfacing EEXIST to the caller.
+          if (error?.code === "EEXIST") {
+            if (Date.now() - started > timeoutMs) throw lockTimeout();
+            continue;
+          }
+          throw error;
+        }
         const owner = await lockOwner(this.paths.lock);
         const knownLocalPid = owner?.host === os.hostname() && Number.isInteger(owner.pid);
         // Never reclaim a lock held by a live PID, even when it is old.
@@ -61,9 +74,7 @@ export class Store {
           await unlink(this.paths.lock).catch(() => {});
           if (!await stat(this.paths.lock).catch(() => null)) continue;
         }
-        if (Date.now() - started > timeoutMs) {
-          throw new WfaError("STORE_LOCK_TIMEOUT", "Timed out waiting for the local task-store lock. Do not start a duplicate request; retry the status command.");
-        }
+        if (Date.now() - started > timeoutMs) throw lockTimeout();
         await sleep(50);
       }
     }

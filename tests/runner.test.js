@@ -82,7 +82,7 @@ test("one CLI task runs ChatGPT and Gemini in parallel and persists independent 
     assert.equal(replay.replayed, true);
     assert.equal(launches, 1);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -133,7 +133,7 @@ test("request ID with changed content is rejected and ambiguous task blocks dupl
       requestId: "new-id",
     }, { home, store, config, skipPreflight: true }), /locked by chatgpt task/);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -185,7 +185,7 @@ test("status preserves the current legacy session and an already collected resul
     assert.equal(reconciled.children.chatgpt.resultPath, path.join(jobDir, "response.md"));
     assert.equal((await store.snapshot()).sessions.workspaces.repo.chatgpt, newUrl);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -222,7 +222,7 @@ test("a post-launch process error preserves a finished result and keeps the unce
       { code: "WORKSPACE_PROVIDER_LOCKED" },
     );
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -268,7 +268,7 @@ test("new task reconciles a stale completed-task cleanup lock before checking wo
     assert.equal(result.task.state, "completed");
     assert.equal((await store.snapshot()).tasks.tasks["old-task"].executionPending, false);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -342,7 +342,7 @@ test("a provider left behind by a serial batch is retried alone and the retry is
     assert.ok(progress.some((line) => line.includes("retrying gemini alone")));
     assert.equal((await store.snapshot()).sessions.workspaces["sample-repo"].gemini, "https://gemini.google.com/app/g1");
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -393,6 +393,6 @@ test("a provider that failed after submitting is never retried automatically", a
     assert.equal(result.task.children.gemini.retriedAsSingleBatch, undefined);
     assert.equal(result.task.retryWarnings, undefined);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
