@@ -29,9 +29,21 @@ makes that path first-class and stops paying for a constraint that did not exist
   instead of asking for `--exclude` tuning against a 40 KiB budget.
 - Every message that called 40 KiB an attachment limit now says prompt text.
   `--dry-run`'s `splitPlan` note states that attachments are not cut at 40 KiB.
-- `Store.transaction(callback, timeoutMs)` accepts a lock timeout; the
-  concurrent-writer test uses a longer one so it stops timing out when the whole
-  suite runs in parallel on a busy machine.
+- `Store.withLock` no longer surfaces a raw `EEXIST` when the holder releases
+  the lock between `open()` and `stat()`. That race failed 3 out of 5 suite runs
+  before it was fixed. `Store.transaction(callback, timeoutMs)` also accepts an
+  explicit lock timeout.
+- `wfa ask "text"` uses the positional argument as the prompt. It used to be
+  silently ignored, which then fell through to stdin and in a background shell
+  hung forever.
+- A stdin that never closes (detached worker, CI runner, `/dev/null`) no longer
+  hangs the CLI: with no first byte within 400ms the prompt is empty and the
+  command fails fast with an actionable message. Pipes and redirected files
+  still read normally.
+- Test cleanup retries a recursive `rm` on Windows. A file the last writer has
+  just unlinked sits in delete-pending state for a few milliseconds, so an
+  immediate `rm` could throw `ENOTEMPTY` and fail an otherwise passing suite.
+  Five consecutive full runs now pass 114/114.
 
 ## 0.2.5 - Unreleased
 

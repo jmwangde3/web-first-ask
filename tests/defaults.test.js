@@ -15,7 +15,7 @@ async function withHome(prefix, fn) {
   try {
     return await fn(home);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 

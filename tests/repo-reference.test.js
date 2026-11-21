@@ -35,8 +35,8 @@ async function fixture(fn) {
     git(root, "remote", "add", "origin", "git@github.com:test-org/test-repo.git");
     return await fn({ root, home });
   } finally {
-    await rm(root, { recursive: true, force: true });
-    await rm(home, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 
@@ -192,7 +192,7 @@ test("stall watcher needs active job and both progress/metadata silence", async 
     assert.match(evidence.chatgpt.lastProgressLine, /running/);
     await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({ state: "completed" }));
     assert.equal(await watch.check(), null);
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally { await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("EPERM is lock collision and dead owner's lock is reclaimed", async () => {
@@ -204,7 +204,7 @@ test("EPERM is lock collision and dead owner's lock is reclaimed", async () => {
     const store = new PolicyStore(home);
     await writeFile(path.join(home, ".store.lock"), JSON.stringify({ host: os.hostname(), pid: 2147483000, createdAt: 0 }));
     assert.equal(await store.withLock(async () => "recovered", 500), "recovered");
-  } finally { await rm(home, { recursive: true, force: true }); }
+  } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("silent in-progress batch becomes stalled rather than completed or retryable", async () => fixture(async ({ root, home }) => {

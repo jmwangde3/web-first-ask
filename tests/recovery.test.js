@@ -36,7 +36,7 @@ test("collect requires confirmation only when no trusted ask-bridge terminal art
     assert.equal(getCalls, 0);
     assert.equal((await store.snapshot()).tasks.tasks["task-1"].children.chatgpt.state, "interrupted_unknown");
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -80,7 +80,7 @@ test("collect automatically returns a verified completed batch result without as
       { code: "RESULT_INTEGRITY_FAILED" },
     );
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -111,7 +111,7 @@ test("wait automatically adopts only ask-bridge completed metadata and reports t
     assert.equal(result.collected[0].provider, "gemini");
     assert.match(result.collected[0].resultPath, /response\.md$/);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -145,7 +145,7 @@ test("verified result can be read while batch cleanup is pending, but workspace 
     assert.equal(refreshed.executionPending, false);
     assert.equal(workspaceHasBlockingTask((await store.snapshot()).tasks.tasks, "repo", ["chatgpt"]), null);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -173,7 +173,7 @@ test("manual collection refuses a conversation URL outside the selected provider
     );
     assert.equal(getCalls, 0);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -208,7 +208,7 @@ test("abandon requires confirmation and releases only the selected unresolved pr
     assert.equal(workspaceHasBlockingTask(snapshot.tasks.tasks, "repo", ["chatgpt"]), null);
     assert.equal(workspaceHasBlockingTask(snapshot.tasks.tasks, "repo", ["gemini"]), null);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -251,6 +251,6 @@ test("a collection finishing after resolve cannot resurrect the abandoned provid
     assert.equal(tasks.tasks.pending.children.chatgpt.state, "abandoned");
     assert.equal(sessions.workspaces.repo.chatgpt, threadUrl);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

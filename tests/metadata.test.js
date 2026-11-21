@@ -41,7 +41,7 @@ test("completed metadata is trusted only with exact identity and a stable non-em
     }, "chatgpt", runDir);
     assert.equal(verified.verified, true);
   } finally {
-    await rm(runDir, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -62,7 +62,7 @@ test("missing or mismatched job/provider identity is never trusted", async () =>
     assert.equal(missingIdentity.state, "interrupted_unknown");
     assert.equal(missingIdentity.trustedCompletion, false);
   } finally {
-    await rm(runDir, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -77,7 +77,7 @@ test("provisional in_progress metadata becomes interrupted_unknown, never comple
     assert.match(result.error, /do not resend/i);
     assert.equal(result.trustedCompletion, false);
   } finally {
-    await rm(runDir, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -92,7 +92,7 @@ test("timed-out partial artifacts are not exposed as completed result files", as
     assert.equal(result.responsePath, null);
     assert.equal(result.trustedCompletion, false);
   } finally {
-    await rm(runDir, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -111,7 +111,7 @@ test("completed metadata with missing, empty, invalid or contradictory response 
     const contradictory = await readBatchMetadata(root, "error", "chatgpt", { runDir });
     assert.equal(contradictory.trustedCompletion, false);
   } finally {
-    await rm(runDir, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -128,8 +128,8 @@ test("artifacts outside the recorded task run directory are never trusted", asyn
     const wrongOwner = await readBatchMetadata(root, "job-owned", "chatgpt", { runDir: wrongRunDir });
     assert.equal(wrongOwner.trustedCompletion, false);
   } finally {
-    await rm(runDir, { recursive: true, force: true });
-    await rm(wrongRunDir, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(wrongRunDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -154,6 +154,6 @@ test("symlinked response files are rejected when the platform permits symlink cr
     assert.equal(result.trustedCompletion, false);
     assert.equal(result.responsePath, null);
   } finally {
-    await rm(runDir, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

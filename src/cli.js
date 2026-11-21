@@ -64,15 +64,36 @@ function parseMap(value, label) {
   return result;
 }
 
-async function readPrompt(options) {
+// A detached or background stdin never reaches EOF and never yields data, so an
+// unconditional `for await` over it waits forever instead of failing. Node also
+// cannot tell a Windows pipe from /dev/null via fstat (every is*() returns
+// false), so the reliable signal is "did any byte arrive". Wait for a first
+// chunk with a short grace period; once data flows, read to EOF normally.
+function readStdin(firstByteTimeoutMs = 400) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdin.pause();
+      resolve(Buffer.concat(chunks).toString("utf8").trim());
+    };
+    const timer = setTimeout(() => { if (!chunks.length) finish(); }, firstByteTimeoutMs);
+    process.stdin.on("data", (chunk) => chunks.push(chunk));
+    process.stdin.on("end", finish);
+    process.stdin.on("error", finish);
+    process.stdin.resume();
+  });
+}
+
+async function readPrompt(options, positional = []) {
   if (options.prompt && options["prompt-file"]) throw new WfaError("ARGUMENT_ERROR", "Use only one of --prompt and --prompt-file.");
   if (options["prompt-file"]) return (await readFile(path.resolve(options["prompt-file"]), "utf8")).trim();
   if (options.prompt) return String(options.prompt).trim();
-  if (!process.stdin.isTTY) {
-    const chunks = [];
-    for await (const chunk of process.stdin) chunks.push(chunk);
-    return Buffer.concat(chunks).toString("utf8").trim();
-  }
+  if (positional.length) return positional.join(" ").trim();
+  if (!process.stdin.isTTY) return await readStdin();
   return "";
 }
 
@@ -83,11 +104,8 @@ function defaultWorkspace(value) {
 // `--bundle-repo` stays a bare flag, but `--bundle-repo=zip` switches the
 // transport from inline text (subject to the prompt truncation ceiling) to a
 // native archive upload (not subject to it).
-function resolveBundleRepoMode(value, command) {
+function resolveBundleRepoMode(value) {
   if (!value) return null;
-  if (command !== "code") {
-    throw new WfaError("ARGUMENT_ERROR", "--bundle-repo is only supported by wfa code.");
-  }
   const mode = value === true ? "inline" : String(value).toLowerCase();
   if (!["inline", "zip"].includes(mode)) {
     throw new WfaError("ARGUMENT_ERROR", `Invalid --bundle-repo value "${value}". Use --bundle-repo, --bundle-repo=inline, or --bundle-repo=zip.`);
@@ -427,7 +445,7 @@ export async function main(argv = process.argv.slice(2)) {
   });
   let prompt = command === "code" && options.requirement
     ? (options["prompt-file"] ? await readPrompt({ "prompt-file": options["prompt-file"] }) : "")
-    : await readPrompt(options);
+    : await readPrompt(options, positional);
   const rawFiles = [...(options.file ?? []), ...(options.dir ?? [])];
   const rawImages = options.image ?? [];
   const expanded = rawFiles.length || rawImages.length
@@ -435,7 +453,7 @@ export async function main(argv = process.argv.slice(2)) {
     : { files: [], images: [] };
   const files = expanded.files;
   const images = expanded.images;
-  const bundleRepoMode = resolveBundleRepoMode(options["bundle-repo"], command);
+  const bundleRepoMode = resolveBundleRepoMode(options["bundle-repo"]);
   let mode = "full-file";
   if (command === "code") {
     const requirement = options.requirement || prompt;

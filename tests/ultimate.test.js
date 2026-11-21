@@ -42,7 +42,7 @@ test("stale partial answer cannot be auto-collected even if its text is identica
     assert.equal(getCalls, 0);
     const task = (await store.snapshot()).tasks.tasks.unknown;
     assert.equal(task.children.chatgpt.state, "interrupted_unknown");
-  } finally { await rm(home, { recursive: true, force: true }); }
+  } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("wait and attach remain read-only for an uncertain task", async () => {
@@ -55,7 +55,7 @@ test("wait and attach remain read-only for an uncertain task", async () => {
     await assert.rejects(() => waitForTask("unknown", { home, store, timeoutSeconds: 1, pollMs: 0 }), { code: "INVALID_POLL_INTERVAL" });
     const after = (await store.snapshot()).tasks.tasks.unknown;
     assert.equal(after.children.chatgpt.resultPath ?? null, null);
-  } finally { await rm(home, { recursive: true, force: true }); }
+  } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("detached spawn resolves only after spawn event and rejects invalid command", async () => {
@@ -67,7 +67,7 @@ test("detached spawn resolves only after spawn event and rejects invalid command
       }),
       (error) => error.code === "ENOENT" || error.code === "EACCES",
     );
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("failed detached launch records failed_before_start rather than running", async () => {
@@ -84,7 +84,7 @@ test("failed detached launch records failed_before_start rather than running", a
     assert.equal(output.task.state, "failed");
     assert.equal(output.task.children.chatgpt.state, "failed_before_start");
     assert.match(output.task.children.chatgpt.error, /executable not found/);
-  } finally { await rm(home, { recursive: true, force: true }); await rm(repo, { recursive: true, force: true }); }
+  } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); await rm(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("detached launch persists lineage and task log paths", async () => {
@@ -115,7 +115,7 @@ test("detached launch persists lineage and task log paths", async () => {
     assert.deepEqual(output.task.lineage, ["parent"]);
     assert.equal(launchOpts.stdoutPath, path.join(output.task.runDir, "batch.stdout.log"));
     assert.equal(launchOpts.stderrPath, path.join(output.task.runDir, "batch.stderr.log"));
-  } finally { await rm(home, { recursive: true, force: true }); await rm(repo, { recursive: true, force: true }); }
+  } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); await rm(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("CLI help does not advertise optional Oracle integration", async () => {

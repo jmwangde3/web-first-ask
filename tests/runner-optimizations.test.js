@@ -48,8 +48,8 @@ test("dry-run previews a line-numbered bundle and never creates a task or launch
     assert.deepEqual((await store.snapshot()).tasks.tasks, {});
     await assert.rejects(access(path.join(home, "tasks.json")));
   } finally {
-    await rm(home, { recursive: true, force: true });
-    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(workspaceRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -100,8 +100,8 @@ test("automatic project brief is injected only for providers creating a new sess
     assert.equal(result.task.children.chatgpt.state, "completed");
     assert.equal(result.task.children.gemini.state, "completed");
   } finally {
-    await rm(home, { recursive: true, force: true });
-    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(workspaceRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -165,8 +165,8 @@ test("WFA followup uses the completed parent's exact provider conversation and r
     assert.equal(result.task.parentThreadUrl, "https://chatgpt.com/c/parent");
     assert.equal(result.task.children.chatgpt.state, "completed");
   } finally {
-    await rm(home, { recursive: true, force: true });
-    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(workspaceRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -222,8 +222,8 @@ test("followup rejects a provider home URL and a mismatched repository root befo
     await assert.rejects(() => executeTask({ ...task, workspaceRoot: os.tmpdir() },
       { home, store, config, skipPreflight: true }), { code: "FOLLOWUP_WORKSPACE_MISMATCH" });
   } finally {
-    await rm(home, { recursive: true, force: true });
-    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(workspaceRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -249,6 +249,6 @@ test("HTTP 429 in stderr cannot make a provisional submitted job safely retryabl
     await assert.rejects(() => executeTask({ prompt: "Do not resend", workspace: "repo", providers: ["chatgpt"] },
       { home, store, config, skipPreflight: true }), { code: "WORKSPACE_PROVIDER_LOCKED" });
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

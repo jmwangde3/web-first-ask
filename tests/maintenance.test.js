@@ -55,6 +55,6 @@ test("updaters and task launches share a gate, including a live background helpe
     assert.equal(result.task.state, "needs_recovery");
     assert.equal((await store.snapshot()).tasks.upstreamUpdate, undefined);
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

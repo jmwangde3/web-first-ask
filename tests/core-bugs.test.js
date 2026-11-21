@@ -33,8 +33,8 @@ async function withRepo(fn) {
     git(root, "remote", "add", "origin", "https://github.com/acme/fake.git");
     return await fn({ root, home });
   } finally {
-    await rm(root, { recursive: true, force: true });
-    await rm(home, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 
@@ -194,7 +194,7 @@ test("Chrome restore and log rotation are integrated and idempotent", async () =
     const again = await prepareChromeStartup({ root });
     assert.equal(again.repairedProfiles.length, 0);
     assert.equal(again.logRotated, false);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("aborting a foreground process retains already-emitted logs", async () => {
@@ -265,7 +265,7 @@ test("install-skill --target accepts an explicit skills directory", async () => 
     await runCli(["install-skill", "--target", target]);
     const installed = await readFile(path.join(target, "web-first", "SKILL.md"), "utf8");
     assert.equal(installed, await readFile(new URL("../skills/web-first/SKILL.md", import.meta.url), "utf8"));
-  } finally { await rm(target, { recursive: true, force: true }); }
+  } finally { await rm(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("a recycled parent pid with a stale heartbeat cannot lock the task forever", async () => {
@@ -283,7 +283,7 @@ test("a recycled parent pid with a stale heartbeat cannot lock the task forever"
     });
     const task = await abandonProvider("recycled", "chatgpt", { confirm: true, home, store });
     assert.equal(task.children.chatgpt.state, "abandoned");
-  } finally { await rm(home, { recursive: true, force: true }); }
+  } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("a live owner with a fresh heartbeat still blocks resolve", async () => {
@@ -302,5 +302,5 @@ test("a live owner with a fresh heartbeat still blocks resolve", async () => {
       () => abandonProvider("owned", "chatgpt", { confirm: true, home, store }),
       /still running/i,
     );
-  } finally { await rm(home, { recursive: true, force: true }); }
+  } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });

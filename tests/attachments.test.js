@@ -33,7 +33,7 @@ test("directory attachments recurse, classify images, skip generated/dependency 
     assert.deepEqual(result.images.map((item) => path.relative(root, item).replaceAll("\\", "/")), ["src/diagram.png"]);
     assert.equal(result.count, 4);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -53,7 +53,7 @@ test("quoted glob patterns support recursive matching, brace alternatives and ! 
       "src/a.js", "src/a.md", "src/nested/b.js",
     ]);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -67,6 +67,6 @@ test("explicit image inputs reject non-image file types", async () => {
       { code: "IMAGE_TYPE_UNSUPPORTED" },
     );
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

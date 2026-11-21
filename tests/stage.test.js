@@ -57,7 +57,7 @@ test("stage is non-destructive and apply requires explicit confirmation", async 
     const task = (await fixture.store.snapshot()).tasks.tasks["task-1"];
     assert.equal(task.children.chatgpt.appliedFiles[0], "src/main.js");
   } finally {
-    await rm(fixture.home, { recursive: true, force: true });
+    await rm(fixture.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -73,7 +73,7 @@ test("apply refuses a target changed after the preview", async () => {
     );
     assert.equal(await readFile(target, "utf8"), "manual edit\n");
   } finally {
-    await rm(fixture.home, { recursive: true, force: true });
+    await rm(fixture.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -93,7 +93,7 @@ test("spec tasks and path traversal are never staged", async () => {
       { code: "NOT_APPLICABLE" },
     );
   } finally {
-    await rm(fixture.home, { recursive: true, force: true });
+    await rm(fixture.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -103,7 +103,7 @@ test("result reader only returns task-owned result files", async () => {
     const result = await readTaskResult("task-1", { provider: "chatgpt", stdout: true, home: fixture.home, store: fixture.store });
     assert.match(result.body, /FILE: src\/main.js/);
   } finally {
-    await rm(fixture.home, { recursive: true, force: true });
+    await rm(fixture.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -148,6 +148,6 @@ test("auto-collected ask-bridge results are hash-verified again before reading a
       { code: "RESULT_INTEGRITY_FAILED" },
     );
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
