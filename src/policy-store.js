@@ -5,7 +5,9 @@ import { matchRepoUnreadable, repositoryFallbackCommand } from "./repository.js"
 import { summarizeTask, workspaceSessions } from "./state.js";
 
 async function detectDetachedStall(task) {
-  if (!task.detached || !task.executionPending || !task.childPid
+  // A serial worker has its own guarded per-job watchdog; killing the worker
+  // from a stale aggregate log would strand its next, as-yet-unsent provider.
+  if (task.serialWorker || !task.detached || !task.executionPending || !task.childPid
     || !Number.isInteger(task.stallTimeoutSeconds) || task.stallTimeoutSeconds === 0) return null;
   const logPath = path.join(task.runDir, "batch.stdout.log");
   const logInfo = await stat(logPath).catch(() => null);
@@ -89,31 +91,29 @@ export class PolicyStore extends Store {
           if (this.intent.followupTaskId) {
             const parent = state.tasks.tasks[this.intent.followupTaskId];
             for (const provider of task.providers) {
-              if (parent?.children?.[provider]?.threadUrl) {
-                task.sessionBaseline[provider] = parent.children[provider].threadUrl;
-              }
+              if (parent?.children?.[provider]?.threadUrl) task.sessionBaseline[provider] = parent.children[provider].threadUrl;
             }
           }
           task.stallTimeoutSeconds = this.intent.stallTimeoutSeconds;
-          task.repoReference = this.intent.repository?.available ? {
+          task.bundleRepo = Boolean(this.intent.bundleRepo);
+          task.repoReference = !task.bundleRepo && this.intent.repository?.available ? {
             url: this.intent.repository.url, branch: this.intent.repository.branch, commit: this.intent.repository.commit,
+            warnings: this.intent.repository.warnings ?? [],
           } : null;
         }
         if (!task.children) continue;
         const detachedStall = await detectDetachedStall(task);
-        if (detachedStall) {
-          this.stalls.set(id, { ...(this.stalls.get(id) ?? {}), ...detachedStall });
-        }
+        if (detachedStall) this.stalls.set(id, { ...(this.stalls.get(id) ?? {}), ...detachedStall });
         let changed = false;
         for (const [provider, child] of Object.entries(task.children)) {
-          if (task.repoReference && child.state === "completed" && child.resultPath && !child.repoChecked) {
+          if (!task.bundleRepo && task.repoReference && child.state === "completed" && child.resultPath && !child.repoChecked) {
             const body = await readFile(child.resultPath, "utf8").catch(() => "");
             const matched = matchRepoUnreadable(body);
             child.repoChecked = true;
             if (matched && (child.completionProof || child.collectionSource === "manual-confirmed-get")) {
               child.repoUnreadable = true;
               child.repoUnreadableEvidence = matched;
-              child.repoFallbackCommand = repositoryFallbackCommand(id, provider, task.workspace);
+              child.repoFallbackCommand = repositoryFallbackCommand(id, provider, task.workspace, task.kind);
               child.recoveryHint = `Repository unreadable. Run: ${child.repoFallbackCommand}`;
             }
           }
@@ -121,8 +121,7 @@ export class PolicyStore extends Store {
             const expected = task.sessionBaseline[provider] ?? null;
             if (task.sessionPolicy === "fresh" && expected === child.threadUrl) {
               child.threadMismatch = {
-                expected: "a new conversation (not the previous workspace thread)",
-                actual: child.threadUrl,
+                expected: "a new conversation (not the previous workspace thread)", actual: child.threadUrl,
               };
             } else if (task.sessionPolicy === "continue" && expected && expected !== child.threadUrl) {
               child.threadMismatch = { expected, actual: child.threadUrl };
@@ -143,11 +142,8 @@ export class PolicyStore extends Store {
             const currentSession = state.sessions.workspaces?.[task.workspace]?.[provider];
             if (currentSession === child.threadUrl) {
               const original = task.sessionBaseline?.[provider] ?? null;
-              if (original && original !== child.threadUrl) {
-                state.sessions.workspaces[task.workspace][provider] = original;
-              } else {
-                delete state.sessions.workspaces[task.workspace][provider];
-              }
+              if (original && original !== child.threadUrl) state.sessions.workspaces[task.workspace][provider] = original;
+              else delete state.sessions.workspaces[task.workspace][provider];
             }
           }
         }

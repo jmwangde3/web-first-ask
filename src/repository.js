@@ -6,11 +6,12 @@ import { WfaError } from "./errors.js";
 
 const exec = promisify(execFile);
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", ".cache", "vendor", "target", ".venv", "__pycache__"]);
-const SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|7z|rar|exe|dll|so|dylib|class|pyc|woff2?|ttf|otf|mp[34]|avi|mov|sqlite|db|lock)$/i;
+const SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|7z|rar|exe|dll|so|dylib|class|pyc|woff2?|ttf|otf|mp[34]|avi|mov|sqlite|db|bin|dat|lock)$/i;
+const CORE_FILES = ["package.json", "src/cli.js", "src/managed-runner.js", "src/repository.js", "src/policy-store.js", "src/ask-bridge.js", "src/jobs.js", "README.md"];
 
 async function git(cwd, ...args) {
   const { stdout } = await exec("git", args, { cwd, windowsHide: true, timeout: 5000, maxBuffer: 12 * 1024 * 1024 });
-  return stdout.trim();
+  return stdout.trimEnd();
 }
 
 export function normalizeRepoUrl(remote) {
@@ -36,33 +37,59 @@ export function normalizeRepoUrl(remote) {
   return url.toString().replace(/\/$/, "");
 }
 
+async function workingState(root, remote) {
+  const status = await git(root, "status", "--porcelain=v1", "--untracked-files=normal").catch(() => null);
+  const dirtyFiles = status === null ? null : status.split(/\r?\n/).filter(Boolean)
+    .map((line) => line.slice(3));
+  const refs = remote ? await git(root, "for-each-ref", "--format=%(refname)", `refs/remotes/${remote}/`).catch(() => "") : "";
+  const unpushedCommits = refs
+    ? Number(await git(root, "rev-list", "--count", "HEAD", "--not", `--remotes=${remote}`).catch(() => "NaN"))
+    : null;
+  const pushVerified = Number.isInteger(unpushedCommits);
+  const warnings = [];
+  if (dirtyFiles === null) warnings.push("Could not inspect the local worktree; its contents may differ from the remote repository.");
+  else if (dirtyFiles.length) warnings.push(`Local worktree has ${dirtyFiles.length} modified/untracked file(s) absent from the referenced commit.`);
+  if (!pushVerified) warnings.push("Cannot verify that HEAD is available on the remote (no usable remote-tracking refs). Fetch/push before relying on the URL.");
+  else if (unpushedCommits > 0) warnings.push(`${unpushedCommits} local commit(s) are not reachable from remote-tracking refs; push before relying on the URL.`);
+  return {
+    dirty: dirtyFiles === null ? null : dirtyFiles.length > 0,
+    dirtyFiles: dirtyFiles?.slice(0, 100) ?? [],
+    dirtyFileCount: dirtyFiles?.length ?? null,
+    unpushedCommits: pushVerified ? unpushedCommits : null,
+    pushVerified,
+    safeToReference: warnings.length === 0,
+    warnings,
+  };
+}
+
 export async function resolveRepository({ cwd = process.cwd(), repoUrl, noRepo = false } = {}) {
   if (noRepo) return { available: false, reason: "disabled by --no-repo" };
-  let root = null;
-  try { root = await git(cwd, "rev-parse", "--show-toplevel"); } catch {}
-  let branch = null;
-  let commit = null;
-  if (root) {
-    branch = await git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD").catch(() => "(detached)");
-    commit = await git(cwd, "rev-parse", "HEAD").catch(() => null);
-  }
+  const root = await git(cwd, "rev-parse", "--show-toplevel").catch(() => null);
+  const branch = root ? await git(root, "symbolic-ref", "--quiet", "--short", "HEAD").catch(() => "(detached)") : null;
+  const commit = root ? await git(root, "rev-parse", "HEAD").catch(() => null) : null;
+  const remotes = root ? (await git(root, "remote").catch(() => "")).split(/\r?\n/).filter(Boolean) : [];
+  const chosen = remotes.includes("origin") ? "origin" : remotes[0];
+  const localUrl = chosen ? normalizeRepoUrl(await git(root, "remote", "get-url", chosen).catch(() => "")) : null;
   if (repoUrl !== undefined && repoUrl !== null) {
     const url = normalizeRepoUrl(repoUrl);
     if (!url) throw new WfaError("INVALID_REPO_URL", "--repo-url must be a browsable Git remote URL.");
-    return { available: true, source: "override", url, branch, commit, root };
+    const state = root ? await workingState(root, localUrl === url ? chosen : null)
+      : { dirty: null, dirtyFiles: [], dirtyFileCount: null, unpushedCommits: null, pushVerified: false, safeToReference: false,
+        warnings: ["This URL is an override outside a verified local Git tree; the remote state is unverified."] };
+    return { available: true, source: "override", url, branch, commit, root, ...state };
   }
   if (!root) return { available: false, reason: "working directory is not a Git repository" };
-  const remotes = (await git(cwd, "remote").catch(() => "")).split(/\r?\n/).filter(Boolean);
-  const chosen = remotes.includes("origin") ? "origin" : remotes[0];
   if (!chosen) return { available: false, reason: "Git repository has no remote" };
-  const url = normalizeRepoUrl(await git(cwd, "remote", "get-url", chosen).catch(() => ""));
-  if (!url) return { available: false, reason: `remote ${chosen} is not a browsable repository URL` };
-  return { available: true, source: chosen, url, branch, commit, root };
+  if (!localUrl) return { available: false, reason: `remote ${chosen} is not a browsable repository URL` };
+  return { available: true, source: chosen, url: localUrl, branch, commit, root, ...await workingState(root, chosen) };
 }
 
 export function repositoryBlock(repo) {
   if (!repo?.available) return "";
-  return `REPOSITORY\nURL: ${repo.url}\nBranch: ${repo.branch || "unknown"}\nCommit: ${repo.commit || "unknown"}\nRead this repository directly at the branch and commit above. Do not wait for pasted files. If the repository is unreadable, reply with exactly REPO_UNREADABLE and nothing else.\nEND REPOSITORY`;
+  const warning = repo.warnings?.length
+    ? `\nLOCAL STATE WARNINGS:\n${repo.warnings.map((item) => `- ${item}`).join("\n")}\nDo not assume the remote contains uncommitted/unpushed local changes.\n`
+    : "\n";
+  return `REPOSITORY\nURL: ${repo.url}\nBranch: ${repo.branch || "unknown"}\nCommit: ${repo.commit || "unknown"}${warning}Read this repository directly at the branch and commit above. Do not wait for pasted files. If the repository is unreadable, reply with exactly REPO_UNREADABLE and nothing else.\nEND REPOSITORY`;
 }
 
 export function matchRepoUnreadable(answer) {
@@ -83,47 +110,79 @@ function matchesExclude(file, patterns) {
   });
 }
 
-export async function bundleRepository({ cwd = process.cwd(), excludes = [], includes = [], maxFileBytes = 65536, maxTotalBytes = 8 * 1024 * 1024 } = {}) {
+export async function bundleRepository({ cwd = process.cwd(), excludes = [], includes = [], prompt = "", maxFileBytes = 65536,
+  maxTotalBytes = 8 * 1024 * 1024, maxInlineBytes = 30 * 1024 } = {}) {
   const root = await git(cwd, "rev-parse", "--show-toplevel").catch(() => null);
   if (!root) throw new WfaError("BUNDLE_REPO_NOT_GIT", "--bundle-repo requires a Git working tree. Use --file <path> instead.");
   const { stdout } = await exec("git", ["ls-files", "-z", "--cached", "--exclude-standard"], {
     cwd: root, windowsHide: true, timeout: 10000, encoding: "buffer", maxBuffer: 12 * 1024 * 1024,
   });
-  const paths = Buffer.from(stdout).toString("utf8").split("\0").filter(Boolean);
-  const selected = includes.map((entry) => path.resolve(cwd, entry));
-  const sections = [];
+  const tracked = Buffer.from(stdout).toString("utf8").split("\0").filter(Boolean);
   const skipped = [];
-  let sourceBytes = 0;
-  for (const relative of paths) {
+  const eligible = tracked.filter((relative) => {
     const label = relative.replace(/\\/g, "/");
-    if (label.split("/").some((part) => SKIP_DIRS.has(part)) || SKIP_EXT.test(label)
+    const invalid = label.split("/").some((part) => SKIP_DIRS.has(part)) || SKIP_EXT.test(label)
       || /(?:^|\/)(?:\.env(?:\.|$)|id_rsa|[^/]*\.min\.(?:js|css)$)/i.test(label)
-      || matchesExclude(label, excludes)) {
-      skipped.push({ path: label, reason: "excluded/generated/binary filename" });
-      continue;
-    }
+      || matchesExclude(label, excludes);
+    if (invalid) skipped.push({ path: label, reason: "excluded/generated/binary filename" });
+    return !invalid;
+  });
+  const selectedPaths = includes.map((entry) => path.resolve(cwd, entry));
+  const matchesInclude = (entry) => selectedPaths.some((item) => {
+    const absolute = path.resolve(root, entry);
+    return absolute === item || absolute.startsWith(item + path.sep);
+  });
+  const taskText = String(prompt);
+  const mentioned = eligible.filter((item) => taskText.includes(item)
+    || (taskText.includes(path.posix.basename(item)) && eligible.filter((entry) => path.posix.basename(entry) === path.posix.basename(item)).length === 1));
+  // The inventory is cheap; full sources are not. Without a specified/mentioned
+  // file, send the tree and ask for a narrow follow-up instead of streaming
+  // unrelated repository files under an arbitrary byte budget.
+  const priority = includes.length ? eligible.filter(matchesInclude) : mentioned;
+  const tree = eligible.map((item) => `- ${item}`).join("\n");
+  const core = CORE_FILES.filter((item) => eligible.includes(item));
+  const intro = `REPOSITORY SOURCE BUNDLE\nDIRECTORY TREE (tracked, eligible files):\n${tree}\n\nCORE ENTRY POINTS:\n${core.map((item) => `- ${item}`).join("\n") || "(none detected)"}\n\nThe sources included below are authoritative for this request. The tree is only an inventory; do not claim to have read unlisted source contents. Ask for exact additional paths if needed.\n`;
+  let content = intro;
+  let sourceBytes = 0;
+  let files = 0;
+  for (const relative of priority) {
     const absolute = path.resolve(root, relative);
-    if (selected.length && !selected.some((entry) => absolute === entry || absolute.startsWith(entry + path.sep))) continue;
     const info = await lstat(absolute).catch(() => null);
-    if (!info?.isFile() || info.size > maxFileBytes || sourceBytes + info.size > maxTotalBytes) {
-      skipped.push({ path: label, reason: !info?.isFile() ? "not a regular file" : "size cap" });
+    if (!info?.isFile() || info.isSymbolicLink() || info.size > maxFileBytes) {
+      skipped.push({ path: relative, reason: "not regular file or file-size cap" });
       continue;
     }
     const buffer = await readFile(absolute).catch(() => null);
     if (!buffer || buffer.includes(0)) {
-      skipped.push({ path: label, reason: "unreadable/binary" });
+      skipped.push({ path: relative, reason: "unreadable/binary" });
       continue;
     }
     let body;
     try { body = new TextDecoder("utf-8", { fatal: true }).decode(buffer); }
-    catch { skipped.push({ path: label, reason: "invalid UTF-8" }); continue; }
+    catch { skipped.push({ path: relative, reason: "invalid UTF-8" }); continue; }
+    const section = `\n===== FILE: ${relative} =====\n${body}\n===== END FILE: ${relative} =====\n`;
+    const limit = includes.length ? maxTotalBytes : Math.min(maxTotalBytes, maxInlineBytes);
+    if (sourceBytes + buffer.length > limit || Buffer.byteLength(content + section, "utf8") > maxTotalBytes) {
+      skipped.push({ path: relative, reason: "inline budget; use --file to select this source explicitly" });
+      continue;
+    }
+    content += section;
     sourceBytes += buffer.length;
-    sections.push(`===== FILE: ${label} =====\n${body}\n===== END FILE: ${label} =====`);
+    files += 1;
   }
-  const content = sections.join("\n\n");
-  return { content, stats: { files: sections.length, bytes: Buffer.byteLength(content, "utf8"), skipped: skipped.length }, skipped };
+  return { content, stats: { files, bytes: Buffer.byteLength(content, "utf8"), skipped: skipped.length,
+    listed: eligible.length, sourceBytes, coreEntryPoints: core }, skipped };
 }
 
-export function repositoryFallbackCommand(taskId, provider, workspace) {
-  return `wfa ask --workspace ${workspace} --provider ${provider} --followup ${taskId} --bundle-repo --prompt "The repository could not be accessed. Use the inlined sources to answer the original request."`;
+function shellQuote(value) {
+  return `"${String(value ?? "").replace(/["\\]/g, "\\$&")}"`;
+}
+
+export function repositoryFallbackCommand(taskId, provider, workspace, kind = "ask") {
+  const command = kind === "code" ? "code" : "ask";
+  const flag = command === "code" ? "--requirement" : "--prompt";
+  const instruction = command === "code"
+    ? "Use the inlined source and original conversation to implement the request. Return complete FILE: path blocks for every changed file; no plans, diffs or omissions. Ask for specific missing files if needed."
+    : "Use the inlined sources and original conversation to answer the request. Ask for specific missing files if needed.";
+  return `wfa ${command} --workspace ${shellQuote(workspace)} --provider ${shellQuote(provider)} --followup ${shellQuote(taskId)} --bundle-repo --exclude "docs/**" ${flag} ${shellQuote(instruction)}`;
 }

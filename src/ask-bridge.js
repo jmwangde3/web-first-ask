@@ -1,7 +1,95 @@
 import { spawn } from "node:child_process";
-import { open } from "node:fs/promises";
+import { open, readFile, readdir, rename, rm, stat, writeFile, chmod } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { WfaError } from "./errors.js";
 import { truncate } from "./util.js";
+
+const LOG_ROTATE_BYTES = 64 * 1024 * 1024;
+const LOG_KEEP_BYTES = 4 * 1024 * 1024;
+
+function chromeConfigDir(env = process.env) {
+  return env.ASK_BRIDGE_CONFIG_DIR || path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "ask-bridge");
+}
+
+async function findPreferences(root) {
+  const result = [];
+  const queue = [{ dir: root, depth: 0 }];
+  while (queue.length && result.length < 24) {
+    const { dir, depth } = queue.shift();
+    const direct = path.join(dir, "Preferences");
+    if ((await stat(direct).catch(() => null))?.isFile()) result.push(direct);
+    if (depth >= 3) continue;
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.isSymbolicLink() && !["Cache", "Code Cache", "GPUCache", "node_modules"].includes(entry.name)) {
+        queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+      }
+    }
+    if (queue.length > 128) queue.length = 128;
+  }
+  return result;
+}
+
+// No wrapper script is required. Only an exact `profile.exit_type: "Crashed"`
+// entry is changed; malformed/unrecognized profiles are never rewritten.
+export async function prepareChromeStartup({ apply = true, root = chromeConfigDir() } = {}) {
+  const report = { root, inspectedProfiles: 0, crashedProfiles: [], repairedProfiles: [],
+    logPath: path.join(root, "chrome-devtools-mcp.log"), logRotated: false, warnings: [] };
+  for (const preferences of await findPreferences(root)) {
+    report.inspectedProfiles += 1;
+    try {
+      const original = await readFile(preferences, "utf8");
+      const data = JSON.parse(original);
+      if (data?.profile?.exit_type !== "Crashed") continue;
+      report.crashedProfiles.push(preferences);
+      if (!apply) continue;
+      data.profile.exit_type = "Normal";
+      data.profile.exited_cleanly = true;
+      const mode = (await stat(preferences)).mode & 0o777;
+      const temporary = `${preferences}.wfa-${process.pid}-${Date.now()}.tmp`;
+      try {
+        await writeFile(temporary, JSON.stringify(data), { encoding: "utf8", mode: 0o600, flag: "wx" });
+        await chmod(temporary, mode);
+        await rename(temporary, preferences);
+      } finally {
+        await rm(temporary, { force: true }).catch(() => {});
+      }
+      report.repairedProfiles.push(preferences);
+    } catch (error) {
+      report.warnings.push(`Cannot inspect/repair ${preferences}: ${error.message}`);
+    }
+  }
+  try {
+    const info = await stat(report.logPath);
+    if (info.isFile() && info.size > LOG_ROTATE_BYTES) {
+      report.logBytesBefore = info.size;
+      if (apply) {
+        const file = await open(report.logPath, "r");
+        let tail;
+        try {
+          const count = Math.min(LOG_KEEP_BYTES, info.size);
+          tail = Buffer.alloc(count);
+          const { bytesRead } = await file.read(tail, 0, count, info.size - count);
+          tail = tail.subarray(0, bytesRead);
+        } finally { await file.close(); }
+        const temporary = `${report.logPath}.wfa-${process.pid}-${Date.now()}.tmp`;
+        try {
+          await writeFile(temporary, tail, { mode: 0o600, flag: "wx" });
+          await rename(temporary, report.logPath);
+          report.logRotated = true;
+        } finally { await rm(temporary, { force: true }).catch(() => {}); }
+      }
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") report.warnings.push(`Cannot inspect/rotate ${report.logPath}: ${error.message}`);
+  }
+  report.applied = report.repairedProfiles.length > 0 || report.logRotated;
+  report.profileStatus = report.repairedProfiles.length ? "repaired"
+    : report.crashedProfiles.length ? "crashed (not repaired)"
+      : report.inspectedProfiles ? "healthy" : "not found";
+  return report;
+}
 
 export async function spawnDetached(command, args, {
   cwd,
@@ -12,6 +100,7 @@ export async function spawnDetached(command, args, {
   if (!stdoutPath || !stderrPath) {
     throw new WfaError("DETACH_LOG_PATH_REQUIRED", "Detached execution needs task-scoped stdout/stderr log paths.");
   }
+  if (args.includes("batch") || args.includes("login")) await prepareChromeStartup({ root: chromeConfigDir(env) });
   let stdout = null;
   let stderr = null;
   let child = null;
@@ -19,10 +108,7 @@ export async function spawnDetached(command, args, {
     stdout = await open(stdoutPath, "wx", 0o600);
     stderr = await open(stderrPath, "wx", 0o600);
     child = spawn(command, args, {
-      cwd,
-      env,
-      detached: true,
-      windowsHide: true,
+      cwd, env, detached: true, windowsHide: true,
       stdio: ["ignore", stdout.fd, stderr.fd],
     });
     await new Promise((resolve, reject) => {
@@ -32,8 +118,6 @@ export async function spawnDetached(command, args, {
     if (!Number.isInteger(child.pid) || child.pid <= 0) {
       throw new WfaError("DETACHED_SPAWN_UNCONFIRMED", "ask-bridge did not provide a valid launched PID.");
     }
-    // The detached child owns the saved task logs; errors after the confirmed
-    // spawn are visible as incomplete metadata, not a signal to resend.
     child.on("error", () => {});
     child.unref();
     return { pid: child.pid };
@@ -47,19 +131,22 @@ export function resolveAskBridge(config = {}, env = process.env) {
   return env.ASK_BRIDGE_BIN || config.askBridgePath || (process.platform === "win32" ? "ask-bridge.exe" : "ask-bridge");
 }
 
-export function runProcess(command, args, {
+export async function runProcess(command, args, {
   cwd,
   inherit = false,
   env = process.env,
   onSpawn,
   onStdout,
+  onStderr,
   onStdoutLine,
   onStderrLine,
   input,
   timeoutMs,
   killGraceMs = 5000,
   drainGraceMs = 1000,
+  abortSignal,
 } = {}) {
+  if (args.includes("batch") || args.includes("login")) await prepareChromeStartup({ root: chromeConfigDir(env) });
   return new Promise((resolve) => {
     let child;
     let stdout = "";
@@ -69,17 +156,13 @@ export function runProcess(command, args, {
     let exited = false;
     let processError = null;
     let timedOut = false;
+    let aborted = false;
     let stdioDrainTimedOut = false;
     let timeoutHandle = null;
     let forceKillHandle = null;
     let watchdogHandle = null;
     let drainHandle = null;
     let spawnCallback = Promise.resolve();
-
-    // Line callbacks exist so ask-bridge progress reaches the caller while the
-    // batch is still running instead of sitting in the accumulated buffer until
-    // the process exits. A partial line is held back and flushed on close, and
-    // an upstream that never prints a newline is bounded instead of growing.
     const pendingLine = { stdout: "", stderr: "" };
     const lineCallback = { stdout: onStdoutLine, stderr: onStderrLine };
     const emitLines = (stream, text, final = false) => {
@@ -103,51 +186,66 @@ export function runProcess(command, args, {
     const finish = (result) => {
       if (settled) return;
       settled = true;
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      if (forceKillHandle) clearTimeout(forceKillHandle);
-      if (watchdogHandle) clearTimeout(watchdogHandle);
-      if (drainHandle) clearTimeout(drainHandle);
-      resolve({ ...result, processError, timedOut, stdioDrainTimedOut });
+      clearTimeout(timeoutHandle);
+      clearTimeout(forceKillHandle);
+      clearTimeout(watchdogHandle);
+      clearTimeout(drainHandle);
+      abortSignal?.removeEventListener("abort", onAbort);
+      resolve({ ...result, processError, timedOut, aborted, stdioDrainTimedOut });
     };
-
     const destroyPipes = () => {
       child.stdout?.destroy();
       child.stderr?.destroy();
     };
-
     const finishAfterSpawnCallback = async (code, signal, childMayRun = false) => {
       await spawnCallback;
       finish({ code, signal, stdout, stderr, spawnError: null, pid: child.pid ?? null, childMayRun });
     };
-
     const signalChild = (signal) => {
       try {
-        if (!child.kill(signal) && !exited) {
-          processError ??= new Error(`Could not signal ask-bridge with ${signal}`);
-        }
-      } catch (error) {
-        processError ??= error;
-      }
+        if (!child.kill(signal) && !exited) processError ??= new Error(`Could not signal ask-bridge with ${signal}`);
+      } catch (error) { processError ??= error; }
     };
+    const beginShutdown = () => {
+      if (exited || settled || forceKillHandle) return;
+      signalChild("SIGTERM");
+      forceKillHandle = setTimeout(() => {
+        if (exited || settled) return;
+        signalChild("SIGKILL");
+        watchdogHandle = setTimeout(() => {
+          if (exited || settled) return;
+          processError ??= new Error("ask-bridge did not exit after the watchdog tried to stop it");
+          child.unref();
+          destroyPipes();
+          void finishAfterSpawnCallback(null, null, true);
+        }, 1000);
+        watchdogHandle.unref?.();
+      }, Math.max(0, killGraceMs));
+      forceKillHandle.unref?.();
+    };
+    const onAbort = () => { aborted = true; beginShutdown(); };
 
+    if (abortSignal?.aborted) {
+      finish({ code: null, signal: null, stdout, stderr, spawnError: new Error("Process launch aborted") });
+      return;
+    }
     try {
       child = spawn(command, args, {
-        cwd,
-        env,
-        windowsHide: !inherit,
-        stdio: inherit ? (input === undefined ? "inherit" : ["pipe", "inherit", "inherit"]) : [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+        cwd, env, windowsHide: !inherit,
+        stdio: inherit ? (input === undefined ? "inherit" : ["pipe", "inherit", "inherit"])
+          : [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       });
     } catch (error) {
       finish({ code: null, signal: null, stdout, stderr, spawnError: error });
       return;
     }
-
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+    if (abortSignal?.aborted) onAbort();
     child.once("spawn", () => {
       spawned = true;
       if (input !== undefined && child.stdin) child.stdin.end(String(input), "utf8");
       spawnCallback = Promise.resolve().then(() => onSpawn?.(child.pid ?? null)).catch(() => {});
     });
-
     if (!inherit) {
       const stdoutDecoder = new TextDecoder("utf-8");
       const stderrDecoder = new TextDecoder("utf-8");
@@ -160,69 +258,34 @@ export function runProcess(command, args, {
       child.stderr?.on("data", (chunk) => {
         const text = stderrDecoder.decode(chunk, { stream: true });
         stderr = truncate(stderr + text, 12000);
+        onStderr?.(stderr);
         emitLines("stderr", text);
       });
       child.stdout?.once("close", () => emitLines("stdout", stdoutDecoder.decode(), true));
       child.stderr?.once("close", () => emitLines("stderr", stderrDecoder.decode(), true));
     }
-
     if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
-      timeoutHandle = setTimeout(() => {
-        timedOut = true;
-        signalChild("SIGTERM");
-        forceKillHandle = setTimeout(() => {
-          if (exited) return;
-          signalChild("SIGKILL");
-          watchdogHandle = setTimeout(() => {
-            if (exited) return;
-            processError ??= new Error("ask-bridge did not exit after the watchdog tried to stop it");
-            child.unref();
-            destroyPipes();
-            void finishAfterSpawnCallback(null, null, true);
-          }, 1000);
-        }, killGraceMs);
-      }, timeoutMs);
+      timeoutHandle = setTimeout(() => { timedOut = true; beginShutdown(); }, timeoutMs);
+      timeoutHandle.unref?.();
     }
-
     child.on("error", (error) => {
-      if (spawned) {
-        processError ??= error;
-      } else {
-        finish({ code: null, signal: null, stdout, stderr, spawnError: error, pid: child.pid ?? null });
-      }
+      if (spawned) processError ??= error;
+      else finish({ code: null, signal: null, stdout, stderr, spawnError: error, pid: child.pid ?? null });
     });
-
     child.once("exit", (code, signal) => {
       exited = true;
-      // The main process has exited. Do not let inherited handles in a
-      // descendant keep this CLI waiting forever for the later "close" event.
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-        timeoutHandle = null;
-      }
-      if (forceKillHandle) {
-        clearTimeout(forceKillHandle);
-        forceKillHandle = null;
-      }
-      if (watchdogHandle) {
-        clearTimeout(watchdogHandle);
-        watchdogHandle = null;
-      }
-
+      clearTimeout(timeoutHandle); timeoutHandle = null;
+      clearTimeout(forceKillHandle); forceKillHandle = null;
+      clearTimeout(watchdogHandle); watchdogHandle = null;
       drainHandle = setTimeout(() => {
         stdioDrainTimedOut = true;
         destroyPipes();
         void finishAfterSpawnCallback(code, signal);
       }, Math.max(0, drainGraceMs));
+      drainHandle.unref?.();
     });
-
     child.once("close", (code, signal) => {
-      // Normally close follows exit after stdout/stderr are fully drained.
-      // If it arrives within the grace period, preserve the complete output.
-      if (drainHandle) {
-        clearTimeout(drainHandle);
-        drainHandle = null;
-      }
+      clearTimeout(drainHandle); drainHandle = null;
       void finishAfterSpawnCallback(code, signal);
     });
   });
@@ -251,9 +314,5 @@ export async function checkAskBridge(config = {}) {
   if (batchHelp.spawnError || batchHelp.code !== 0 || !/batch/i.test(helpText) || missingOptions.length) {
     throw new WfaError("ASK_BRIDGE_BATCH_UNAVAILABLE", `The installed ask-bridge does not expose the required batch interface. Missing: ${missingOptions.join(", ") || "batch command"}. Update ask-bridge before using web-first-ask.`);
   }
-  return {
-    command,
-    version: (version.stdout || version.stderr).trim(),
-    batchHelp: helpText,
-  };
+  return { command, version: (version.stdout || version.stderr).trim(), batchHelp: helpText };
 }

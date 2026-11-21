@@ -62,6 +62,39 @@ export function isPidAlive(pid) {
   }
 }
 
+// Windows and Linux both recycle pids, so `isPidAlive(task.parentPid)` alone can
+// report a dead owner as alive and lock a task forever. A task that records a
+// heartbeat is only considered owned while that heartbeat is fresh; legacy tasks
+// without a heartbeat keep the previous pid-only behaviour.
+export const OWNER_HEARTBEAT_STALE_MS = 180000;
+
+export function owningProcessAlive(task, { now = Date.now(), staleMs = OWNER_HEARTBEAT_STALE_MS } = {}) {
+  if (!task?.parentPid) return false;
+  if (!isPidAlive(task.parentPid)) return false;
+  if (!task.heartbeatAt) return true;
+  const beat = Date.parse(task.heartbeatAt);
+  return Number.isFinite(beat) && now - beat < staleMs;
+}
+
+export function startHeartbeat({ taskId, store, intervalMs = 45000 }) {
+  let stopped = false;
+  const beat = () => {
+    if (stopped) return;
+    store.transaction(({ tasks }) => {
+      const task = tasks.tasks[taskId];
+      if (task) task.heartbeatAt = new Date().toISOString();
+    }).catch(() => {});
+  };
+  const timer = setInterval(beat, intervalMs);
+  timer.unref?.();
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
 export function safeError(error) {
   return truncate(error instanceof Error ? error.message : String(error), 1500);
 }

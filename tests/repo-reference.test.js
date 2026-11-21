@@ -16,7 +16,8 @@ const bin = fileURLToPath(new URL("../bin/wfa.js", import.meta.url));
 const git = (cwd, ...args) => execFileSync("git", args, { cwd, encoding: "utf8", windowsHide: true }).trim();
 const argAfter = (args, flag) => args[args.indexOf(flag) + 1];
 const config = { defaultProvider: "chatgpt", defaultProviders: ["chatgpt", "gemini"],
-  defaultConcurrency: 1, defaultTimeoutSeconds: 1200, maxTimeoutSeconds: 7200, maxConcurrency: 3, downloadImages: false };
+  defaultConcurrency: 1, defaultTimeoutSeconds: 1200, maxTimeoutSeconds: 7200,
+  maxConcurrency: 3, downloadImages: false };
 
 async function fixture(fn) {
   const root = await mkdtemp(path.join(os.tmpdir(), "wfa-repo-root-"));
@@ -71,14 +72,14 @@ test("detects repo metadata without source reads and inlines tracked files only 
   assert.equal((await resolveRepository({ cwd: root, noRepo: true })).available, false);
   assert.equal((await resolveRepository({ cwd: root, repoUrl: "https://gitlab.com/new/repo.git" })).url,
     "https://gitlab.com/new/repo");
-  const bundled = await bundleRepository({ cwd: root });
-  assert.equal(bundled.stats.files, 2);
+  const bundled = await bundleRepository({ cwd: root, prompt: "Read main.js" });
+  assert.equal(bundled.stats.files, 1);
   assert.ok(bundled.stats.skipped >= 1);
   assert.match(bundled.content, /FILE: main.js/);
   assert.doesNotMatch(bundled.content, /not tracked/);
 }));
 
-test("wfa code needs no --file when the current repository has a remote", async () => fixture(async ({ root, home }) => {
+test("wfa code needs no --file when current repository has a remote", async () => fixture(async ({ root, home }) => {
   const run = (...args) => spawnSync(process.execPath, [bin, "code", "--requirement", "Improve main.js", "--dry-run", ...args], {
     cwd: root, env: { ...process.env, WFA_HOME: home }, encoding: "utf8",
   });
@@ -94,20 +95,22 @@ test("wfa code needs no --file when the current repository has a remote", async 
   assert.equal(disabled.status, 1);
   const bundle = run("--bundle-repo");
   assert.equal(bundle.status, 0, bundle.stderr);
-  assert.equal(JSON.parse(bundle.stdout).bundleRepo.files, 2);
+  assert.equal(JSON.parse(bundle.stdout).bundleRepo.files, 1);
 }));
 
-test("repo block reaches each provider and a new task omits saved workspace sessions", async () => fixture(async ({ root, home }) => {
+test("repo block reaches each provider in isolated single-job batches and fresh sessions", async () => fixture(async ({ root, home }) => {
   const store = new PolicyStore(home);
   await store.transaction(({ sessions }) => { sessions.workspaces.x = { chatgpt: "https://chatgpt.com/c/previous" }; });
-  let jobs;
+  const seen = [];
   const result = await executeTask({
     prompt: "Analyze main.js", providers: ["chatgpt", "gemini"], workspace: "x", workspaceRoot: root,
   }, { home, store, config, skipPreflight: true,
     runProcess: async (_cmd, args, opts) => {
-      jobs = (await readFile(argAfter(args, "--input"), "utf8")).trim().split("\n").map(JSON.parse);
+      const jobs = (await readFile(argAfter(args, "--input"), "utf8")).trim().split("\n").map(JSON.parse);
+      assert.equal(jobs.length, 1);
       assert.ok(jobs.every((job) => job.prompt.includes("REPOSITORY\nURL: https://github.com/test-org/test-repo")));
       assert.ok(jobs.every((job) => !Object.hasOwn(job, "session")));
+      seen.push(...jobs);
       return successfulBatch("Answer", (provider) => provider === "chatgpt"
         ? "https://chatgpt.com/c/previous" : "https://gemini.google.com/app/new")(_cmd, args, opts);
     },
@@ -118,10 +121,10 @@ test("repo block reaches each provider and a new task omits saved workspace sess
     actual: "https://chatgpt.com/c/previous",
   });
   assert.equal((await store.snapshot()).sessions.workspaces.x.chatgpt, undefined);
-  assert.equal(jobs.length, 2);
+  assert.equal(seen.length, 2);
 }));
 
-test("--continue-session includes the saved conversation and checks the expected URL", async () => fixture(async ({ root, home }) => {
+test("--continue-session includes saved conversation and checks expected URL", async () => fixture(async ({ root, home }) => {
   const store = new PolicyStore(home);
   const previous = "https://chatgpt.com/c/known";
   await store.transaction(({ sessions }) => { sessions.workspaces.x = { chatgpt: previous }; });
@@ -138,29 +141,31 @@ test("--continue-session includes the saved conversation and checks the expected
   assert.equal((await store.snapshot()).sessions.workspaces.x.chatgpt, previous);
 }));
 
-test("REPO_UNREADABLE is unresolved; the exact fallback sends text in the same thread", async () => fixture(async ({ root, home }) => {
+test("REPO_UNREADABLE is unresolved; code fallback keeps code delivery and source authority", async () => fixture(async ({ root, home }) => {
   const store = new PolicyStore(home);
   const first = await executeTask({
-    prompt: "Explain main.js", provider: "chatgpt", workspace: "x", workspaceRoot: root,
+    prompt: "Explain main.js", kind: "code", provider: "chatgpt", workspace: "x", workspaceRoot: root,
   }, { home, store, config, skipPreflight: true,
     runProcess: successfulBatch("REPO_UNREADABLE", () => "https://chatgpt.com/c/sentinel"),
   });
   assert.equal(first.task.children.chatgpt.state, "repo_unreadable");
   assert.equal(first.task.children.chatgpt.repoUnreadable, true);
-  assert.match(first.task.children.chatgpt.repoFallbackCommand, /--bundle-repo/);
+  assert.match(first.task.children.chatgpt.repoFallbackCommand, /wfa code .*--bundle-repo/);
   assert.ok(workspaceHasBlockingTask((await store.snapshot()).tasks.tasks, "x", ["chatgpt"]));
   const followup = await executeTask({
-    prompt: "Use the inline source to finish the original request.", provider: "chatgpt", workspace: "x",
-    workspaceRoot: root, followupTaskId: first.task.taskId, bundleRepo: true,
+    prompt: "Use the inline source of main.js to finish the original request.", provider: "chatgpt", workspace: "x",
+    kind: "code", workspaceRoot: root, followupTaskId: first.task.taskId, bundleRepo: true,
   }, { home, store, config, skipPreflight: true, runProcess: async (cmd, args, opts) => {
     const job = JSON.parse((await readFile(argAfter(args, "--input"), "utf8")).trim());
     assert.equal(job.session, "https://chatgpt.com/c/sentinel");
     assert.match(job.prompt, /FILE: main.js/);
+    assert.doesNotMatch(job.prompt, /^REPOSITORY\nURL:/);
     assert.deepEqual(job.files, []);
     return successfulBatch("Resolved answer", () => "https://chatgpt.com/c/sentinel")(cmd, args, opts);
   } });
   assert.equal(followup.task.children.chatgpt.state, "completed");
   assert.equal(followup.task.parentTaskId, first.task.taskId);
+  assert.equal(followup.task.repoReference, null);
 }));
 
 test("sentinel matching avoids quoted or explanatory false positives", () => {
@@ -169,7 +174,7 @@ test("sentinel matching avoids quoted or explanatory false positives", () => {
   assert.equal(matchRepoUnreadable("The identifier REPO_UNREADABLE is in the test file."), null);
 });
 
-test("stall watcher needs an active job and both progress/metadata silence", async () => {
+test("stall watcher needs active job and both progress/metadata silence", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "wfa-stall-"));
   try {
     let now = 1000;
@@ -190,21 +195,19 @@ test("stall watcher needs an active job and both progress/metadata silence", asy
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("EPERM is a lock collision and a dead owner's lock is reclaimed", async () => {
+test("EPERM is lock collision and dead owner's lock is reclaimed", async () => {
   assert.equal(isLockCollision({ code: "EPERM" }), true);
   assert.equal(isLockCollision({ code: "EEXIST" }), true);
   assert.equal(isLockCollision({ code: "EACCES" }), false);
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-lock-"));
   try {
     const store = new PolicyStore(home);
-    await writeFile(path.join(home, ".store.lock"), JSON.stringify({
-      host: os.hostname(), pid: 2147483000, createdAt: 0,
-    }));
+    await writeFile(path.join(home, ".store.lock"), JSON.stringify({ host: os.hostname(), pid: 2147483000, createdAt: 0 }));
     assert.equal(await store.withLock(async () => "recovered", 500), "recovered");
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
-test("a silent in-progress batch becomes stalled rather than completed or retryable", async () => fixture(async ({ root, home }) => {
+test("silent in-progress batch becomes stalled rather than completed or retryable", async () => fixture(async ({ root, home }) => {
   const store = new PolicyStore(home);
   const result = await executeTask({
     prompt: "Check a hanging provider", workspace: "stall-example", provider: "chatgpt",

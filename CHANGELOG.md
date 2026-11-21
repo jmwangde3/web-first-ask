@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.2.5 - Unreleased
+
+The four defects that could silently degrade a run are fixed at the source: a
+contradictory prompt when a follow-up also bundles the repository, a repository
+reference that ignored uncommitted or unpushed work, a stall kill that discarded
+the captured logs, and a serial batch that made `--detach` inherit the tab-close
+failure. `src/runner.js` is split into orchestration, stall and retry modules.
+
+### Fixed
+- `--followup` combined with `--bundle-repo` no longer injects the `REPOSITORY`
+  block (which tells the provider not to wait for pasted files) and no longer
+  runs the `REPO_UNREADABLE` sentinel check, so the inlined bundle is the only
+  instruction the provider sees.
+- The repository reference now inspects `git status --porcelain` and the count
+  of commits not present on the remote, records `dirty`/`dirtyFiles`/
+  `unpushedCommits`/`safeToReference`, and warns in the prompt when the local
+  HEAD has not been pushed. A failed Git call degrades to "unknown" instead of
+  failing the task.
+- A stall kill preserves the stdout/stderr lines already captured instead of
+  overwriting them with empty strings, and every watchdog, force-kill and drain
+  timer is `unref()`ed so the CLI can exit on its own after `afterKill`.
+- Provider retries persist their own `batch.stdout.<provider>.retry.log` and
+  `batch.stderr.<provider>.retry.log`, and `refreshTask` reads them.
+- The `repositoryFallbackCommand` for `wfa code` keeps the `code` subcommand
+  with `--followup` and `--requirement` (the `FILE:` delivery contract), adds
+  `--exclude`, and asks for missing files by name instead of degrading to
+  `wfa ask`.
+- A task now records `heartbeatAt`, refreshed every 45 seconds by the process
+  that owns it. `wfa resolve`/`wfa collect` only treat `parentPid` as alive when
+  that heartbeat is fresher than 180 seconds, so a recycled pid can no longer
+  lock a task forever (measured on this machine: `parentPid 31808` had been
+  reassigned to an unrelated MCP server, and `wfa resolve` refused to unlock a
+  dead task with `TASK_STILL_RUNNING`). Tasks written by older versions keep the
+  previous pid-only behaviour.
+
+### Changed
+- Each provider now runs its own single-job batch, so a tab closed by the
+  previous job cannot strand the next one. This removes the U10 failure mode for
+  `--detach` as well, not just for the synchronous path.
+- `src/runner.js` (955 lines) is split into `runner-orchestration.js`,
+  `runner-stall.js` and `runner-retry.js`; `runner.js` remains the stable public
+  re-export shim.
+- `wfa list` refreshes non-terminal tasks before printing, so a detached task no
+  longer shows `running` after its worker has exited.
+- `wfa install-skill` accepts `--target codex|workbuddy|<skills-dir>` instead of
+  hardcoding `~/.codex/skills`.
+- Chrome `profile.exit_type: "Crashed"` repair and `chrome-devtools-mcp.log`
+  rotation moved into `src/ask-bridge.js`, so the external wrapper script in
+  `~/.local/bin` is no longer required.
+
+### Added
+- `wfa stage` applies exact `ANCHOR:`/`REPLACE:` blocks in addition to complete
+  `FILE:` blocks, accepts a conventional `./relative/path`, and refuses to stage
+  a result whose `latexEscaping` heuristic fired.
+- `tests/core-bugs.test.js` and extended `tests/repo-reference.test.js` cover the
+  dirty/unpushed repository reference, the bundle/follow-up combination, stall
+  log retention, anchor staging and the LaTeX guard (104 tests total).
+
 ## 0.2.4 - Unreleased
 
 A request to a project that has a Git remote now points the providers at that
