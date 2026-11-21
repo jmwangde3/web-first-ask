@@ -231,7 +231,7 @@ Use `--json` for machine-readable summaries. Reuse `--request-id` only when reco
 
 ## Known issues
 
-`docs/known-issues.md` is the upstream-facing list (U1–U9) of defects measured against ask-bridge 0.4.0, with reproduction, expectation and impact per item: Gemini attachment uploads timing out, prompts above roughly 44 KiB being truncated without a signal, ChatGPT long answers landing in Canvas instead of `response.md`, `--new-session` still reusing an open tab, Gemini escaping Markdown diffs, unstable concurrent tabs, the Chrome `exit_type=Crashed` restore bubble, missing log rotation, and the absence of a `submissionState`. Each item is tagged with what WFA does about it locally — detection or workaround, never a fix. Read it before sending large context or relying on provider-side isolation.
+`docs/known-issues.md` is the upstream-facing list (U1–U10) of defects measured against ask-bridge 0.4.0, with reproduction, expectation and impact per item: Gemini attachment uploads timing out, prompts above roughly 44 KiB being truncated without a signal, ChatGPT long answers landing in Canvas instead of `response.md`, `--new-session` still reusing an open tab, Gemini escaping Markdown diffs, unstable concurrent tabs, the Chrome `exit_type=Crashed` restore bubble, missing log rotation, the absence of a `submissionState`, and a serial batch closing the previous job's tab so the next job always fails once. Each item is tagged with what WFA does about it locally — detection or workaround, never a fix. Read it before sending large context or relying on provider-side isolation.
 
 ## Local data and privacy
 

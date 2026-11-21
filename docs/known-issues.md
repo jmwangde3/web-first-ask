@@ -17,6 +17,7 @@
 | U7 | Chrome `exit_type` 停在 `Crashed`，弹恢复气泡 | 一般 | 外部包装器治标 |
 | U8 | `chrome-devtools-mcp.log` 无轮转 | 一般 | 外部脚本截断 |
 | U9 | 缺 `submissionState` 等提交证明字段 | 设计 | 靠错误文本推断 |
+| U10 | `--concurrency 1` 串行批次也关掉上一个 job 的标签页 | 阻断 | 自动单 job 重跑一次 |
 
 ---
 
@@ -168,9 +169,26 @@ wfa status <第二个 task-id>   # 比较两次的 Conversation
 
 ---
 
+## U10 `--concurrency 1` 串行批次也关掉上一个 job 的标签页
+
+**现象**：串行批次里第一个 job 完成后，ask-bridge 把它的标签页关了；第二个 job 在**提交之前**就失败：
+
+```
+[batch] job wfa-chatgpt-699d3563: completed in 16s
+[batch] job wfa-gemini-699d3563: failed (failed to open tab: list_pages failed: The selected page has been closed. Call list_pages to see open pages.)
+```
+
+**复现**：任意两 provider 串行批次。两种顺序（`chatgpt,gemini` 与 `gemini,chatgpt`）都复现，**总是第二个 job 挂**，与 provider 无关。
+
+**期望**：串行批次内可以复用同一个页面直到整批结束，或下一个 job 新建页面而不是拿着已关闭的 page id 去 `list_pages`。
+
+**影响**：串行是本机唯一可靠的模式（见 U6），因此这个缺陷让「默认双 provider」的第二次调用**必然**先失败一次。wfa 只能对「错误文本匹配 + 无 threadUrl + 无 responsePath」的 provider 单独重跑一次，代价是多一次进程启动和一次浏览器加载；如果将来错误文案变了，重试就静默失效。
+
+---
+
 ## 建议优先级
 
-- **P0**：U2（静默截断产生「看起来正常」的错误结论）、U4（答非所问且难察觉）、U1（Gemini 附件完全不可用）
+- **P0**：U2（静默截断产生「看起来正常」的错误结论）、U4（答非所问且难察觉）、U1（Gemini 附件完全不可用）、U10（串行必挂一次）
 - **P1**：U3（长产物取不到）、U5（输出不可直接用）、U9（其余判定的地基）
 - **P2**：U6、U7、U8
 
@@ -185,6 +203,7 @@ wfa 0.2.3 起：
 - `response.md` 出现 Canvas 存根特征或 `\vert{}` 类转义时标记 `responseHeuristics` 并在 CLI 警告，不修改正文。
 - `--new-session` 完成后比对上一轮 `threadUrl`，相同则记 `sessionIsolationWarning`。
 - 默认 chatgpt + gemini，多 provider 默认串行（`--concurrency 1`）。
+- 串行批次被关标签页时，对可证明未提交的那个 provider 单独重跑一次，记 `retriedAsSingleBatch` / `retryWarnings`，并在 `wfa status` 打出来。
 - 可证明未提交的失败（tab 打开失败、Send 按钮未激活、附件上传超时）自动解锁 workspace。
 
-以上都只是**检测与规避**，不是修复：U1–U5 的根因仍在 ask-bridge。
+以上都只是**检测与规避**，不是修复：U1–U10 的根因仍在 ask-bridge。
