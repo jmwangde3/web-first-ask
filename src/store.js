@@ -78,7 +78,7 @@ export class Store {
     }
   }
 
-  async transaction(callback) {
+  async transaction(callback, timeoutMs) {
     return this.withLock(async () => {
       const tasks = await readJson(this.paths.tasks, EMPTY_TASKS);
       const sessions = await readJson(this.paths.sessions, EMPTY_SESSIONS);
@@ -87,7 +87,7 @@ export class Store {
       await writeJsonAtomic(this.paths.tasks, state.tasks);
       await writeJsonAtomic(this.paths.sessions, state.sessions);
       return result;
-    });
+    }, timeoutMs);
   }
 
   async snapshot() {

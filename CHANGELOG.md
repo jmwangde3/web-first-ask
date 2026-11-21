@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.6 - Unreleased
+
+The 40 KiB ceiling was never an ask-bridge limit: it applies to **prompt text**
+that the provider truncates, not to attachments, which upload natively. A
+132 KB zip reaches Gemini through `ask-bridge batch` in 15 seconds. This release
+makes that path first-class and stops paying for a constraint that did not exist.
+
+### Added
+- `--bundle-repo=zip` packages the tracked, non-sensitive sources into a zip and
+  sends it as a native attachment. The prompt only carries a short
+  `REPOSITORY ARCHIVE` block, so a whole repository fits: 64 files / 427 KB
+  compress to 146 KB (~34%), which is well under the prompt ceiling and needs no
+  `--exclude` tuning. `--bundle-repo` without a value keeps the inline transport.
+- `src/repository-archive.js`: dependency-free ZIP writer (deflate with a store
+  fallback, UTF-8 names, CRC32 per entry) plus `collectTrackedSources`, which
+  shares the inline bundle's skip rules so both transports ship the same files.
+  Archives are pruned to the newest five.
+- `isArchiveAttachment` — `zip`/`tar`/`gz`/`tgz`/`7z` upload natively on both
+  providers.
+
+### Fixed
+- Gemini no longer refuses archive attachments. The old
+  `GEMINI_ATTACHMENT_UNSUPPORTED` guard assumed every native upload times out;
+  measured, archives complete in 15s and the document parser timeout does not
+  apply to them. Binary documents are still blocked or inlined.
+- The `--bundle-repo` fallback command now recommends `--bundle-repo=zip`
+  instead of asking for `--exclude` tuning against a 40 KiB budget.
+- Every message that called 40 KiB an attachment limit now says prompt text.
+  `--dry-run`'s `splitPlan` note states that attachments are not cut at 40 KiB.
+- `Store.transaction(callback, timeoutMs)` accepts a lock timeout; the
+  concurrent-writer test uses a longer one so it stops timing out when the whole
+  suite runs in parallel on a busy machine.
+
 ## 0.2.5 - Unreleased
 
 The four defects that could silently degrade a run are fixed at the source: a

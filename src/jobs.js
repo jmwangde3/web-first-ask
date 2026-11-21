@@ -1,5 +1,6 @@
 import path from "node:path";
 import { PROVIDERS } from "./constants.js";
+import { isArchiveAttachment } from "./attachments.js";
 import { WfaError } from "./errors.js";
 
 export function normalizeProviders(values, fallback = ["chatgpt"]) {
@@ -37,10 +38,13 @@ export function buildJobs({
       throw new WfaError("GEMINI_IMAGE_UNSUPPORTED", "ask-bridge batch does not support image attachments for Gemini. Use --file for supported document formats or omit Gemini from this image request.");
     }
     const providerFiles = filesByProvider[provider] ?? files;
-    if (provider === "gemini" && providerFiles.length && !allowGeminiAttachments) {
+    // Archives are exempt: they upload as opaque attachments and measured fast
+    // in batch, unlike binary documents whose parsers time out.
+    const archiveOnly = providerFiles.length > 0 && providerFiles.every((file) => isArchiveAttachment(file));
+    if (provider === "gemini" && providerFiles.length && !allowGeminiAttachments && !archiveOnly) {
       throw new WfaError(
         "GEMINI_ATTACHMENT_UNSUPPORTED",
-        "Gemini document attachments time out in ask-bridge batch. Inline the content into a prompt under 40 KiB, drop Gemini with --providers chatgpt, or force the native upload with --allow-gemini-attachments.",
+        "Gemini document attachments time out in ask-bridge batch. Use a zip/tar archive (those upload natively), inline the content into a prompt under 40 KiB, drop Gemini with --providers chatgpt, or force the native upload with --allow-gemini-attachments.",
       );
     }
     const job = {

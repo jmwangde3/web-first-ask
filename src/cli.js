@@ -80,6 +80,21 @@ function defaultWorkspace(value) {
   return value || path.basename(process.cwd()).replace(/[^A-Za-z0-9._-]/g, "_").replace(/^[^A-Za-z0-9]+/, "") || "workspace";
 }
 
+// `--bundle-repo` stays a bare flag, but `--bundle-repo=zip` switches the
+// transport from inline text (subject to the prompt truncation ceiling) to a
+// native archive upload (not subject to it).
+function resolveBundleRepoMode(value, command) {
+  if (!value) return null;
+  if (command !== "code") {
+    throw new WfaError("ARGUMENT_ERROR", "--bundle-repo is only supported by wfa code.");
+  }
+  const mode = value === true ? "inline" : String(value).toLowerCase();
+  if (!["inline", "zip"].includes(mode)) {
+    throw new WfaError("ARGUMENT_ERROR", `Invalid --bundle-repo value "${value}". Use --bundle-repo, --bundle-repo=inline, or --bundle-repo=zip.`);
+  }
+  return mode;
+}
+
 function printTask(task, json = false, replayed = false) {
   const children = Object.fromEntries(Object.entries(task.children ?? {}).map(([provider, child]) => [provider, {
     state: child.state, result: child.resultPath ?? null, thread: child.threadUrl ?? null,
@@ -151,6 +166,7 @@ Common options:
   --repo-url <url>     Override the detected Git remote URL
   --no-repo            Do not add a repository reference
   --bundle-repo        Inline a directory tree and a bounded selection of tracked sources
+  --bundle-repo=zip    Attach the tracked sources as a zip instead of inlining (no prompt ceiling)
   --file <path|glob|dir> Repeatable source/document attachment; directories recurse
   --dir <path>         Alias for recursive directory attachment
   --image <path|glob>  Repeatable image attachment (not supported by Gemini)
@@ -175,7 +191,7 @@ Common options:
   --stage              Stage completed full-file code without applying it
   --poll-ms <ms>       Polling interval for wait/attach (250..60000; default 2000)
   --dry-run            Preview repository reference, dirty/unpushed warnings and risks
-  --allow-oversize     Send prompt over 40 KiB anyway (truncation risk)
+  --allow-oversize     Send an inline prompt over 40 KiB anyway (truncation risk; attachments are unaffected)
   --allow-gemini-attachments  Force native Gemini upload instead of inlining text
   --allow-sensitive    Explicitly allow sending text flagged by secret scanner
   --no-bundle-lines     Disable selected-source bundle for wfa code
@@ -419,11 +435,12 @@ export async function main(argv = process.argv.slice(2)) {
     : { files: [], images: [] };
   const files = expanded.files;
   const images = expanded.images;
+  const bundleRepoMode = resolveBundleRepoMode(options["bundle-repo"], command);
   let mode = "full-file";
   if (command === "code") {
     const requirement = options.requirement || prompt;
     if (!requirement) throw new WfaError("ARGUMENT_ERROR", "wfa code requires --requirement or --prompt.");
-    if (!files.length && !repository.available && !options["bundle-repo"]) {
+    if (!files.length && !repository.available && !bundleRepoMode) {
       throw new WfaError("ARGUMENT_ERROR", "wfa code requires --file/--dir or a Git repository with a remote (--repo-url also works).");
     }
     mode = String(options.mode ?? "full-file").toLowerCase();
@@ -432,12 +449,14 @@ export async function main(argv = process.argv.slice(2)) {
     }
     prompt = buildCodePrompt({
       requirement,
-      filePaths: options["bundle-repo"]
-        ? ["Source: use the inlined REPOSITORY SOURCE BUNDLE below, not a remote reference"]
-        : files.length ? [...files, ...images].map((file) => {
-          const relative = path.relative(process.cwd(), path.resolve(file));
-          return (relative || path.basename(file)).split(path.sep).join("/");
-        }) : (repository.available ? ["Source: read the REPOSITORY reference below directly"] : []),
+      filePaths: bundleRepoMode === "zip"
+        ? ["Source: extract the attached repository archive and read the files you need from it"]
+        : bundleRepoMode
+          ? ["Source: use the inlined REPOSITORY SOURCE BUNDLE below, not a remote reference"]
+          : files.length ? [...files, ...images].map((file) => {
+            const relative = path.relative(process.cwd(), path.resolve(file));
+            return (relative || path.basename(file)).split(path.sep).join("/");
+          }) : (repository.available ? ["Source: read the REPOSITORY reference below directly"] : []),
       context: [options.context, ...(options.requirement && prompt ? [prompt] : [])].filter(Boolean).join("\n\n"),
       mode,
     });
@@ -470,7 +489,7 @@ export async function main(argv = process.argv.slice(2)) {
     kind: command, prompt, providers, provider: options.provider,
     workspace: defaultWorkspace(options.workspace), files, images, workspaceRoot: process.cwd(),
     repository, repoUrl: options["repo-url"], noRepo: Boolean(options["no-repo"]),
-    bundleRepo: Boolean(options["bundle-repo"]), repoExcludes: options.exclude ?? [],
+    bundleRepo: Boolean(bundleRepoMode), bundleRepoMode, repoExcludes: options.exclude ?? [],
     bundleLines: command === "code" ? options["no-bundle-lines"] !== true : Boolean(options["bundle-lines"]),
     dryRun: Boolean(options["dry-run"]), allowSensitive: Boolean(options["allow-sensitive"]),
     allowOversize: Boolean(options["allow-oversize"]),

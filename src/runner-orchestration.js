@@ -13,7 +13,7 @@ import {
   buildLineNumberedBundle, estimateTokens, prependBrief, resolveBriefText,
   scanSensitiveText, writeLineNumberedBundle,
 } from "./bundle.js";
-import { isSensitiveAttachmentPath, isTextSourceAttachment } from "./attachments.js";
+import { isArchiveAttachment, isSensitiveAttachmentPath, isTextSourceAttachment } from "./attachments.js";
 import { refreshTask } from "./runner-stall.js";
 import { executePreparedTask } from "./runner-retry.js";
 
@@ -212,9 +212,14 @@ export async function executeTask(input, dependencies = {}) {
       body = sections.join("\n\n");
     }
     if (body === null) {
-      geminiAttachmentBlocked = true;
-      if (!input.dryRun) {
-        throw new WfaError("GEMINI_ATTACHMENT_UNSUPPORTED", "Gemini cannot receive attachments: ask-bridge uploads time out, and a binary or native document cannot be inlined. Inline the content yourself, drop Gemini with --providers chatgpt, or force the native upload with --allow-gemini-attachments.");
+      // Archives upload natively on both providers and are not parsed, so the
+      // documented batch upload timeout does not apply to them. Binary
+      // documents still are blocked: their parsers time out before submit.
+      if (!files.every((filePath) => isArchiveAttachment(filePath))) {
+        geminiAttachmentBlocked = true;
+        if (!input.dryRun) {
+          throw new WfaError("GEMINI_ATTACHMENT_UNSUPPORTED", "Gemini cannot receive this attachment in batch mode: document parsers time out before the prompt is submitted, and a binary or native document cannot be inlined. Inline the content yourself, drop Gemini with --providers chatgpt, or force the native upload with --allow-gemini-attachments.");
+        }
       }
     } else {
       geminiInlineBody = body;
@@ -244,9 +249,9 @@ export async function executeTask(input, dependencies = {}) {
     providers: promptRiskProviders,
     promptBytesByProvider,
     splitPlan: splitAttachmentFiles(attachmentStats, PROMPT_SIZE_WARN_BYTES),
-    splitPlanNote: "Groups use the attachment sizes on disk; a source bundle or a rewritten prompt changes the transmitted size. Prompt text is never split automatically.",
+    splitPlanNote: "Reference grouping only. Attachments upload natively and are not cut at 40 KiB; these groups describe what a forced inline fallback would look like. Prompt text is never split automatically.",
     message: promptRiskProviders.length
-      ? `Prompt exceeds ${PROMPT_SIZE_WARN_BYTES / 1024} KiB for: ${promptRiskProviders.join(", ")}. ask-bridge truncates silently around 44 KiB, so the provider may answer from a partial prompt.`
+      ? `Prompt text exceeds ${PROMPT_SIZE_WARN_BYTES / 1024} KiB for: ${promptRiskProviders.join(", ")}. ask-bridge can truncate long prompt text around 44 KiB, so the provider may answer from a partial prompt. Attachments are unaffected because they travel outside the prompt.`
       : null,
   };
   if (input.dryRun) {
@@ -286,9 +291,9 @@ export async function executeTask(input, dependencies = {}) {
   if (promptSizeRisk.exceedsThreshold && !input.allowOversize) {
     const sizes = promptRiskProviders.map((provider) => `${provider}=${promptBytesByProvider[provider]} bytes`).join(", ");
     const inlineNote = geminiInline
-      ? ` Gemini's prompt includes ${geminiInline.bytes} bytes of inlined attachments because ask-bridge cannot upload them; split those files or use --providers chatgpt.` : "";
+      ? ` Gemini's prompt includes ${geminiInline.bytes} bytes of inlined attachments because binary documents cannot be uploaded; send them as a zip or use --providers chatgpt.` : "";
     throw new WfaError("PROMPT_OVERSIZE",
-      `Prompt exceeds ${PROMPT_SIZE_WARN_BYTES} bytes (${sizes}).${inlineNote} ask-bridge may silently truncate it: rewrite or split the prompt body, or pass --allow-oversize to send anyway. --dry-run prints a file-level splitPlan; prompt text is never split automatically.`);
+      `Prompt exceeds ${PROMPT_SIZE_WARN_BYTES} bytes (${sizes}).${inlineNote} Only the prompt text is capped: attachments upload natively and are not truncated. Rewrite or split the prompt body, switch --bundle-repo to --bundle-repo=zip, or pass --allow-oversize to send anyway. --dry-run prints a file-level splitPlan; prompt text is never split automatically.`);
   }
   if (sensitiveFindings.length && !input.allowSensitive) {
     const locations = sensitiveFindings.slice(0, 12).map((item) => `${item.source}:${item.line} (${item.kind})`).join(", ");

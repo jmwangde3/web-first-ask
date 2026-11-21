@@ -181,8 +181,10 @@ function shellQuote(value) {
 export function repositoryFallbackCommand(taskId, provider, workspace, kind = "ask") {
   const command = kind === "code" ? "code" : "ask";
   const flag = command === "code" ? "--requirement" : "--prompt";
+  // The archive travels as a native attachment, so it is not subject to the
+  // prompt truncation ceiling and does not need --exclude tuning to fit.
   const instruction = command === "code"
-    ? "Use the inlined source and original conversation to implement the request. Return complete FILE: path blocks for every changed file; no plans, diffs or omissions. Ask for specific missing files if needed."
-    : "Use the inlined sources and original conversation to answer the request. Ask for specific missing files if needed.";
-  return `wfa ${command} --workspace ${shellQuote(workspace)} --provider ${shellQuote(provider)} --followup ${shellQuote(taskId)} --bundle-repo --exclude "docs/**" ${flag} ${shellQuote(instruction)}`;
+    ? "Extract the attached repository archive and use it with the original conversation to implement the request. Return complete FILE: path blocks for every changed file; no plans, diffs or omissions. Name the exact path of any file missing from the archive instead of guessing."
+    : "Extract the attached repository archive and use it with the original conversation to answer the request. Name the exact path of any file missing from the archive instead of guessing.";
+  return `wfa ${command} --workspace ${shellQuote(workspace)} --provider ${shellQuote(provider)} --followup ${shellQuote(taskId)} --bundle-repo=zip ${flag} ${shellQuote(instruction)}`;
 }
