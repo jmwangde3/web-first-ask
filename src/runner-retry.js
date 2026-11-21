@@ -8,6 +8,7 @@ import { detectSessionIsolationWarning, rememberSession, summarizeTask } from ".
 import { guardedBatch } from "./runner-stall.js";
 import { PolicyStore } from "./policy-store.js";
 import { loadConfig } from "./config.js";
+import { geminiTaskModeNeeded, startGeminiTaskModeForTask } from "./gemini-mode.js";
 import { WfaError } from "./errors.js";
 import { startHeartbeat } from "./util.js";
 
@@ -142,6 +143,32 @@ async function runOne({ command, task, job, config, timeoutSeconds, store, run, 
     if (!result.childMayRun) current.children[provider].childPid = null;
   });
   return { result: metadata, processResult: result };
+}
+
+// The Gemini landing mode is page state that only a live click can change, so
+// whether it took effect is an observation, not a promise. Record what was
+// actually seen on the task instead of reporting the run as clean.
+async function recordGeminiMode(store, taskId, report) {
+  if (!report) return;
+  await store.transaction(({ tasks }) => {
+    const current = tasks.tasks[taskId];
+    if (!current) return;
+    current.geminiModeReport = report;
+    current.updatedAt = new Date().toISOString();
+  });
+}
+
+/**
+ * Run a batch with the Task-switch clicker attached when the task needs it.
+ * The clicker can never throw, so it cannot turn a working run into a failure.
+ */
+async function withGeminiMode(task, store, log, execute) {
+  const clicker = startGeminiTaskModeForTask(task, log);
+  try {
+    return await execute();
+  } finally {
+    await recordGeminiMode(store, task.taskId, await clicker?.stop());
+  }
 }
 
 async function runSequential({ command, task, config, input, store, run, jobs, timeoutSeconds }) {
@@ -290,13 +317,24 @@ export async function executePreparedTask({ task, command, config, input, store,
       if (!serial) for (const child of Object.values(current.children)) child.childPid = spawned.pid;
       current.updatedAt = new Date().toISOString();
     });
+    if (!serial) {
+      // A detached plain batch is ask-bridge's own process: no coordinator
+      // survives here to hold a debugging session open, so this mode cannot
+      // press the switch and must not pretend it did.
+      await recordGeminiMode(store, task.taskId, geminiTaskModeNeeded(task) ? {
+        requested: "task", applied: false, clickedAt: null, pageUrl: null, clicks: 0,
+        error: "detached batch has no coordinator process to press the Task switch; run without --detach or with --concurrency 1",
+      } : null);
+    }
     const snapshot = await store.snapshot();
     return { task: snapshot.tasks.tasks[task.taskId], replayed: false, detached: true };
   }
 
   const run = dependencies.runProcess ?? runProcess;
-  if (serial) await runSequential({ command, task, config, input, store, run, jobs: createdJobs, timeoutSeconds });
-  else await runBatch({ command, task, config, input, store, run, jobs: createdJobs, timeoutSeconds });
+  await withGeminiMode(task, store, (line) => input.onProgressLine?.("stdout", line), async () => {
+    if (serial) await runSequential({ command, task, config, input, store, run, jobs: createdJobs, timeoutSeconds });
+    else await runBatch({ command, task, config, input, store, run, jobs: createdJobs, timeoutSeconds });
+  });
   const snapshot = await store.snapshot();
   return { task: snapshot.tasks.tasks[task.taskId], replayed: false };
 }
@@ -328,7 +366,9 @@ export async function runDetachedBatchWorker(taskId, workerToken, { home, store 
   const run = (cmd, args, options) => guardedBatch(runProcess, cmd, args, options, store, task.stallTimeoutSeconds ?? 300);
   const heartbeat = startHeartbeat({ taskId, store });
   try {
-    await runSequential({ command, task, config: settings, input: {}, store, run, jobs, timeoutSeconds: task.timeoutSeconds });
+    await withGeminiMode(task, store, () => {}, () => runSequential({
+      command, task, config: settings, input: {}, store, run, jobs, timeoutSeconds: task.timeoutSeconds,
+    }));
     return 0;
   } finally {
     heartbeat.stop();

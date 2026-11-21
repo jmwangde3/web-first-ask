@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { PolicyStore } from "./policy-store.js";
 import { resolveRepository } from "./repository.js";
 import { getHomeDir } from "./paths.js";
-import { loadConfig, saveBrowserMode } from "./config.js";
+import { loadConfig, saveBrowserMode, saveGeminiMode, validateGeminiMode } from "./config.js";
 import { executeTask, refreshTask } from "./managed-runner.js";
 import { runDetachedBatchWorker } from "./runner.js";
 import { collectTask, listTasks, abandonProvider, waitForTask } from "./recovery.js";
@@ -24,7 +24,7 @@ const VALUE_FLAGS = new Set([
   "file", "image", "timeout", "request-id", "concurrency", "reasoning",
   "reasoning-map", "model", "model-map", "context", "limit",
   "mode", "brief-file", "followup", "dir", "exclude", "poll-ms",
-  "repo-url", "stall-timeout", "target",
+  "repo-url", "stall-timeout", "target", "gemini-mode",
 ]);
 const REPEAT_FLAGS = new Set(["file", "image", "dir", "exclude"]);
 
@@ -130,6 +130,7 @@ function printTask(task, json = false, replayed = false) {
   }]));
   const summary = { taskId: task.taskId, requestId: task.requestId, workspace: task.workspace,
     kind: task.kind, state: task.state,
+    geminiMode: task.geminiMode ?? null, geminiModeReport: task.geminiModeReport ?? null,
     sessionPolicy: task.sessionPolicy ?? (task.fresh ? "fresh" : "continue"),
     executionPending: Boolean(task.executionPending), replayed,
     retryWarnings: task.retryWarnings ?? [], providers: children };
@@ -137,6 +138,10 @@ function printTask(task, json = false, replayed = false) {
   process.stdout.write(`Task: ${task.taskId}${replayed ? " (existing request; not resent)" : ""}\n`);
   process.stdout.write(`Workspace: ${task.workspace}\nState: ${task.state}\nSession: ${summary.sessionPolicy}\n`);
   if (task.executionPending) process.stdout.write("Execution cleanup: pending; completed results are readable but the workspace/provider lock remains active.\n");
+  if (task.geminiModeReport) {
+    const report = task.geminiModeReport;
+    process.stdout.write(`Gemini mode: ${report.requested}${report.applied ? " (switch pressed before typing)" : " (NOT applied)"}${report.error ? ` - ${report.error}` : ""}\n`);
+  }
   for (const warning of task.retryWarnings ?? []) process.stdout.write(`Retry: ${warning}\n`);
   for (const [provider, child] of Object.entries(children)) {
     process.stdout.write(`- ${provider}: ${child.state}${child.retriedAsSingleBatch ? " (after a single-job retry)" : ""}\n`);
@@ -172,6 +177,7 @@ Commands:
   wfa resolve   Abandon an unresolved provider task after confirming it is no longer running
   wfa login     Log in to a provider through ask-bridge
   wfa browser-mode [headless|headful]  Show or save browser mode and Chrome repair status
+  wfa gemini-mode [chat|task]          Show or save default Gemini landing mode (chat or task)
   wfa doctor    Check Node.js, ask-bridge integration and Chrome startup repair
   wfa unlock    Clear a task-store lock whose owner is gone (rename first, then unlink)
   wfa install-skill [--target codex|workbuddy|path]  Install web-first Skill
@@ -212,6 +218,7 @@ Common options:
   --dry-run            Preview repository reference, dirty/unpushed warnings and risks
   --allow-oversize     Send an inline prompt over 40 KiB anyway (truncation risk; attachments are unaffected)
   --allow-gemini-attachments  Force native Gemini upload instead of inlining text
+  --gemini-mode chat|task     Override the default Gemini landing mode for this request
   --allow-sensitive    Explicitly allow sending text flagged by secret scanner
   --no-bundle-lines     Disable selected-source bundle for wfa code
   --request-id <id>    Reuse only to recover the exact same logical request
@@ -357,6 +364,20 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(`Saved browser mode: ${mode}\n`);
     printChromeStatus(status);
     process.stdout.write("If ask-bridge is already running Chrome, wait for active tasks to finish and run `ask-bridge close` to use this mode on the next request.\n");
+    return;
+  }
+  if (command === "gemini-mode") {
+    if (positional.length > 1 || Object.keys(options).length > 0) {
+      throw new WfaError("ARGUMENT_ERROR", "Usage: wfa gemini-mode [chat|task]");
+    }
+    const [mode] = positional;
+    if (mode === undefined) {
+      const config = await loadConfig(home);
+      process.stdout.write(`${config.geminiMode}\n`);
+      return;
+    }
+    await saveGeminiMode(store, mode);
+    process.stdout.write(`Saved Gemini mode: ${mode}\n`);
     return;
   }
   const config = await loadConfig(home);
@@ -577,6 +598,7 @@ export async function main(argv = process.argv.slice(2)) {
     process.stderr.write(`Note: sending repository reference ${where || repository.reason}; the provider may read that remote instead of your working tree. Use --no-repo to send the prompt only, or --bundle-repo=zip to send the actual sources.\n`);
   }
   const modelByProvider = parseMap(options["model-map"], "model-map");
+  const geminiMode = options["gemini-mode"] === undefined ? undefined : validateGeminiMode(options["gemini-mode"]);
   const result = await executeTask({
     kind: command, prompt, providers, provider: options.provider,
     workspace: defaultWorkspace(options.workspace), files, images, workspaceRoot: process.cwd(),
@@ -586,6 +608,7 @@ export async function main(argv = process.argv.slice(2)) {
     dryRun: Boolean(options["dry-run"]), allowSensitive: Boolean(options["allow-sensitive"]),
     allowOversize: Boolean(options["allow-oversize"]),
     allowGeminiAttachments: Boolean(options["allow-gemini-attachments"]),
+    geminiMode,
     briefFile: options["brief-file"], noBrief: Boolean(options["no-brief"]),
     followupTaskId: options.followup, continueSession: Boolean(options["continue-session"]),
     stallTimeoutSeconds: options["stall-timeout"] === undefined ? 300 : Number(options["stall-timeout"]),
