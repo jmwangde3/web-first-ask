@@ -248,8 +248,24 @@ export async function executeTask(input, dependencies = {}) {
   const sensitiveFindings = sensitiveScan.findings;
   const unscannedAttachments = sensitiveScan.unscannedAttachments;
 
+  // Empirical browser-side cap measured on this machine: a prompt larger than
+  // roughly 44 KiB reaches the page truncated, with no signal from ask-bridge.
+  // Warn well below that, and let --dry-run turn it into a blocker.
+  const PROMPT_SIZE_WARN_BYTES = 40 * 1024;
+  const promptBytesByProvider = Object.fromEntries(providers.map((provider) =>
+    [provider, Buffer.byteLength(promptByProvider[provider] ?? "", "utf8")]));
+  const promptRiskProviders = providers.filter((provider) => promptBytesByProvider[provider] > PROMPT_SIZE_WARN_BYTES);
+  const promptSizeRisk = {
+    thresholdBytes: PROMPT_SIZE_WARN_BYTES,
+    exceedsThreshold: promptRiskProviders.length > 0,
+    providers: promptRiskProviders,
+    message: promptRiskProviders.length
+      ? `Prompt exceeds ${PROMPT_SIZE_WARN_BYTES / 1024} KiB for: ${promptRiskProviders.join(", ")}. ask-bridge truncates silently around 44 KiB, so the provider may answer from a partial prompt.`
+      : null,
+  };
+
   if (input.dryRun) {
-    const promptBytes = Object.values(promptByProvider).reduce((sum, value) => sum + Buffer.byteLength(value, "utf8"), 0);
+    const promptBytes = Object.values(promptBytesByProvider).reduce((sum, value) => sum + value, 0);
     const actualFileAttachments = bundleLines ? nativeFiles : files;
     const actualAttachmentPaths = [...actualFileAttachments, ...images];
     const attachmentBytes = (await Promise.all(actualAttachmentPaths.map(async (filePath) => (await stat(filePath)).size)))
@@ -269,6 +285,8 @@ export async function executeTask(input, dependencies = {}) {
         briefIncludedProviders: providers.filter((provider) => promptByProvider[provider] !== input.prompt),
         briefBytes: Buffer.byteLength(briefText, "utf8"),
         promptBytes,
+        promptBytesByProvider,
+        promptSizeRisk,
         filesCount: files.length,
         imagesCount: images.length,
         actualAttachmentCount: actualAttachmentPaths.length + (bundlePreview ? 1 : 0),
@@ -286,6 +304,9 @@ export async function executeTask(input, dependencies = {}) {
         sensitiveFindings,
         unscannedAttachments,
         sendBlocked: sensitiveFindings.length > 0 && !input.allowSensitive,
+        sizeBlocked: promptSizeRisk.exceedsThreshold && !input.allowOversize,
+        blocked: (sensitiveFindings.length > 0 && !input.allowSensitive)
+          || (promptSizeRisk.exceedsThreshold && !input.allowOversize),
       },
     };
   }
@@ -376,8 +397,8 @@ export async function executeTask(input, dependencies = {}) {
     const blocking = workspaceHasBlockingTask(tasks.tasks, workspace, providers);
     if (blocking) {
       const reason = blocking.executionPending
-        ? "The verified result may already be readable, but the owning ask-bridge process is still finishing cleanup. Wait for it to exit before starting another task."
-        : `Do not send another prompt to this provider until you collect or explicitly abandon the previous task; rate-limit cooldowns remain enforced even after an early resolve.${blocking.cooldownUntil ? ` Cooldown remains active until ${blocking.cooldownUntil}.` : ""}`;
+        ? `The owning ask-bridge process is still finishing cleanup. Run \`wfa wait ${blocking.taskId}\`, then retry after it exits.`
+        : `Inspect it with \`wfa status ${blocking.taskId}\`. If the original generation is no longer active and cannot be collected, run \`wfa resolve ${blocking.taskId} --provider ${blocking.provider} --confirm\`. --new-session does not bypass a request that may already have been submitted; only failures proven to happen before submission (tab/load errors, send-button failures, attachment-upload timeouts) release the lock automatically.${blocking.cooldownUntil ? ` Cooldown remains active until ${blocking.cooldownUntil}.` : ""}`;
       throw new WfaError(
         "WORKSPACE_PROVIDER_LOCKED",
         `Workspace "${workspace}" is locked by ${blocking.provider} task ${blocking.taskId} (${blocking.state}). ${reason}`,
@@ -552,6 +573,8 @@ export async function executeTask(input, dependencies = {}) {
     cwd: workspaceRoot,
     inherit: false,
     timeoutMs: (timeoutSeconds + 180) * 1000,
+    onStdoutLine: (line) => input.onProgressLine?.("stdout", line),
+    onStderrLine: (line) => input.onProgressLine?.("stderr", line),
     onSpawn: async (pid) => {
       await store.transaction(({ tasks }) => {
         const current = tasks.tasks[task.taskId];

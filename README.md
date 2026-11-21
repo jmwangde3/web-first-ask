@@ -9,9 +9,10 @@
 - `wfa compare` sends the same prompt and attachments to multiple providers concurrently, then saves each answer separately.
 - `wfa code` defaults to a path-and-line-numbered source bundle and asks for **complete replacement contents**; `--mode spec` switches to a compact implementation specification.
 - Directory recursion, quoted glob patterns, exclusions, image attachments and native document attachments are built into the CLI.
-- `--dry-run` previews prompt/attachment size, estimated tokens and likely secret locations without creating a task or launching a provider.
+- `--dry-run` previews per-provider prompt bytes, attachment size, estimated tokens, prompt-size risk and likely secret locations without creating a task or launching a provider. A prompt above 40 KiB per provider exits 2; `--allow-oversize` keeps it at 0.
 - A local task ledger records request IDs, provider states, conversation URLs, parent-task lineage, revisions and result paths.
-- Uncertain sends are never automatically repeated. An unresolved provider/workspace is locked until the user collects or explicitly abandons the old task.
+- Uncertain sends are never automatically repeated. An unresolved provider/workspace is locked until the user collects or explicitly abandons the old task, except for failures that provably happened before submission (tab load failure, send-button failure, attachment upload timeout), which release the lock automatically.
+- ask-bridge progress lines are forwarded to stderr as `[ask-bridge stdout] …` while the batch is still running.
 - Results can be inspected and staged; writing staged code into the workspace requires an explicit `wfa apply --confirm` and SHA-256 revalidation.
 - WFA can continue an existing task conversation with `--followup`.
 - ask-bridge remains an external tool; WFA adds no runtime npm dependency.
@@ -217,10 +218,15 @@ Use `--json` for machine-readable summaries. Reuse `--request-id` only when reco
 
 - `wfa compare` and `wfa code --providers ...` create one ask-bridge batch job per provider.
 - Jobs run concurrently by default (`concurrency = provider count`) and each gets its own tab and output directory.
+- `--concurrency 1` runs the selected providers one after another in a single batch. Use it when concurrent browser sessions interfere with each other on the same machine; the trade-off is total wall-clock time, not correctness.
 - Each provider has a separate saved conversation URL per workspace.
 - The same prompt and attachments are sent independently to every selected provider; no provider sees another provider's answer.
 - Results are stored separately, for example `.../ask-bridge-output/wfa-chatgpt-<id>/response.md` and `.../wfa-chatgpt-<id>/metadata.json`.
 - Codex compares the answers and makes the final decision. It must not blindly merge or trust any provider.
+
+## Known issues
+
+`docs/known-issues.md` records failures observed against ask-bridge 0.2.1 with reproductions and current workarounds: Gemini attachment uploads timing out, prompts above roughly 44 KiB being truncated without a signal, ChatGPT long answers landing in Canvas instead of `response.md`, `--new-session` still reusing an open tab, and Gemini escaping Markdown diffs. Read it before sending large context or relying on provider-side isolation.
 
 ## Local data and privacy
 

@@ -4,6 +4,28 @@ export function isBlockingChild(child) {
   return BLOCKING_STATES.has(child?.state);
 }
 
+// Failures that provably happened before the prompt reached the page. Without
+// this exemption a single dead job locks the workspace provider forever and the
+// only way out is `wfa resolve --confirm`, even though nothing was ever sent.
+// Anything ambiguous (timed_out, recoverable, interrupted_unknown, a generic
+// `failed`, or a failure that still carries a thread URL / result / completion
+// proof) stays blocking on purpose: resending an uncertain request is worse
+// than an explicit resolve.
+const CONFIRMED_UNSUBMITTED_PATTERNS = [
+  /^failed to open tab\b/i,
+  /^prompt submission failed\b/i, // e.g. "Send button did not become active/enabled"
+  /Timed out waiting for Gemini to show attachment/i,
+];
+
+export function isConfirmedUnsubmittedFailure(child) {
+  if (!child || child.state !== "failed") return false;
+  if (child.threadUrl || child.resultPath || child.completionProof) return false;
+  if (child.errorCode === "ATTACHMENT_UPLOAD_TIMEOUT") return true;
+  const error = String(child.error ?? "").trim();
+  if (!error) return false;
+  return CONFIRMED_UNSUBMITTED_PATTERNS.some((pattern) => pattern.test(error));
+}
+
 export function summarizeTask(task) {
   const states = Object.values(task.children ?? {}).map((child) => child.state);
   let state = "running";
@@ -43,6 +65,7 @@ export function workspaceHasBlockingTask(tasks, workspace, providers, exceptTask
     if (latest.executionPending) {
       return { taskId: latest.taskId, provider, state: "execution_pending", childState: child.state, executionPending: true };
     }
+    if (isConfirmedUnsubmittedFailure(child)) continue;
     if (isBlockingChild(child)) {
       return { taskId: latest.taskId, provider, state: child.state };
     }
