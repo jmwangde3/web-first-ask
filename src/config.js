@@ -11,6 +11,13 @@ function validateBrowserMode(mode) {
   return mode;
 }
 
+export function validateGeminiMode(mode) {
+  if (mode !== "chat" && mode !== "task") {
+    throw new WfaError("INVALID_GEMINI_MODE", 'Gemini mode must be "chat" or "task".');
+  }
+  return mode;
+}
+
 export async function loadConfig(home) {
   const user = await readJson(getPaths(home).config, {});
   const userConfig = { ...user };
@@ -20,6 +27,7 @@ export async function loadConfig(home) {
     ...DEFAULT_CONFIG,
     ...userConfig,
     browserMode: validateBrowserMode(userConfig.browserMode ?? DEFAULT_CONFIG.browserMode),
+    geminiMode: validateGeminiMode(userConfig.geminiMode ?? DEFAULT_CONFIG.geminiMode),
     defaultProviders: normalizeProviders(
       Array.isArray(configuredProviders) ? configuredProviders : [configuredProviders],
       DEFAULT_CONFIG.defaultProviders,
@@ -38,5 +46,13 @@ export async function saveBrowserMode(store, mode) {
   await store.withLock(async () => {
     const config = await readJson(store.paths.config, {});
     await writeJsonAtomic(store.paths.config, { ...config, browserMode: mode });
+  });
+}
+
+export async function saveGeminiMode(store, mode) {
+  validateGeminiMode(mode);
+  await store.withLock(async () => {
+    const config = await readJson(store.paths.config, {});
+    await writeJsonAtomic(store.paths.config, { ...config, geminiMode: mode });
   });
 }

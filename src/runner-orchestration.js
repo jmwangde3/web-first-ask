@@ -8,6 +8,7 @@ import { resolveAskBridge, checkAskBridge } from "./ask-bridge.js";
 import { workspaceHasBlockingTask, workspaceSessions } from "./state.js";
 import { WfaError } from "./errors.js";
 import { assertUpstreamAvailable } from "./maintenance.js";
+import { validateGeminiMode } from "./config.js";
 import { hashFile, sha256, slug, startHeartbeat, uuid } from "./util.js";
 import {
   buildLineNumberedBundle, estimateTokens, prependBrief, resolveBriefText,
@@ -423,6 +424,7 @@ export async function executeTask(input, dependencies = {}) {
       parentTaskId: followup?.taskId ?? null, parentProvider: followup?.provider ?? null,
       parentJobId: followup?.jobId ?? null, parentThreadUrl: followup?.threadUrl ?? null,
       parentResultPath: followup?.resultPath ?? null,
+      geminiMode: validateGeminiMode(input.geminiMode ?? config.geminiMode ?? "chat"),
       children, processExitCode: null,
       // A detached worker can claim this token at most once. The token is not
       // exposed in task summaries and cannot be supplied by a normal CLI job.
