@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -162,7 +162,7 @@ Commands:
   wfa compare   Ask multiple providers; sequential by default
   wfa code      Ask for complete replacement code; repository reference by default
   wfa status    Inspect a task by ID
-  wfa list      List recent tasks, refreshing detached/running states
+  wfa list      List recent tasks, refreshing detached/running states (--no-refresh skips that)
   wfa wait      Wait for a task; adopt verified results and optionally stage completed code
   wfa attach    Reattach read-only to saved task status; never resubmit
   wfa collect   Return a verified saved result; manual get requires --confirm-complete
@@ -173,6 +173,7 @@ Commands:
   wfa login     Log in to a provider through ask-bridge
   wfa browser-mode [headless|headful]  Show or save browser mode and Chrome repair status
   wfa doctor    Check Node.js, ask-bridge integration and Chrome startup repair
+  wfa unlock    Clear a task-store lock whose owner is gone (rename first, then unlink)
   wfa install-skill [--target codex|workbuddy|path]  Install web-first Skill
   wfa upstream update  Update ask-bridge using its official updater
 
@@ -258,21 +259,66 @@ function printChromeStatus(status, output = process.stdout) {
   for (const warning of status.warnings ?? []) output.write(`Chrome startup warning: ${warning}\n`);
 }
 
+// The two writes every transaction depends on, measured where the store
+// actually lives. A filter driver, an antivirus scanner or a network redirector
+// can turn each of them into 15-30 s, which is invisible until a session is
+// killed mid-write and leaves a lock behind. This is the explicit diagnostic
+// mode for that: never on the normal command path.
+async function probeStoreWrites(home) {
+  const target = path.join(home, `.write-probe-${process.pid}`);
+  const rotated = `${target}.rotated`;
+  const probe = { overwriteMs: null, renameMs: null, error: null };
+  try {
+    await mkdir(home, { recursive: true });
+    await writeFile(target, "seed");
+    let started = Date.now();
+    await writeFile(target, "again");
+    probe.overwriteMs = Date.now() - started;
+    await writeFile(rotated, "seed");
+    started = Date.now();
+    await rename(target, rotated);
+    probe.renameMs = Date.now() - started;
+  } catch (error) {
+    probe.error = error?.code ?? String(error?.message ?? error);
+  } finally {
+    await unlink(target).catch(() => {});
+    await unlink(rotated).catch(() => {});
+  }
+  return probe;
+}
+
 async function doctor(config) {
   const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
   const supported = (nodeMajor === 20 && nodeMinor >= 19)
     || (nodeMajor === 22 && nodeMinor >= 12) || nodeMajor >= 23;
   if (!supported) throw new WfaError("NODE_VERSION", `ask-bridge requires Node.js ^20.19.0, ^22.12.0 or >=23.0.0; found ${process.versions.node}.`);
+  // Say what is being checked before the two slow external probes run: an empty
+  // terminal while Chrome is being repaired reads as a hang.
+  process.stderr.write("Checking Chrome startup repair and the ask-bridge binary...\n");
   const chrome = await prepareChromeStartup({ apply: true });
   const result = await checkAskBridge(config);
   process.stdout.write(`Node.js: ${process.versions.node} OK\n`);
   process.stdout.write(`ask-bridge: ${result.version}\nBatch command: available\nData directory: ${getHomeDir()}\n`);
+  const probe = await probeStoreWrites(getHomeDir());
+  const show = (ms) => (ms === null ? "n/a" : `${ms} ms`);
+  const slow = (probe.overwriteMs ?? 0) > 2000 || (probe.renameMs ?? 0) > 2000;
+  process.stdout.write(`Store writes: ${show(probe.overwriteMs)} overwrite, ${show(probe.renameMs)} rename${probe.error ? ` (probe failed: ${probe.error})` : ""}${slow ? "  <-- SLOW" : ""}\n`);
+  if (slow) {
+    process.stdout.write("  Something is intercepting writes to the data directory. Every task transaction\n"
+      + "  pays that cost, and a run killed mid-write leaves a lock that costs the same again.\n"
+      + "  Point WFA_HOME at a directory on a fast local volume; the ledger can be copied over.\n");
+  }
   printChromeStatus(chrome);
 }
 
 export async function main(argv = process.argv.slice(2)) {
   const [command, ...rest] = argv;
   if (!command || command === "--help" || command === "help") { help(); return; }
+  if (command === "--version" || command === "-V" || command === "version") {
+    const pkg = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
+    process.stdout.write(`wfa ${pkg.version}\n`);
+    return;
+  }
   const { positional, options } = parseArgs(rest);
   if (options.help) { help(); return; }
   if (Object.prototype.hasOwnProperty.call(options, "engine")) {
@@ -335,16 +381,37 @@ export async function main(argv = process.argv.slice(2)) {
     const task = await refreshTask(taskId, { home, store });
     return printTask(task, Boolean(options.json));
   }
+  if (command === "unlock") {
+    if (positional.length || Object.keys(options).some((key) => key !== "json")) {
+      throw new WfaError("ARGUMENT_ERROR", "Usage: wfa unlock [--json]");
+    }
+    const result = await store.unlock();
+    if (options.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    else if (result.reason === "no lock file") process.stdout.write(`No task-store lock at ${result.path}. Nothing to clear.\n`);
+    else if (result.removed) {
+      process.stdout.write(`Cleared the stale task-store lock at ${result.path}${Number.isInteger(result.owner?.pid) ? ` (owner pid ${result.owner.pid} is gone)` : ""}.\n`);
+    } else {
+      process.stdout.write(`Could not clear ${result.path}: ${result.reason}.\nIf a filter driver or antivirus holds the file, point WFA_HOME at another directory; the old task ledger can be copied over.\n`);
+    }
+    return result.removed || result.reason === "no lock file" ? 0 : 1;
+  }
   if (command === "list") {
     const tasks = await listTasks({ home, store });
     const limit = Number(options.limit ?? 20);
     const selected = tasks.slice(0, limit);
-    const refreshed = await Promise.all(selected.map(async (task) => {
+    // --no-refresh was parsed but never honoured, so a read-only listing still
+    // ran up to `limit` write transactions -- each of them contending for the
+    // store lock. Refresh sequentially for the same reason: a burst of parallel
+    // refreshes is a burst of lock waiters.
+    const refreshed = [];
+    for (const task of selected) {
+      if (options["no-refresh"]) { refreshed.push(task); continue; }
       if (task.detached || task.executionPending || ["preparing", "running"].includes(task.state)) {
-        return refreshTask(task.taskId, { home, store });
+        refreshed.push(await refreshTask(task.taskId, { home, store }));
+        continue;
       }
-      return task;
-    }));
+      refreshed.push(task);
+    }
     const result = refreshed.map((task) => ({
       taskId: task.taskId, workspace: task.workspace, kind: task.kind, state: task.state,
       providers: Object.fromEntries(Object.entries(task.children).map(([key, value]) => [key, value.state])),
@@ -502,6 +569,13 @@ export async function main(argv = process.argv.slice(2)) {
     process.stderr.write("Note: --new-session is already the default. ask-bridge can still reuse an open tab; inspect any threadMismatch warning.\n");
   }
   for (const warning of repository.warnings ?? []) process.stderr.write(`Repository warning: ${warning}\n`);
+  // The repository URL and commit leave the machine and the provider may read
+  // that remote instead of the working tree, so say so before it happens rather
+  // than after an answer that describes code the user has not written yet.
+  if (repository.available && !bundleRepoMode && command !== "compare") {
+    const where = [repository.url, repository.commit].filter(Boolean).join("@");
+    process.stderr.write(`Note: sending repository reference ${where || repository.reason}; the provider may read that remote instead of your working tree. Use --no-repo to send the prompt only, or --bundle-repo=zip to send the actual sources.\n`);
+  }
   const modelByProvider = parseMap(options["model-map"], "model-map");
   const result = await executeTask({
     kind: command, prompt, providers, provider: options.provider,

@@ -45,3 +45,26 @@ test("stderr classification is scoped to the matching job ID", () => {
 test("Cloudflare challenge is separated from login and rate-limit states", () => {
   assert.equal(classifyProviderError({ error: "Cloudflare Turnstile verification required" }).errorCode, "CLOUDFLARE_BLOCKED");
 });
+
+// Windows "os error 5" while ask-bridge finalizes metadata.json: the answer is
+// already on disk. Calling that a failed job loses a finished result.
+test("a metadata write failure with a saved answer is a degraded success, not a failure", () => {
+  const degraded = classifyProviderError({
+    error: "failed to persist metadata.json: Failed to finalize metadata.json: 拒绝访问。 (os error 5)",
+    state: "failed",
+    hasResponse: true,
+  });
+  assert.equal(degraded.errorCode, "METADATA_PERSIST_FAILED");
+  assert.equal(degraded.degraded, true);
+  assert.match(degraded.recoveryHint, /do not resend/i);
+});
+
+test("the same metadata error without a saved answer stays a plain failure", () => {
+  const failed = classifyProviderError({
+    error: "failed to persist metadata.json: Failed to finalize metadata.json: (os error 5)",
+    state: "failed",
+    hasResponse: false,
+  });
+  assert.equal(failed.degraded, undefined);
+  assert.equal(failed.errorCode, "PROVIDER_ERROR");
+});

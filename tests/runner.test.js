@@ -396,3 +396,47 @@ test("a provider that failed after submitting is never retried automatically", a
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
+
+// Windows "os error 5": ask-bridge writes response.md, then fails to finalize
+// metadata.json. The job must not be recorded as a failure that throws away a
+// finished answer, and the task must not be left needing manual repair.
+test("a batch job that saved its answer but failed to persist metadata is kept as degraded", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-runner-"));
+  const store = new Store(home);
+  const config = {
+    defaultProvider: "chatgpt", defaultTimeoutSeconds: 1200, maxTimeoutSeconds: 7200,
+    maxConcurrency: 3, downloadImages: false,
+  };
+  try {
+    const result = await executeTask({
+      kind: "ask", prompt: "Explain the patch", providers: ["chatgpt"], workspace: "degraded-demo",
+      timeoutSeconds: 1200, requestId: "degraded-001",
+    }, {
+      home, store, config, skipPreflight: true,
+      runProcess: async (_command, args, options) => {
+        await options.onSpawn?.(999999);
+        const jobs = (await readFile(argAfter(args, "--input"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+        const outputDir = argAfter(args, "--output-dir");
+        for (const job of jobs) {
+          const jobDir = path.join(outputDir, job.id);
+          await mkdir(jobDir, { recursive: true });
+          await writeFile(path.join(jobDir, "response.md"), "The answer that almost got lost");
+          await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({
+            id: job.id, provider: job.provider, state: "failed",
+            error: "failed to persist metadata.json: Failed to finalize metadata.json: 拒绝访问。 (os error 5)",
+            threadUrl: "https://chatgpt.com/c/degraded",
+          }));
+        }
+        return { code: 1, signal: null, stdout: "Completed: 0", stderr: "", spawnError: null };
+      },
+    });
+    const child = result.task.children.chatgpt;
+    assert.equal(child.state, "completed");
+    assert.equal(child.errorCode, "METADATA_PERSIST_FAILED");
+    assert.equal(child.degradedReason, "METADATA_PERSIST_FAILED");
+    assert.match(child.resultPath ?? "", /response\.md$/);
+    assert.equal(await readFile(child.resultPath, "utf8"), "The answer that almost got lost");
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
