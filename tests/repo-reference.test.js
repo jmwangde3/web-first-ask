@@ -230,3 +230,24 @@ test("silent in-progress batch becomes stalled rather than completed or retryabl
   assert.ok(result.task.children.chatgpt.stall.silentSeconds >= 1);
   assert.ok(workspaceHasBlockingTask((await store.snapshot()).tasks.tasks, "stall-example", ["chatgpt"]));
 }));
+
+test("zip bundles are a repository payload, so they get no remote reference and no sentinel check", async () => fixture(async ({ root, home }) => {
+  const store = new PolicyStore(home);
+  const result = await executeTask({
+    prompt: "Explain the attached sources", provider: "chatgpt", workspace: "zip", workspaceRoot: root,
+    bundleRepo: true, bundleRepoMode: "zip",
+  }, { home, store, config, skipPreflight: true, runProcess: async (cmd, args, opts) => {
+    const job = JSON.parse((await readFile(argAfter(args, "--input"), "utf8")).trim());
+    assert.match(job.prompt, /REPOSITORY ARCHIVE/);
+    assert.doesNotMatch(job.prompt, /^REPOSITORY\nURL:/m);
+    assert.equal(job.files.length, 1);
+    assert.ok(job.files[0].endsWith(".zip"));
+    // The provider answers with the sentinel anyway; the archive already told
+    // it not to fetch, so this must not be classified as an unreadable repo.
+    return successfulBatch("REPO_UNREADABLE", () => "https://chatgpt.com/c/zip")(cmd, args, opts);
+  } });
+  assert.equal(result.task.repoReference, null);
+  assert.equal(result.task.bundleRepo, true);
+  assert.notEqual(result.task.children.chatgpt.repoUnreadable, true);
+  assert.equal(result.task.children.chatgpt.state, "completed");
+}));

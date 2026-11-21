@@ -105,12 +105,21 @@ function relevantSessionFingerprint(sessionMap, providers, fresh) {
   return Object.fromEntries(providers.map((provider) => [provider, fresh ? null : (sessionMap[provider] ?? null)]));
 }
 
-async function buildSensitiveFindings({ promptByProvider, files, images, briefText }) {
+async function buildSensitiveFindings({ promptByProvider, files, images, briefText, archiveScan }) {
   const findings = [];
   const unscannedAttachments = [];
   for (const [provider, prompt] of Object.entries(promptByProvider)) findings.push(...scanSensitiveText(prompt, `prompt:${provider}`));
   if (briefText) findings.push(...scanSensitiveText(briefText, "brief"));
+  findings.push(...(archiveScan?.findings ?? []));
   for (const filePath of files) {
+    // Archive entries were scanned while they were packed, so the zip itself is
+    // not an opaque blob any more. Report only the entries that stayed binary.
+    if (archiveScan?.file && path.resolve(filePath) === path.resolve(archiveScan.file)) {
+      const missed = archiveScan.totalFiles - archiveScan.scannedFiles;
+      if (missed > 0) unscannedAttachments.push({ path: filePath,
+        reason: `${missed} non-text entr${missed === 1 ? "y" : "ies"} inside the archive were not inspected by the text secret scanner` });
+      continue;
+    }
     if (isSensitiveAttachmentPath(filePath)) findings.push({ source: filePath, line: 1, kind: "sensitive_filename" });
     const text = await readTextForScan(filePath);
     if (text !== null) findings.push(...scanSensitiveText(text, filePath));
@@ -231,6 +240,7 @@ export async function executeTask(input, dependencies = {}) {
   const promptByProvider = withGeminiInline(basePrompts, geminiInlineBody, geminiInline);
   const sessionFingerprint = relevantSessionFingerprint(sessionMap, providers, Boolean(input.fresh));
   const sensitiveScan = await buildSensitiveFindings({ promptByProvider, files, images,
+    archiveScan: input.archiveScan,
     briefText: Object.values(basePrompts).some((value) => value !== input.prompt) ? briefText : "" });
   const sensitiveFindings = sensitiveScan.findings;
   const unscannedAttachments = sensitiveScan.unscannedAttachments;
@@ -248,7 +258,9 @@ export async function executeTask(input, dependencies = {}) {
     exceedsThreshold: promptRiskProviders.length > 0,
     providers: promptRiskProviders,
     promptBytesByProvider,
-    splitPlan: splitAttachmentFiles(attachmentStats, PROMPT_SIZE_WARN_BYTES),
+    // Archives upload natively and are never inlined, so including one in the
+    // "forced inline fallback" plan would describe a split that cannot happen.
+    splitPlan: splitAttachmentFiles(attachmentStats.filter((item) => !isArchiveAttachment(item.filePath)), PROMPT_SIZE_WARN_BYTES),
     splitPlanNote: "Reference grouping only. Attachments upload natively and are not cut at 40 KiB; these groups describe what a forced inline fallback would look like. Prompt text is never split automatically.",
     message: promptRiskProviders.length
       ? `Prompt text exceeds ${PROMPT_SIZE_WARN_BYTES / 1024} KiB for: ${promptRiskProviders.join(", ")}. ask-bridge can truncate long prompt text around 44 KiB, so the provider may answer from a partial prompt. Attachments are unaffected because they travel outside the prompt.`

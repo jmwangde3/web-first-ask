@@ -159,3 +159,50 @@ function dryRunCliWithFiles(home, paths) {
   for (const filePath of paths) args.push("--file", filePath);
   return dryRunCli(home, args);
 }
+
+test("--bundle-repo=zip previews a native attachment, keeps it out of the split plan, and scans inside it", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { mkdir } = await import("node:fs/promises");
+  const root = await mkdtemp(path.join(os.tmpdir(), "wfa-zip-preview-"));
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-zip-preview-home-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8", windowsHide: true });
+  const preview = () => {
+    const run = spawnSync(process.execPath, [bin, "ask", "--provider", "chatgpt", "--bundle-repo=zip",
+      "--prompt", "review the sources", "--dry-run"], {
+      cwd: root, env: { ...process.env, WFA_HOME: home }, encoding: "utf8",
+    });
+    return { status: run.status, stderr: run.stderr, preview: run.stdout ? JSON.parse(run.stdout) : null };
+  };
+  try {
+    git("init", "-q");
+    git("config", "user.email", "t@example.test");
+    git("config", "user.name", "T");
+    await mkdir(path.join(root, "src"), { recursive: true });
+    await writeFile(path.join(root, "src", "a.js"), "export const a = 1;\n");
+    await writeFile(path.join(root, "src", "b.js"), "export const b = 2;\n");
+    git("add", ".");
+    git("commit", "-qm", "init");
+    git("remote", "add", "origin", "git@github.com:test-org/zip-preview.git");
+
+    const clean = preview();
+    assert.equal(clean.status, 0, clean.stderr);
+    assert.equal(clean.preview.blocked, false);
+    assert.equal(clean.preview.actualAttachmentCount, 1);
+    assert.equal(clean.preview.repositoryArchive.files, 2);
+    assert.deepEqual(clean.preview.promptSizeRisk.splitPlan, []);
+    assert.deepEqual(clean.preview.unscannedAttachments, []);
+
+    await writeFile(path.join(root, "src", "config.js"), 'export const api_key = "' + "abcdefghijklmnop" + '";\n');
+    git("add", ".");
+    git("commit", "-qm", "config");
+    const risky = preview();
+    assert.equal(risky.status, 2, risky.stderr);
+    assert.equal(risky.preview.blocked, true);
+    assert.ok(risky.preview.blockReasons.includes("SENSITIVE_CONTENT_DETECTED"));
+    assert.ok(risky.preview.sensitiveFindings.some((finding) =>
+      finding.source === "src/config.js" && finding.kind === "secret_assignment"));
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});

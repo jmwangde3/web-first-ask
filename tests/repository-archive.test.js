@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { inflateRawSync } from "node:zlib";
 import os from "node:os";
 import path from "node:path";
@@ -170,4 +170,53 @@ test("archive attachments are recognised so Gemini accepts them natively", () =>
     timeoutSeconds: 60,
     files: [path.join(os.tmpdir(), "report.pdf")],
   }), /GEMINI_ATTACHMENT_UNSUPPORTED|Gemini document attachments/);
+});
+
+test("two archives of the same repository in the same second do not collide", async () => {
+  await withRepo(async ({ root, out }) => {
+    const first = await archiveRepository({ cwd: root, outDir: out });
+    const second = await archiveRepository({ cwd: root, outDir: out });
+    assert.notEqual(first.file, second.file);
+    assert.ok((await readFile(first.file)).length > 0);
+    assert.ok((await readFile(second.file)).length > 0);
+  });
+});
+
+test("secret-shaped source lines are reported, not shipped as an unscanned blob", async () => {
+  await withRepo(async ({ root, out }) => {
+    await writeFile(path.join(root, "src", "config.js"), 'export const api_key = "' + "abcdefghijklmnop" + '";\n');
+    git(root, "add", "src/config.js");
+    git(root, "commit", "-q", "-m", "config");
+    const result = await archiveRepository({ cwd: root, outDir: out });
+    assert.equal(result.scannedFiles, result.stats.files);
+    assert.ok(result.secretFindings.some((finding) =>
+      finding.source === "src/config.js" && finding.kind === "secret_assignment"));
+  });
+});
+
+test("pruning keeps a fresh archive that may still be uploading", async () => {
+  await withRepo(async ({ root, out }) => {
+    const first = await archiveRepository({ cwd: root, outDir: out, keepArchives: 1 });
+    const second = await archiveRepository({ cwd: root, outDir: out, keepArchives: 1 });
+    await readFile(first.file);
+    await readFile(second.file);
+    // Once the old one is past the protected window, the count wins again.
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    await utimes(first.file, old, old);
+    await archiveRepository({ cwd: root, outDir: out, keepArchives: 1 });
+    await assert.rejects(() => readFile(first.file), /ENOENT/);
+  });
+});
+
+test("the archive block admits a dirty working tree instead of claiming the commit", async () => {
+  await withRepo(async ({ root, out }) => {
+    const result = await archiveRepository({ cwd: root, outDir: out });
+    const clean = repositoryArchiveBlock(result, { commit: "abc123", branch: "main" });
+    assert.doesNotMatch(clean, /uncommitted changes/);
+    const dirty = repositoryArchiveBlock(result, {
+      commit: "abc123", branch: "main", dirty: true, dirtyFiles: ["src/a.js"],
+    });
+    assert.match(dirty, /uncommitted changes/);
+    assert.match(dirty, /1 file\(s\)/);
+  });
 });

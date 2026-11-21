@@ -55,8 +55,12 @@ export async function executeTask(input, dependencies = {}) {
   if (bundle) prompt += `\n\n${bundle.content}\nEND SOURCE BUNDLE`;
   if (archive) prompt += `\n\n${repositoryArchiveBlock(archive, repository)}\n`;
   const store = dependencies.store instanceof PolicyStore ? dependencies.store : new PolicyStore(dependencies.home);
+  // `bundleRepo` means "a repository payload was shipped", not "it was inlined".
+  // Leaving it false for the zip transport made the task claim a remote
+  // reference and run the REPO_UNREADABLE sentinel against an archive the
+  // prompt had already told the provider not to fetch.
   store.intent = { sessionPolicy, followupTaskId: input.followupTaskId ?? null,
-    stallTimeoutSeconds, repository, bundleRepo: Boolean(bundle) };
+    stallTimeoutSeconds, repository, bundleRepo: Boolean(bundle) || Boolean(archive) };
   store.allowUnreadableFollowup = null;
   if (input.followupTaskId) {
     const snapshot = await store.snapshot();
@@ -73,6 +77,14 @@ export async function executeTask(input, dependencies = {}) {
       noBrief: Boolean(input.noBrief || (repository.available && !input.briefFile)),
       files: bundle ? [] : (archive ? [...(input.files ?? []), archive.file] : input.files),
       bundleLines: bundle || archive ? false : input.bundleLines,
+      // Zip entries are scanned while they are packed; hand the findings to the
+      // same gate the inline bundle goes through.
+      archiveScan: archive ? {
+        file: archive.file,
+        findings: archive.secretFindings ?? [],
+        scannedFiles: archive.scannedFiles ?? 0,
+        totalFiles: archive.stats.files,
+      } : null,
       sequentialBatches: true,
     }, {
       ...dependencies, store,

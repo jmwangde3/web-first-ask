@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { randomBytes } from "node:crypto";
+import { promisify, TextDecoder } from "node:util";
 import { lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { crc32, deflateRawSync } from "node:zlib";
 import { WfaError } from "./errors.js";
+import { scanSensitiveText } from "./bundle.js";
 
 const exec = promisify(execFile);
 
@@ -14,13 +16,29 @@ const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", 
 const SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|7z|rar|exe|dll|so|dylib|class|pyc|woff2?|ttf|otf|mp[34]|avi|mov|sqlite|db|bin|dat|lock)$/i;
 const SENSITIVE = /(?:^|\/)(?:\.env(?:\.|$)|\.npmrc|\.netrc|id_rsa|id_ed25519|credentials|secrets\.json|service-account\.json|[^/]*\.(?:pem|key|p12|pfx|keystore))/i;
 const MAX_ENTRIES = 60000;
-const MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024;
+// The archive is an attachment, so the attachment ceiling is the real limit.
+// Failing here names the actual problem; the upload would otherwise reject the
+// file after the task was created.
+const MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
+// An archive younger than this may still be uploading. Pruning by count alone
+// could delete the file a live task is about to send.
+const PRUNE_MIN_AGE_MS = 10 * 60 * 1000;
 
 async function git(cwd, ...args) {
   const { stdout } = await exec("git", args, {
     cwd, windowsHide: true, timeout: 10000, encoding: "buffer", maxBuffer: 64 * 1024 * 1024,
   });
   return Buffer.from(stdout).toString("utf8").trimEnd();
+}
+
+// The archive is a transport, not an exemption: the inline bundle's text is
+// scanned for secrets, so its zipped equivalent is scanned here. Binary entries
+// are skipped and reported as unscanned instead of silently passing.
+function scanEntry(name, data) {
+  if (data.includes(0)) return null;
+  let text;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(data); } catch { return null; }
+  return scanSensitiveText(text, name);
 }
 
 function matchesExclude(file, patterns) {
@@ -117,7 +135,7 @@ export function buildZip(entries) {
   return Buffer.concat([...local, ...central, end]);
 }
 
-async function pruneArchives(directory, keep) {
+async function pruneArchives(directory, keep, now = Date.now()) {
   const names = await readdir(directory).catch(() => []);
   const archives = [];
   for (const name of names) {
@@ -126,7 +144,8 @@ async function pruneArchives(directory, keep) {
     if (info?.isFile()) archives.push({ name, mtime: info.mtimeMs });
   }
   archives.sort((a, b) => b.mtime - a.mtime);
-  for (const stale of archives.slice(keep)) await rm(path.join(directory, stale.name), { force: true }).catch(() => {});
+  const stale = archives.slice(keep).filter((item) => now - item.mtime > PRUNE_MIN_AGE_MS);
+  for (const item of stale) await rm(path.join(directory, item.name), { force: true }).catch(() => {});
 }
 
 export async function archiveRepository({ cwd = process.cwd(), excludes = [], outDir, prompt = "",
@@ -145,6 +164,8 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
     else rest.push(relative);
   }
   const entries = [];
+  const secretFindings = [];
+  let scannedFiles = 0;
   let totalBytes = 0;
   let uncompressed = 0;
   for (const relative of [...mentioned, ...rest]) {
@@ -161,6 +182,8 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
     const data = await readFile(absolute).catch(() => null);
     if (!data) { skipped.push({ path: relative, reason: "unreadable" }); continue; }
     entries.push({ name: relative.replace(/\\/g, "/"), data });
+    const scan = scanEntry(relative, data);
+    if (scan) { secretFindings.push(...scan); scannedFiles += 1; }
     totalBytes += data.length;
     if (entries.length > MAX_ENTRIES) throw new WfaError("BUNDLE_REPO_TOO_LARGE", `--bundle-repo=zip selected more than ${MAX_ENTRIES} files. Narrow it with --file or --exclude.`);
   }
@@ -169,16 +192,23 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
   }
   uncompressed = totalBytes;
   const zip = buildZip(entries);
-  if (zip.length > MAX_ARCHIVE_BYTES) throw new WfaError("BUNDLE_REPO_TOO_LARGE", "--bundle-repo=zip produced an archive over 4 GiB.");
+  if (zip.length > MAX_ARCHIVE_BYTES) {
+    throw new WfaError("BUNDLE_REPO_TOO_LARGE", `--bundle-repo=zip produced an archive of ${(zip.length / 1024 / 1024).toFixed(1)} MiB, over the 50 MiB attachment limit. Narrow it with --exclude or --file.`);
+  }
   const directory = outDir ?? path.join(process.cwd(), ".wfa");
   await mkdir(directory, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+  // Milliseconds plus a random suffix: two archives of the same repository in
+  // the same second must not overwrite each other, because the first may still
+  // be uploading.
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 23);
   const slug = path.basename(root).replace(/[^A-Za-z0-9._-]/g, "_") || "repo";
-  const file = path.join(directory, `${slug}-${stamp}.zip`);
+  const file = path.join(directory, `${slug}-${stamp}-${randomBytes(2).toString("hex")}.zip`);
   await writeFile(file, zip);
   await pruneArchives(directory, keepArchives);
   return {
     file,
+    secretFindings,
+    scannedFiles,
     stats: {
       files: entries.length,
       listed: selected.length,
@@ -195,9 +225,16 @@ export function repositoryArchiveBlock(archive, repository) {
   const name = path.basename(archive.file);
   const commit = repository?.commit ? ` at commit ${repository.commit}` : "";
   const branch = repository?.branch ? ` (branch ${repository.branch})` : "";
+  // The archive is packed from the working tree, not from the commit object.
+  // Saying only "at commit X" would let the provider treat uncommitted work as
+  // the pushed state, which is the same mistake the repository reference warns
+  // about.
+  const dirty = repository?.dirty
+    ? ` The working tree had uncommitted changes when it was packed (${repository.dirtyFiles?.length ?? "some"} file(s)), so individual files may differ from that commit.`
+    : "";
   return [
     "REPOSITORY ARCHIVE",
-    `The attached file ${name} is a zip of this repository's tracked sources${commit}${branch}.`,
+    `The attached file ${name} is a zip of this repository's tracked sources${commit}${branch}.${dirty}`,
     `It holds ${archive.stats.files} file(s), ${archive.stats.sourceBytes} bytes uncompressed. Paths inside the archive are repository-relative.`,
     "Extract it and read the files you need from there. Do not wait for pasted files and do not try to fetch the repository over the network.",
     "If a path you need is missing from the archive, name that exact path instead of guessing what it contains.",
