@@ -25,7 +25,28 @@ test("ordinary prose and code are not flagged", () => {
     "```",
     "See https://example.com/docs for details.",
   ].join("\n");
-  assert.deepEqual(inspectResponseHeuristics(text), { canvasStub: false, latexEscaping: false, reasons: [] });
+  assert.deepEqual(inspectResponseHeuristics(text), { canvasStub: false, latexEscaping: false, attachmentUnreadable: false, reasons: [] });
+});
+
+test("a completed answer that admits it cannot open the attachment is flagged", () => {
+  // Verbatim from a Gemini run against a --bundle-repo=zip archive: ask-bridge
+  // reported completed, the answer used nothing from the archive.
+  const text = "当前会话环境中没有可用的文件解压或本地文件读取工具，因此无法直接解压 `WorkDadd-8b74e957.zip`，此处不编造未经核对的代码块与行号。";
+  const result = inspectResponseHeuristics(text);
+  assert.equal(result.attachmentUnreadable, true);
+  assert.equal(result.reasons.length, 1);
+  assert.match(result.reasons[0], /attachment could not be read/i);
+});
+
+test("the English form of the same refusal is flagged", () => {
+  const result = inspectResponseHeuristics("I am unable to extract the attached archive, so I cannot review those files.");
+  assert.equal(result.attachmentUnreadable, true);
+});
+
+test("talking about attachments without refusing them is not flagged", () => {
+  const result = inspectResponseHeuristics("I read the attached archive and changed three files.");
+  assert.equal(result.attachmentUnreadable, false);
+  assert.deepEqual(result.reasons, []);
 });
 
 test("a fresh request that returns the previous conversation URL is flagged", () => {

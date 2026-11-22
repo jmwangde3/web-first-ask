@@ -13,6 +13,11 @@ const PROVIDERS = new Set(["chatgpt", "gemini", "claude"]);
 // would be worse than telling the caller to ask again.
 const CANVAS_STUB_MAX_CHARS = 400;
 const LATEX_ESCAPE_PATTERN = /\\vert\{\}|\\lbrace(?:\{\}|)|\\rbrace(?:\{\}|)|\\textbackslash/;
+// Measured 2026-11-22: a Gemini answer to a `--bundle-repo=zip` request
+// completed with "当前会话环境中没有可用的文件解压或本地文件读取工具" and produced no
+// code at all. wfa called that completed, so the run looked successful.
+const ATTACHMENT_REFUSAL_CN = /(?:没有|缺少|无法|不能|不具备)[^\n]{0,26}(?:解压|解包|解压缩|读取本地|访问本地|下载附件|打开附件)/i;
+const ATTACHMENT_REFUSAL_EN = /(?:unable|can'?t|cannot|could ?not|no (?:tool|way|ability))[^\n]{0,40}(?:extract|unzip|decompress|open|read|download)[^\n]{0,24}(?:attach|archive|zip|uploaded)/i;
 
 export function inspectResponseHeuristics(responseText) {
   const text = String(responseText ?? "");
@@ -29,7 +34,13 @@ export function inspectResponseHeuristics(responseText) {
   const reasons = [];
   if (canvasStub) reasons.push("Short response points at a downloadable artifact instead of containing the answer; the body is probably in Canvas.");
   if (latexEscaping) reasons.push("Response contains LaTeX-escaped sequences; code and diffs in it may be corrupted.");
-  return { canvasStub, latexEscaping, reasons };
+  // Providers finish "completed" after admitting they cannot open an uploaded
+  // archive, which reads as success while containing no use of the attachment.
+  const attachmentUnreadable = ATTACHMENT_REFUSAL_CN.test(text) || ATTACHMENT_REFUSAL_EN.test(text);
+  if (attachmentUnreadable) {
+    reasons.push("The answer says the attachment could not be read or extracted, so the attached files were probably not used. Send what it needs as text, or point it at a URL it can reach.");
+  }
+  return { canvasStub, latexEscaping, attachmentUnreadable, reasons };
 }
 
 function sameFileVersion(before, after) {

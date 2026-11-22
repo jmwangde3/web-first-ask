@@ -1,5 +1,13 @@
 export const PROVIDERS = Object.freeze(["chatgpt", "gemini", "claude"]);
 
+// ask-bridge writes nothing at all while a page generates — no progress line and
+// no metadata update — so the watchdog only sees silence. Five minutes sits
+// inside the normal range for a few hundred lines of code, which made wfa kill
+// healthy long answers and lose them. Fifteen minutes with the browser-log veto
+// in runner-stall leaves room for a real generation and still recovers a dead
+// tab long before --timeout.
+export const DEFAULT_STALL_TIMEOUT_SECONDS = 900;
+
 export const BLOCKING_STATES = new Set([
   "queued",
   "running",

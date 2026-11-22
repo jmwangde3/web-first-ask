@@ -3,6 +3,8 @@ import path from "node:path";
 import { Store } from "./store.js";
 import { matchRepoUnreadable, repositoryFallbackCommand } from "./repository.js";
 import { summarizeTask, workspaceSessions } from "./state.js";
+import { browserIdleMs, browserStillWorking } from "./stall-watch.js";
+import { chromeLogPath } from "./ask-bridge.js";
 
 async function detectDetachedStall(task) {
   // A serial worker has its own guarded per-job watchdog; killing the worker
@@ -39,6 +41,10 @@ async function detectDetachedStall(task) {
     }
   }
   if (!Object.keys(evidence).length) return null;
+  // Same veto as the per-job watchdog: the batch log staying quiet proves
+  // nothing while ask-bridge's browser log is still being written.
+  const idleMs = await browserIdleMs(chromeLogPath());
+  if (browserStillWorking(idleMs)) return null;
   if (task.childPid !== process.pid) {
     try { process.kill(task.childPid, "SIGTERM"); } catch {}
   }
@@ -131,7 +137,7 @@ export class PolicyStore extends Store {
           if (stall && child.state !== "completed" && child.state !== "repo_unreadable" && child.state !== "abandoned") {
             child.state = "stalled";
             child.stall = stall;
-            child.error = `No progress line or metadata update for ${stall.silentSeconds} seconds. Submission may have occurred.`;
+            child.error = `No progress line or metadata update for ${stall.silentSeconds} seconds, and ask-bridge's browser log was silent for the same period. Submission may have occurred; check the conversation before resending. A long generation looks identical from here, so raise --stall-timeout if the answer was still being written.`;
             child.recoveryHint = `Run wfa collect ${id} --provider ${provider} or wfa resolve ${id} --provider ${provider} --confirm after checking the browser.`;
             changed = true;
           } else if (child.repoUnreadable && child.state === "completed") {

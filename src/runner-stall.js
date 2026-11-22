@@ -6,7 +6,8 @@ import { isPidAlive, owningProcessAlive } from "./util.js";
 import { readBatchMetadata } from "./metadata.js";
 import { classifyProviderError } from "./provider-errors.js";
 import { detectSessionIsolationWarning, rememberSession, summarizeTask } from "./state.js";
-import { createStallWatch } from "./stall-watch.js";
+import { createStallWatch, browserIdleMs, browserStillWorking } from "./stall-watch.js";
+import { chromeLogPath } from "./ask-bridge.js";
 
 function stateFromProviderError(state, classified) {
   if (state !== "failed" && state !== "failed_before_start") return state;
@@ -42,13 +43,36 @@ export async function guardedBatch(run, command, args, options, store, timeoutSe
   let pid = null;
   let stalled = null;
   let stopped = false;
+  let vetoed = false;
+  let lastBeatAt = Date.now();
+  const browserLog = chromeLogPath();
   let resolveFallback;
   let afterKillTimer = null;
   const fallback = new Promise((resolve) => { resolveFallback = resolve; });
   const tick = async () => {
     if (stopped || stalled) return;
+    if (Date.now() - lastBeatAt >= (options.heartbeatMs ?? 60000)) {
+      lastBeatAt = Date.now();
+      const active = watch.snapshot().filter((item) => item.active);
+      if (active.length) {
+        options.onStdoutLine?.(`[wfa] still waiting: ${active.map((item) => `${item.provider} quiet ${item.idleSeconds}s`).join(", ")} (stall limit ${timeoutSeconds}s). ask-bridge prints nothing while a page generates; if this line stops appearing, the run is gone.`);
+      }
+    }
     const evidence = await watch.check();
     if (!evidence || stopped) return;
+    // ask-bridge emits no stdout and no metadata update while a page generates,
+    // so silence alone is not a stall: a 400-line answer looks exactly like a
+    // hung tab for five minutes. Check the browser log, which ask-bridge appends
+    // to on every tool call, before killing work that may be nearly done.
+    const idleMs = await browserIdleMs(browserLog);
+    if (browserStillWorking(idleMs)) {
+      if (!vetoed) {
+        vetoed = true;
+        const provider = Object.keys(evidence)[0];
+        options.onStdoutLine?.(`[wfa] ${provider} has produced no output for ${evidence[provider].silentSeconds}s, but ask-bridge's browser log moved ${Math.round(idleMs / 1000)}s ago; still waiting instead of treating it as a stall`);
+      }
+      return;
+    }
     stalled = evidence;
     store.stalls?.set(taskId, { ...(store.stalls.get(taskId) ?? {}), ...evidence });
     controller.abort();

@@ -12,6 +12,7 @@ import { collectTask, listTasks, abandonProvider, waitForTask } from "./recovery
 import { checkAskBridge, prepareChromeStartup, resolveAskBridge, runProcess } from "./ask-bridge.js";
 import { buildCodePrompt, buildComparePrompt } from "./prompts.js";
 import { normalizeProviders } from "./jobs.js";
+import { DEFAULT_STALL_TIMEOUT_SECONDS } from "./constants.js";
 import { WfaError } from "./errors.js";
 import { updateAskBridge } from "./maintenance.js";
 import { truncate } from "./util.js";
@@ -197,7 +198,7 @@ Common options:
   --image <path|glob>  Repeatable image attachment (not supported by Gemini)
   --exclude <glob>     Repeatable source or repository bundle exclusions
   --timeout <seconds>  Default 1200; maximum 7200
-  --stall-timeout <s>  Default 300; 0 disables inactivity watchdog
+  --stall-timeout <s>  Default 900; 0 disables inactivity watchdog
   --concurrency <N>    Jobs in flight (1..3); default 1, using separate batches
 
   --model <name>       Single-provider request only; add --provider
@@ -611,7 +612,7 @@ export async function main(argv = process.argv.slice(2)) {
     geminiMode,
     briefFile: options["brief-file"], noBrief: Boolean(options["no-brief"]),
     followupTaskId: options.followup, continueSession: Boolean(options["continue-session"]),
-    stallTimeoutSeconds: options["stall-timeout"] === undefined ? 300 : Number(options["stall-timeout"]),
+    stallTimeoutSeconds: options["stall-timeout"] === undefined ? DEFAULT_STALL_TIMEOUT_SECONDS : Number(options["stall-timeout"]),
     detach: Boolean(options.detach), mode,
     timeoutSeconds: options.timeout ? Number(options.timeout) : config.defaultTimeoutSeconds,
     concurrency: options.concurrency ? Number(options.concurrency) : undefined,

@@ -12,6 +12,13 @@ function chromeConfigDir(env = process.env) {
   return env.ASK_BRIDGE_CONFIG_DIR || path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "ask-bridge");
 }
 
+// ask-bridge appends to this log on every tool call, so its mtime is the only
+// per-second evidence that the browser is still working. wfa's own batch output
+// says nothing while a page generates.
+export function chromeLogPath(env = process.env) {
+  return env.ASK_BRIDGE_BROWSER_LOG || path.join(chromeConfigDir(env), "chrome-devtools-mcp.log");
+}
+
 async function findPreferences(root) {
   const result = [];
   const queue = [{ dir: root, depth: 0 }];

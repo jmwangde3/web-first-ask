@@ -206,3 +206,17 @@ test("--bundle-repo=zip previews a native attachment, keeps it out of the split 
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
+
+test("the inactivity watchdog waits 15 minutes by default, and can still be narrowed", async () => {
+  await withHome("wfa-defaults-stall-", async (home) => {
+    const wide = dryRunCli(home, ["ask", "--prompt", "x", "--dry-run"]);
+    assert.equal(wide.status, 0, wide.stderr);
+    // Five minutes is inside the normal range for a few hundred lines of code,
+    // and ask-bridge prints nothing while a page generates.
+    assert.equal(wide.preview.stallTimeoutSeconds, 900);
+
+    const explicit = dryRunCli(home, ["ask", "--prompt", "x", "--stall-timeout", "120", "--dry-run"]);
+    assert.equal(explicit.status, 0, explicit.stderr);
+    assert.equal(explicit.preview.stallTimeoutSeconds, 120);
+  });
+});

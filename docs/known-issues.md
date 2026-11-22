@@ -23,6 +23,9 @@
 | U13 | 自动把工作区 git remote 注入 `repoReference` | 严重 | 0.2.8：发送前打印被注入的 `url@commit`；默认仍注入，`--no-repo` 关闭 |
 | U14 | 写 `metadata.json` 报 `os error 5`，任务被判 failed | 严重 | 0.2.8：`response.md` 存在时记 `completed` + `degradedReason`，不再丢答案 |
 | U15 | `mkdir` 数据家目录报 `EPERM` | 严重 | 0.2.8：目录已存在即视为成功，真权限问题留到 `open` |
+| U16 | 长生成被判 `stalled` 并杀进程：ask-bridge 生成期间不产进度行、不更新 metadata | 阻断 | 0.2.9：浏览器日志仍在写就不杀；默认阈值 300 → 900 s |
+| U17 | 批次运行期 CLI 全程静默，无法区分「在等 provider」与「进程已死」 | 严重 | 0.2.9：每 60 s 打一行 `[wfa] still waiting` |
+| U18 | 附件打不开时 provider 仍以 `completed` 收敛，产出为零 | 严重 | 0.2.9：识别「无法解压/读取附件」并警告 |
 
 ---
 
@@ -356,7 +359,27 @@ wfa: EPERM: operation not permitted, mkdir 'C:\Users\<user>\AppData\Local\web-fi
 
 ---
 
-## wfa 0.2.8 修复与实测（2026-11-22 02:20）
+## U16 长生成被判 `stalled` 并杀进程（2026-11-22 04:05 复现，0.2.9 已修）
+
+**现象**：`wfa code` 让 Gemini 输出约 300–400 行 C#，第 300 秒报 `gemini: stalled` / `PROVIDER_ERROR`，同秒 batch 收到 `Shutting down (stdin end)`，生成被中断；随后 `wfa collect` 只得到 `No trusted ask-bridge completed metadata`。
+
+**根因**：`stall-watch` 的存活证据只有两种——含 job id 的进度行、`metadata.json` 的 mtime。ask-bridge 在**等待模型生成**期间两者都不产生，只有结束才写。于是「合法但较长」的生成与「页面卡死」在 wfa 眼里完全一致，5 分钟阈值直接切在正常区间的中间。
+
+**已修**：`runner-stall` 与 `policy-store` 的 detached 判定共用同一否决——判定 stall 前看 ask-bridge 的 `chrome-devtools-mcp.log` mtime，120 秒内有写入就认为浏览器还在被驱动，只打一行说明并继续等（窗口固定，不随 `--stall-timeout` 放大；生成期该日志约每 200 ms 写一次）。默认阈值同时提到 900 s 作为兜底。日志文件不存在时维持原行为（只有静默证据）。
+
+## U17 批次运行期 CLI 全程静默（2026-11-22 03:32 复现，0.2.9 已修）
+
+**现象**：`wfa code` 后台跑 10 分钟，`--json` 输出文件始终 0 字节，调用方的后台任务登记还丢了句柄；只能靠 `.store.lock` 里的 pid 加 `tasklist` 判活。
+
+**已修**：`guardedBatch` 每 60 s 通过进度通道打一行 `[wfa] still waiting: gemini quiet 240s (stall limit 900s)`。合成行不进 `batch.stdout.log`、不含 job id，因此不会被当成 provider 进度、也不会重置自身的静默计时。反过来用：这行停了，就说明进程没了。
+
+## U18 附件打不开仍按 `completed` 收敛（2026-11-22 03:56 复现，0.2.9 已修）
+
+**现象**：`--bundle-repo=zip` 跟发后 `state: completed`，但正文是「当前会话环境中没有可用的文件解压或本地文件读取工具……此处不编造未经核对的代码块」，零可用产出。
+
+**已修**：`inspectResponseHeuristics` 增加附件拒绝特征（中英），命中时在 `wfa code` 与 `wfa status` 都打警告，说明附件很可能没被使用、该改发文本或给可达 URL。仍是 `completed` —— 任务确实完成，只是产出没用上附件，所以用警告而不是假造一个新的失败态。
+
+
 
 U11–U15 里只有 U14 的一半在 ask-bridge 侧，其余都在 wfa 或本机守卫，已在 0.2.8 处理。
 
@@ -396,6 +419,25 @@ U11–U15 里只有 U14 的一半在 ask-bridge 侧，其余都在 wfa 或本机
 - 全套 `node --test tests` 通过（本地 Windows，含上述竞态用例）。
 
 以上第 2、4、5、6 条来自 ask-bridge 侧评审（ChatGPT 读本仓 zip 后给出），其中「rename 自动接管不安全」的 ABA 反例成立，最终实现改成 claim + 代次复验。
+
+---
+
+## 对外部记录 WFA-01…08 的复核（2026-11-22 09:40，wfa 0.2.9）
+
+另一个会话在 0.2.7 上留了一份故障记录。逐条复跑后的结论：
+
+| 编号 | 结论 | 依据 |
+| --- | --- | --- |
+| WFA-01 sandbox-center 杀 node | 环境问题，不属 wfa | 本轮 `doctor`、`code --dry-run` 均正常，未出现无输出 |
+| WFA-02 锁永久死锁，home 报废 | 0.2.7 现象；0.2.9 自愈 | 伪造一份死 pid 的 `.store.lock`，0.27 s 内完成接管与写入。只有宿主守卫同时拦住 rename 与 unlink 时才留 `STORE_LOCK_UNRECLAIMABLE` |
+| WFA-03 `code --dry-run` 静默挂起 | 0.2.9 未复现 | 同一仓库同一参数 0.47 s 返回完整 preview。当时 5 s 的 `git` 超时只是被瞬时写过滤器拖慢的表象，不是判定 bug |
+| WFA-04 safe-delete 守卫自锁 | 外来守卫，非 wfa | 报错与副作用不一致（报失败但已改名）；wfa 侧只能靠 U12 的接管路径绕开 |
+| WFA-05 `NODE_OPTIONS` shim 干扰 | 未证实，未复现 | 清空与不清空 `NODE_OPTIONS` 跑同一组命令无可测差异 |
+| WFA-06 后台句柄丢失 + 全程静默 | 静默部分已修（U17）；句柄丢失属调用方 | 工具侧后台任务登记丢了 pid，wfa 进程仍在跑并持锁——这是调用方的事 |
+| WFA-07 zip 打不开却 completed | 已修（U18） | — |
+| WFA-08 长生成被 stall 误杀 | 已修（U16） | — |
+
+关于「两个会话同时用 wfa」：那不是锁被抢，而是**同一 home 的串行化加上写被拦截**。`tasks.json` 每次落盘是临时文件 + rename 覆写，被守卫拦住时单次要 15–30 s，一个事务写两份文件；两个会话轮流争锁时，60 s 的等待预算会被前一个会话的两三次慢写吃光，看起来就像「锁卡死」。不同会话各用一个 `WFA_HOME` 即可完全避开，`wfa list`/`status` 在 0.2.8 起也不再需要写锁。
 
 ---
 

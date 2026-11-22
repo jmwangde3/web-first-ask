@@ -24,6 +24,26 @@ which meant `--bundle-repo=zip` never worked on Gemini without saying so.
   typed — which could submit an empty prompt — is reported as an error instead of
   a clean run. A detached plain batch has no coordinator left to hold the
   debugging session and records that it could not press the switch.
+- The batch watchdog no longer kills a page that is still being driven. ask-bridge
+  emits no progress line and no metadata update while a model generates, so a
+  400-line answer was indistinguishable from a hung tab and died at the 300 s
+  stall threshold — with `collect` afterwards finding nothing, because the batch
+  had been terminated mid-generation. Before declaring a stall, wfa now checks
+  the mtime of ask-bridge's `chrome-devtools-mcp.log`, which it writes on every
+  tool call (~200 ms while a page generates); if that log moved within the last
+  two minutes the run keeps waiting and says so once. The same veto applies to
+  the detached-task check in `wfa status`, so a second process cannot kill a
+  healthy run either. `--stall-timeout` now defaults to 900 s instead of 300 s.
+- A batch that prints nothing for ten minutes can now be told apart from a dead
+  one: every 60 s the CLI emits `[wfa] still waiting: gemini quiet 240s (stall
+  limit 900s)`. The line is synthetic — it is not written to
+  `batch.stdout.log`, carries no job id, and does not reset the silence it
+  reports — so if it stops appearing, the process is gone.
+- A completed answer that admits it could not open the attachment is flagged.
+  A measured `--bundle-repo=zip` run finished `completed` with "当前会话环境中没有可用
+  的文件解压或本地文件读取工具" and produced no code; `wfa code` and `wfa status`
+  now warn that the attached files were probably unused and say to resend the
+  content as text or point the provider at a reachable URL.
 
 ### Fixed
 - Repository archives are named `<slug8>-<hex8>.zip` (17-character stem) instead

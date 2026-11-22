@@ -209,6 +209,12 @@ test("EPERM is lock collision and dead owner's lock is reclaimed", async () => {
 
 test("silent in-progress batch becomes stalled rather than completed or retryable", async () => fixture(async ({ root, home }) => {
   const store = new PolicyStore(home);
+  // The watchdog vetoes a stall while ask-bridge's browser log is moving. Point
+  // it at a file that does not exist so this test measures the no-evidence path
+  // instead of whatever Chrome happens to be doing on the machine.
+  const previousLog = process.env.ASK_BRIDGE_BROWSER_LOG;
+  process.env.ASK_BRIDGE_BROWSER_LOG = path.join(root, "no-browser.log");
+  try {
   const result = await executeTask({
     prompt: "Check a hanging provider", workspace: "stall-example", provider: "chatgpt",
     workspaceRoot: root, stallTimeoutSeconds: 1,
@@ -229,6 +235,10 @@ test("silent in-progress batch becomes stalled rather than completed or retryabl
   assert.equal(result.task.state, "needs_recovery");
   assert.ok(result.task.children.chatgpt.stall.silentSeconds >= 1);
   assert.ok(workspaceHasBlockingTask((await store.snapshot()).tasks.tasks, "stall-example", ["chatgpt"]));
+  } finally {
+    if (previousLog === undefined) delete process.env.ASK_BRIDGE_BROWSER_LOG;
+    else process.env.ASK_BRIDGE_BROWSER_LOG = previousLog;
+  }
 }));
 
 test("zip bundles are a repository payload, so they get no remote reference and no sentinel check", async () => fixture(async ({ root, home }) => {

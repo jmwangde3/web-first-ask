@@ -6,6 +6,7 @@ import { PolicyStore } from "./policy-store.js";
 import { WfaError } from "./errors.js";
 import { bundleRepository, repositoryBlock, resolveRepository } from "./repository.js";
 import { archiveRepository, repositoryArchiveBlock } from "./repository-archive.js";
+import { DEFAULT_STALL_TIMEOUT_SECONDS } from "./constants.js";
 import { getPaths } from "./paths.js";
 
 function positiveInteger(value, label, allowZero = false) {
@@ -33,7 +34,7 @@ export async function executeTask(input, dependencies = {}) {
   if (input.continueSession && input.fresh) {
     throw new WfaError("ARGUMENT_ERROR", "--continue-session cannot be combined with --new-session/--fresh.");
   }
-  const stallTimeoutSeconds = positiveInteger(input.stallTimeoutSeconds ?? 300, "--stall-timeout", true);
+  const stallTimeoutSeconds = positiveInteger(input.stallTimeoutSeconds ?? DEFAULT_STALL_TIMEOUT_SECONDS, "--stall-timeout", true);
   const sessionPolicy = input.followupTaskId || input.continueSession ? "continue" : "fresh";
   const bundleMode = input.bundleRepoMode === "zip" ? "zip" : "inline";
   const bundle = input.bundleRepo && bundleMode === "inline" ? await bundleRepository({
