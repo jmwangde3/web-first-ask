@@ -64,12 +64,17 @@ function globToRegExp(pattern) {
   return new RegExp(`${source}$`, "i");
 }
 
-function matchesPattern(relativePath, pattern) {
-  const normalized = normalizePattern(relativePath);
+function compilePattern(pattern) {
   const candidate = normalizePattern(pattern);
-  const matcher = globToRegExp(candidate);
-  if (matcher.test(normalized)) return true;
-  if (!candidate.includes("/")) return matcher.test(path.posix.basename(normalized));
+  return { candidate, matcher: globToRegExp(candidate) };
+}
+
+function matchesPattern(relativePath, compiled) {
+  const normalized = normalizePattern(relativePath);
+  if (compiled.matcher.test(normalized)) return true;
+  if (!compiled.candidate.includes("/")) {
+    return compiled.matcher.test(path.posix.basename(normalized));
+  }
   return false;
 }
 
@@ -123,6 +128,9 @@ export async function expandAttachmentInputs({
   const target = { files: [], images: [] };
   const exclusionPatterns = [...excludes].map(normalizePattern);
   const explicit = [];
+  // A single expansion reuses metadata between explicit paths, deduplication,
+  // and final byte accounting. No cross-request filesystem cache is retained.
+  const statCache = new Map();
 
   for (const raw of [...files, ...images]) {
     const value = String(raw);
@@ -132,12 +140,19 @@ export async function expandAttachmentInputs({
       explicit.push({ value, imageOnly: images.includes(raw) });
     }
   }
+  const compiledExclusions = exclusionPatterns.map(compilePattern);
 
   const matches = [];
   const globRequests = [];
   for (const item of explicit) {
     const absolute = path.resolve(root, item.value);
-    const info = await lstat(absolute).catch(() => null);
+    let info;
+    if (statCache.has(absolute)) {
+      info = statCache.get(absolute);
+    } else {
+      info = await lstat(absolute).catch(() => null);
+      statCache.set(absolute, info);
+    }
     if (info?.isSymbolicLink()) {
       throw new WfaError("ATTACHMENT_SYMLINK", `Symbolic-link attachments are not followed: ${absolute}`);
     }
@@ -148,7 +163,7 @@ export async function expandAttachmentInputs({
       await walkDirectory(absolute, root, collected, { visited: 0 });
       for (const filePath of collected) matches.push({ absolute: filePath, imageOnly: item.imageOnly, explicit: false });
     } else if (/[*?{]/.test(item.value)) {
-      globRequests.push(item);
+      globRequests.push({ ...item, compiled: compilePattern(item.value) });
     } else {
       throw new WfaError("ATTACHMENT_NOT_FOUND", `Attachment path does not exist: ${absolute}`);
     }
@@ -158,8 +173,7 @@ export async function expandAttachmentInputs({
     const all = [];
     await walkDirectory(root, root, all, { visited: 0 });
     for (const item of globRequests) {
-      const pattern = normalizePattern(item.value);
-      const found = all.filter((filePath) => matchesPattern(path.relative(root, filePath), pattern));
+      const found = all.filter((filePath) => matchesPattern(path.relative(root, filePath), item.compiled));
       if (!found.length) {
         throw new WfaError("ATTACHMENT_GLOB_EMPTY", `Attachment glob matched no files: ${item.value}`);
       }
@@ -171,9 +185,17 @@ export async function expandAttachmentInputs({
   for (const item of matches) {
     const absolute = path.resolve(item.absolute);
     const rel = path.relative(root, absolute).replaceAll("\\", "/");
-    if (exclusionPatterns.some((pattern) => matchesPattern(rel, pattern))) continue;
-    const info = await stat(absolute).catch(() => null);
+    if (compiledExclusions.some((pattern) => matchesPattern(rel, pattern))) continue;
+
+    let info;
+    if (statCache.has(absolute)) {
+      info = statCache.get(absolute);
+    } else {
+      info = await stat(absolute).catch(() => null);
+      statCache.set(absolute, info);
+    }
     if (!info?.isFile()) continue;
+
     if (item.imageOnly && !IMAGE_EXTENSIONS.has(path.extname(absolute).toLowerCase())) {
       throw new WfaError("IMAGE_TYPE_UNSUPPORTED", `--image expects an image file: ${absolute}`);
     }
@@ -195,7 +217,7 @@ export async function expandAttachmentInputs({
   }
   let totalBytes = 0;
   for (const filePath of [...target.files, ...target.images]) {
-    totalBytes += (await stat(filePath)).size;
+    totalBytes += statCache.get(filePath).size;
   }
   if (totalBytes > maxBytes) {
     throw new WfaError("ATTACHMENT_SIZE_LIMIT", `Expanded attachments total ${(totalBytes / 1024 / 1024).toFixed(1)} MiB; the limit is ${(maxBytes / 1024 / 1024).toFixed(0)} MiB.`);

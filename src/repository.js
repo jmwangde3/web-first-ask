@@ -153,6 +153,7 @@ export async function bundleRepository({ cwd = process.cwd(), excludes = [], inc
   const core = CORE_FILES.filter((item) => eligible.includes(item));
   const intro = `REPOSITORY SOURCE BUNDLE\nDIRECTORY TREE (tracked, eligible files):\n${tree}\n\nCORE ENTRY POINTS:\n${core.map((item) => `- ${item}`).join("\n") || "(none detected)"}\n\nThe sources included below are authoritative for this request. The tree is only an inventory; do not claim to have read unlisted source contents. Ask for exact additional paths if needed.\n`;
   let content = intro;
+  let usedBytes = Buffer.byteLength(intro, "utf8");
   let sourceBytes = 0;
   let files = 0;
   for (const relative of priority) {
@@ -171,12 +172,14 @@ export async function bundleRepository({ cwd = process.cwd(), excludes = [], inc
     try { body = new TextDecoder("utf-8", { fatal: true }).decode(buffer); }
     catch { skipped.push({ path: relative, reason: "invalid UTF-8" }); continue; }
     const section = `\n===== FILE: ${relative} =====\n${body}\n===== END FILE: ${relative} =====\n`;
+    const sectionBytes = Buffer.byteLength(section, "utf8");
     const limit = includes.length ? maxTotalBytes : Math.min(maxTotalBytes, maxInlineBytes);
-    if (sourceBytes + buffer.length > limit || Buffer.byteLength(content + section, "utf8") > maxTotalBytes) {
+    if (sourceBytes + buffer.length > limit || usedBytes + sectionBytes > maxTotalBytes) {
       skipped.push({ path: relative, reason: "inline budget; use --file to select this source explicitly" });
       continue;
     }
     content += section;
+    usedBytes += sectionBytes;
     sourceBytes += buffer.length;
     files += 1;
   }
@@ -190,7 +193,7 @@ export async function bundleRepository({ cwd = process.cwd(), excludes = [], inc
       : `every requested path was skipped: ${skipped.filter((item) => priority.includes(item.path)).map((item) => `${item.path} (${item.reason})`).join(", ") || includes.join(", ")}`;
     throw new WfaError("BUNDLE_REPO_INCLUDE_UNMATCHED", `--bundle-repo could not inline any requested file: ${detail}. A path passed with --file must be relative to the repository root, not to the current directory.`);
   }
-  return { content, stats: { files, bytes: Buffer.byteLength(content, "utf8"), skipped: skipped.length,
+  return { content, stats: { files, bytes: usedBytes, skipped: skipped.length,
     listed: eligible.length, sourceBytes, coreEntryPoints: core }, skipped };
 }
 

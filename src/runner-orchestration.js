@@ -32,10 +32,11 @@ async function validateFiles(paths, label) {
   return result;
 }
 
-async function makePayloadHash({ promptByProvider, providers, workspace, workspaceRoot, sessionFingerprint, files, images, options }) {
-  const attachments = [];
-  for (const file of [...files, ...images]) attachments.push({ path: file, sha256: await hashFile(file) });
-  return sha256(JSON.stringify({ promptByProvider, providers, workspace, workspaceRoot, sessionFingerprint, attachments, options }));
+function makePayloadHash({ promptByProvider, providers, workspace, workspaceRoot, sessionFingerprint, attachmentIdentities, options }) {
+  return sha256(JSON.stringify({
+    promptByProvider, providers, workspace, workspaceRoot, sessionFingerprint,
+    attachments: attachmentIdentities, options,
+  }));
 }
 
 async function readTextForScan(filePath) {
@@ -109,10 +110,50 @@ function relevantSessionFingerprint(sessionMap, providers, fresh) {
   return Object.fromEntries(providers.map((provider) => [provider, fresh ? null : (sessionMap[provider] ?? null)]));
 }
 
-async function buildSensitiveFindings({ promptByProvider, files, images, briefText, archiveScan }) {
+async function buildSensitiveFindings({
+  promptByProvider, basePrompts, sharedPrompt, files, images, briefText, archiveScan,
+}) {
   const findings = [];
   const unscannedAttachments = [];
-  for (const [provider, prompt] of Object.entries(promptByProvider)) findings.push(...scanSensitiveText(prompt, `prompt:${provider}`));
+
+  // Every base prompt consists of an optional handoff prefix and the same
+  // task body. Gemini may append an inline-attachment suffix. Cache the regex
+  // scan for each distinct part; reproduce provider-specific source/line data
+  // without rescanning the common body. Fall back to whole-prompt scanning if
+  // a caller ever supplies an unrecognised composition.
+  const scanCache = new Map();
+  const scanPart = (text) => {
+    if (!text) return [];
+    if (!scanCache.has(text)) scanCache.set(text, scanSensitiveText(text));
+    return scanCache.get(text);
+  };
+  const addPart = (part, provider, offset) => {
+    for (const finding of scanPart(part)) {
+      findings.push({ source: `prompt:${provider}`, line: finding.line + offset, kind: finding.kind });
+    }
+  };
+
+  scanPart(sharedPrompt);
+  for (const [provider, prompt] of Object.entries(promptByProvider)) {
+    const base = basePrompts[provider];
+    if (typeof base !== "string" || !base.endsWith(sharedPrompt) || !prompt.startsWith(base)) {
+      findings.push(...scanSensitiveText(prompt, `prompt:${provider}`));
+      continue;
+    }
+    const prefix = base.slice(0, base.length - sharedPrompt.length);
+    const suffix = prompt.slice(base.length);
+    // Regex rules operate on complete lines, so never split inside a line.
+    if ((prefix && !prefix.endsWith("\n")) || (suffix && !suffix.startsWith("\n"))) {
+      findings.push(...scanSensitiveText(prompt, `prompt:${provider}`));
+      continue;
+    }
+    addPart(prefix, provider, 0);
+    const prefixLines = (prefix.match(/\n/g) ?? []).length;
+    addPart(sharedPrompt, provider, prefixLines);
+    const baseLines = (base.match(/\n/g) ?? []).length;
+    addPart(suffix, provider, baseLines);
+  }
+
   if (briefText) findings.push(...scanSensitiveText(briefText, "brief"));
   findings.push(...(archiveScan?.findings ?? []));
   for (const filePath of files) {
@@ -263,9 +304,11 @@ async function prepareRequest(input, dependencies = {}) {
   const basePrompts = buildProviderPrompts(input, providers, sessionMap, briefText, followup, sessionPolicy);
   const promptByProvider = withGeminiInline(basePrompts, geminiInlineBody, geminiInline);
   const sessionFingerprint = relevantSessionFingerprint(sessionMap, providers, sessionPolicy === "fresh");
-  const sensitiveScan = await buildSensitiveFindings({ promptByProvider, files, images,
+  const sensitiveScan = await buildSensitiveFindings({
+    promptByProvider, basePrompts, sharedPrompt: input.prompt, files, images,
     archiveScan: input.archiveScan,
-    briefText: Object.values(basePrompts).some((value) => value !== input.prompt) ? briefText : "" });
+    briefText: Object.values(basePrompts).some((value) => value !== input.prompt) ? briefText : "",
+  });
   const sensitiveFindings = sensitiveScan.findings;
   const unscannedAttachments = sensitiveScan.unscannedAttachments;
 
@@ -337,6 +380,8 @@ async function prepareRequest(input, dependencies = {}) {
   }
   const requestId = slug(input.requestId || uuid(), "request_id");
   const taskId = uuid();
+  // The same path+content identities are used by both hashes. The intent hash
+  // deliberately ignores paths, while the payload hash retains them.
   const attachmentIdentities = [];
   for (const filePath of [...files, ...images]) attachmentIdentities.push({ path: filePath, sha256: await hashFile(filePath) });
   const intentHash = sha256(JSON.stringify({
@@ -357,8 +402,8 @@ async function prepareRequest(input, dependencies = {}) {
       downloadImages: Boolean(input.downloadImages ?? config.downloadImages), concurrency,
     },
   }));
-  const payloadHash = await makePayloadHash({
-    promptByProvider, providers, workspace, workspaceRoot, sessionFingerprint, files, images,
+  const payloadHash = makePayloadHash({
+    promptByProvider, providers, workspace, workspaceRoot, sessionFingerprint, attachmentIdentities,
     options: {
       kind: input.kind ?? "ask", mode, timeoutSeconds, modelByProvider,
       fresh: Boolean(input.fresh),

@@ -89,7 +89,9 @@ export function buildZip(entries) {
   for (const entry of entries) {
     const name = Buffer.from(entry.name.replace(/\\/g, "/"), "utf8");
     const checksum = crc32(entry.data);
-    const deflated = deflateRawSync(entry.data, { level: 9 });
+    // Level 6 generally captures most of level 9's compression benefit at
+    // substantially lower CPU cost; keep store fallback for incompressible data.
+    const deflated = deflateRawSync(entry.data, { level: 6 });
     const stored = deflated.length >= entry.data.length;
     const payload = stored ? entry.data : deflated;
     const method = stored ? 0 : 8;
@@ -149,7 +151,8 @@ async function pruneArchives(directory, keep, now = Date.now()) {
 }
 
 export async function archiveRepository({ cwd = process.cwd(), excludes = [], outDir, prompt = "",
-  maxFileBytes = 1024 * 1024, maxTotalBytes = 64 * 1024 * 1024, keepArchives = 5, requestId = null } = {}) {  const { root, selected, skipped } = await collectTrackedSources({ cwd, excludes });
+  maxFileBytes = 1024 * 1024, maxTotalBytes = 64 * 1024 * 1024, keepArchives = 5, requestId = null } = {}) {
+  const { root, selected, skipped } = await collectTrackedSources({ cwd, excludes });
   if (!selected.length) {
     throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo=zip found no eligible tracked files. Select paths with --file or adjust --exclude.");
   }

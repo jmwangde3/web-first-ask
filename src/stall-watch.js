@@ -24,7 +24,8 @@ export function browserStillWorking(idleMs, windowSeconds = BROWSER_QUIET_WINDOW
 
 export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = () => Date.now()) {
   const observed = new Map(jobs.map((job) => [job.provider, {
-    id: job.id, active: false, lastLife: clock(), lastProgressLine: null, metadataMtime: null,
+    id: job.id, active: false, lastLife: clock(), lastProgressLine: null,
+    metadataMtime: null, metadataState: undefined,
   }]));
 
   function progress(line) {
@@ -44,14 +45,18 @@ export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = 
     for (const [provider, item] of observed) {
       const metadataPath = path.join(outputDir, item.id, "metadata.json");
       const info = await stat(metadataPath).catch(() => null);
-      if (info?.isFile() && info.mtimeMs !== item.metadataMtime) {
+      const exists = info?.isFile();
+      if (exists && info.mtimeMs !== item.metadataMtime) {
         item.metadataMtime = info.mtimeMs;
         item.lastLife = now;
+        try {
+          item.metadataState = JSON.parse(await readFile(metadataPath, "utf8")).state;
+        } catch {
+          item.metadataState = undefined;
+        }
       }
-      let state;
-      if (info?.isFile()) {
-        try { state = JSON.parse(await readFile(metadataPath, "utf8")).state; } catch {}
-      }
+      // A missing file must not reuse a cached terminal state.
+      const state = exists ? item.metadataState : undefined;
       if (["completed", "failed", "timed_out", "recoverable", "cancelled"].includes(state)) {
         item.active = false;
         continue;

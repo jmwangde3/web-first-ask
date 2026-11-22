@@ -244,8 +244,10 @@ async function runBatch({ command, task, config, input, store, run, jobs, timeou
   }
   await writeFile(path.join(task.runDir, "batch.stdout.log"), result.stdout ?? "", { encoding: "utf8", mode: 0o600 });
   await writeFile(path.join(task.runDir, "batch.stderr.log"), result.stderr ?? "", { encoding: "utf8", mode: 0o600 });
+  const metadataByJob = new Map();
   for (const job of jobs) {
     const metadata = await readBatchMetadata(task.outputDir, job.id, job.provider, { runDir: task.runDir });
+    metadataByJob.set(job.id, metadata);
     await saveResult({ store, task, provider: job.provider, result: metadata, processResult: result });
   }
   await store.transaction(({ tasks }) => {
@@ -255,7 +257,8 @@ async function runBatch({ command, task, config, input, store, run, jobs, timeou
     current.state = summarizeTask(current).state;
   });
   for (const job of jobs) {
-    const metadata = await readBatchMetadata(task.outputDir, job.id, job.provider, { runDir: task.runDir });
+    const metadata = metadataByJob.get(job.id)
+      ?? await readBatchMetadata(task.outputDir, job.id, job.provider, { runDir: task.runDir });
     if (metadata.state !== "failed" || !TAB_CLOSED.test(String(metadata.error ?? ""))
       || metadata.threadUrl || metadata.responsePath) continue;
     input.onProgressLine?.("stdout", `[wfa] retrying ${job.provider} alone after pre-submit tab closure`);

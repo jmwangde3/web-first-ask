@@ -21,6 +21,13 @@ const TASK_SEGMENT_VALUE = "40";
 const CDP_TIMEOUT_MS = 5000;
 const RETRY_DELAY_MS = 5000;
 const MAX_ATTEMPTS_PER_PAGE = 3;
+// 500 ms balances detection latency against HTTP /json/list overhead: Gemini's
+// Task switch becomes clickable ~1.4 s after navigation, so 500 ms catches it
+// promptly while cutting 20-minute polling from ~12,000 requests to ~2,400.
+const PAGE_POLL_INTERVAL_MS = 500;
+// 150 ms between DOM button checks inside pressOnPage avoids excessive CDP
+// Runtime.evaluate calls while still fitting comfortably inside clickWindowMs.
+const CLICK_RETRY_INTERVAL_MS = 150;
 // /app, /app/, /app/<id>, and the same paths behind a Google account prefix
 // (/u/1/app). ask-bridge opens all of these depending on --followup.
 const GEMINI_APP_PATH = /^\/app(?:\/[^/?#]+)?\/?$/;
@@ -77,6 +84,8 @@ export function startGeminiTaskMode({
   waitForBrowserMs = 20000,
   clickWindowMs = 20000,
   retryDelayMs = RETRY_DELAY_MS,
+  pagePollIntervalMs = PAGE_POLL_INTERVAL_MS,
+  clickRetryIntervalMs = CLICK_RETRY_INTERVAL_MS,
   log = () => {},
 } = {}) {
   const state = { requested: "task", applied: false, clickedAt: null, pageUrl: null, error: null, clicks: 0, typedBeforeClick: null };
@@ -196,7 +205,9 @@ export function startGeminiTaskMode({
         state.error ??= "task switch did not report pressed";
         return false;
       }
-      await sleep(80);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(clickRetryIntervalMs, remaining));
     }
     if (!stopped) {
       lastFailure = `Task switch not found or not clickable within ${clickWindowMs} ms on ${url}`;
@@ -260,7 +271,7 @@ export function startGeminiTaskMode({
           inFlight.delete(target.id);
         }
       }
-      await sleep(100);
+      await sleep(pagePollIntervalMs);
     }
   };
 
@@ -297,3 +308,4 @@ export function startGeminiTaskModeForTask(task, log = () => {}) {
   if (!geminiTaskModeNeeded(task)) return null;
   return startGeminiTaskMode({ log });
 }
+

@@ -3,13 +3,22 @@ import { open, readFile, readdir, rename, rm, stat, writeFile, chmod } from "nod
 import os from "node:os";
 import path from "node:path";
 import { WfaError } from "./errors.js";
-import { truncate } from "./util.js";
 
 const LOG_ROTATE_BYTES = 64 * 1024 * 1024;
 const LOG_KEEP_BYTES = 4 * 1024 * 1024;
+const STDOUT_LIMIT = 200000;
+const STDERR_LIMIT = 12000;
+
+// Cache only discovered Preferences paths, not their contents or repair state.
+// All reads, repairs and log-rotation checks still occur on each preparation.
+const preferencesPathsByRoot = new Map();
 
 function chromeConfigDir(env = process.env) {
   return env.ASK_BRIDGE_CONFIG_DIR || path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "ask-bridge");
+}
+
+function invalidatePreferences(root) {
+  preferencesPathsByRoot.delete(path.resolve(root));
 }
 
 // ask-bridge appends to this log on every tool call, so its mtime is the only
@@ -38,12 +47,25 @@ async function findPreferences(root) {
   return result;
 }
 
+async function cachedPreferences(root) {
+  const key = path.resolve(root);
+  let pending = preferencesPathsByRoot.get(key);
+  if (!pending) {
+    pending = findPreferences(root).catch((error) => {
+      preferencesPathsByRoot.delete(key);
+      throw error;
+    });
+    preferencesPathsByRoot.set(key, pending);
+  }
+  return pending;
+}
+
 // No wrapper script is required. Only an exact `profile.exit_type: "Crashed"`
 // entry is changed; malformed/unrecognized profiles are never rewritten.
 export async function prepareChromeStartup({ apply = true, root = chromeConfigDir() } = {}) {
   const report = { root, inspectedProfiles: 0, crashedProfiles: [], repairedProfiles: [],
     logPath: path.join(root, "chrome-devtools-mcp.log"), logRotated: false, warnings: [] };
-  for (const preferences of await findPreferences(root)) {
+  for (const preferences of await cachedPreferences(root)) {
     report.inspectedProfiles += 1;
     try {
       const original = await readFile(preferences, "utf8");
@@ -98,6 +120,14 @@ export async function prepareChromeStartup({ apply = true, root = chromeConfigDi
   return report;
 }
 
+// Retain the newest characters without first joining and re-slicing a full
+// accumulated buffer. The limit matches the previous string-length contract.
+function appendTail(previous, text, limit) {
+  if (text.length >= limit) return text.slice(-limit);
+  const keep = limit - text.length;
+  return (previous.length > keep ? previous.slice(-keep) : previous) + text;
+}
+
 export async function spawnDetached(command, args, {
   cwd,
   env = process.env,
@@ -107,7 +137,12 @@ export async function spawnDetached(command, args, {
   if (!stdoutPath || !stderrPath) {
     throw new WfaError("DETACH_LOG_PATH_REQUIRED", "Detached execution needs task-scoped stdout/stderr log paths.");
   }
-  if (args.includes("batch") || args.includes("login")) await prepareChromeStartup({ root: chromeConfigDir(env) });
+  const isLogin = args.includes("login");
+  const root = chromeConfigDir(env);
+  if (args.includes("batch") || isLogin) {
+    if (isLogin) invalidatePreferences(root);
+    await prepareChromeStartup({ root });
+  }
   let stdout = null;
   let stderr = null;
   let child = null;
@@ -125,10 +160,13 @@ export async function spawnDetached(command, args, {
     if (!Number.isInteger(child.pid) || child.pid <= 0) {
       throw new WfaError("DETACHED_SPAWN_UNCONFIRMED", "ask-bridge did not provide a valid launched PID.");
     }
+    // A detached login can create additional Chrome profiles after launch.
+    child.once("exit", () => { if (isLogin) invalidatePreferences(root); });
     child.on("error", () => {});
     child.unref();
     return { pid: child.pid };
   } finally {
+    if (isLogin) invalidatePreferences(root);
     await stdout?.close().catch(() => {});
     await stderr?.close().catch(() => {});
   }
@@ -153,7 +191,12 @@ export async function runProcess(command, args, {
   drainGraceMs = 1000,
   abortSignal,
 } = {}) {
-  if (args.includes("batch") || args.includes("login")) await prepareChromeStartup({ root: chromeConfigDir(env) });
+  const isLogin = args.includes("login");
+  const root = chromeConfigDir(env);
+  if (args.includes("batch") || isLogin) {
+    if (isLogin) invalidatePreferences(root);
+    await prepareChromeStartup({ root });
+  }
   return new Promise((resolve) => {
     let child;
     let stdout = "";
@@ -198,6 +241,7 @@ export async function runProcess(command, args, {
       clearTimeout(watchdogHandle);
       clearTimeout(drainHandle);
       abortSignal?.removeEventListener("abort", onAbort);
+      if (isLogin) invalidatePreferences(root);
       resolve({ ...result, processError, timedOut, aborted, stdioDrainTimedOut });
     };
     const destroyPipes = () => {
@@ -258,13 +302,13 @@ export async function runProcess(command, args, {
       const stderrDecoder = new TextDecoder("utf-8");
       child.stdout?.on("data", (chunk) => {
         const text = stdoutDecoder.decode(chunk, { stream: true });
-        stdout = truncate(stdout + text, 200000);
+        stdout = appendTail(stdout, text, STDOUT_LIMIT);
         onStdout?.(stdout);
         emitLines("stdout", text);
       });
       child.stderr?.on("data", (chunk) => {
         const text = stderrDecoder.decode(chunk, { stream: true });
-        stderr = truncate(stderr + text, 12000);
+        stderr = appendTail(stderr, text, STDERR_LIMIT);
         onStderr?.(stderr);
         emitLines("stderr", text);
       });
