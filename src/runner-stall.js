@@ -9,6 +9,16 @@ import { detectSessionIsolationWarning, rememberSession, summarizeTask } from ".
 import { createStallWatch, browserIdleMs, browserStillWorking } from "./stall-watch.js";
 import { chromeLogPath } from "./ask-bridge.js";
 
+// Both logs missing means the path is wrong, not that the batch was silent, so
+// at least one file has to exist before an empty pair is treated as evidence.
+async function batchLogsEmpty(runDir) {
+  if (!runDir) return false;
+  const infos = await Promise.all(["batch.stdout.log", "batch.stderr.log"]
+    .map((name) => lstat(path.join(runDir, name)).catch(() => null)));
+  if (infos.every((info) => info === null)) return false;
+  return infos.every((info) => info === null || !info.isFile() || info.size === 0);
+}
+
 function stateFromProviderError(state, classified) {
   if (state !== "failed" && state !== "failed_before_start") return state;
   if (classified.errorCode === "RATE_LIMITED") return "rate_limited";
@@ -186,10 +196,29 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
     }
 
     if (!processAlive) {
+      // A detached batch writes ask-bridge's startup banner straight into
+      // batch.stdout.log. Empty logs mean the process died before ask-bridge
+      // said anything, so no job reached a provider and a retry is safe. This
+      // test is only valid for --detach: the foreground runner buffers stdout
+      // in memory and writes it after the batch ends, so an empty file there is
+      // not evidence of anything.
+      const neverStarted = task.detached === true
+        && await batchLogsEmpty(task.runDir);
       for (const child of Object.values(task.children ?? {})) {
         if (child.state === "queued" || child.state === "running") {
-          child.state = "interrupted_unknown";
-          child.error = "ask-bridge process is no longer running and no trusted terminal artifact was found. The prompt may already have been submitted; do not resend.";
+          child.state = neverStarted ? "failed_before_start" : "interrupted_unknown";
+          child.error = neverStarted
+            ? "The detached worker was killed before ask-bridge printed anything, so nothing reached a provider. The host that launched wfa clears background processes when its own task ends; run wfa in the foreground, or keep wfa itself in the background instead of using --detach."
+            : "ask-bridge process is no longer running and no trusted terminal artifact was found. The prompt may already have been submitted; do not resend.";
+          if (neverStarted) {
+            // Not a provider failure: there is no provider verdict to classify,
+            // and the generic "do not resend" hint contradicts a run that never
+            // sent anything.
+            child.errorCode = null;
+            child.recoveryHint = null;
+            child.retryAfterAt = null;
+            child.retryAfterSeconds = null;
+          }
           child.revision = (child.revision ?? 0) + 1;
         }
       }
