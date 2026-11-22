@@ -141,7 +141,13 @@ function printTask(task, json = false, replayed = false) {
   if (task.executionPending) process.stdout.write("Execution cleanup: pending; completed results are readable but the workspace/provider lock remains active.\n");
   if (task.geminiModeReport) {
     const report = task.geminiModeReport;
-    process.stdout.write(`Gemini mode: ${report.requested}${report.applied ? " (switch pressed before typing)" : " (NOT applied)"}${report.error ? ` - ${report.error}` : ""}\n`);
+    // The switch can apply and still be late: pressing it after the composer
+    // held text may have cleared that text. Saying "before typing" there would
+    // contradict the error printed on the same line.
+    const outcome = !report.applied
+      ? "NOT applied"
+      : report.error ? "applied, but after typing had started" : "switch pressed before typing";
+    process.stdout.write(`Gemini mode: ${report.requested} (${outcome})${report.error ? ` - ${report.error}` : ""}\n`);
   }
   for (const warning of task.retryWarnings ?? []) process.stdout.write(`Retry: ${warning}\n`);
   for (const [provider, child] of Object.entries(children)) {
