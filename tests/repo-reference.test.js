@@ -87,7 +87,8 @@ test("wfa code needs no --file when current repository has a remote", async () =
   assert.equal(normal.status, 0, normal.stderr);
   const preview = JSON.parse(normal.stdout);
   assert.equal(preview.repository.available, true);
-  assert.deepEqual(preview.providers, ["chatgpt", "gemini"]);
+  // Both providers by default; the order is asserted in defaults.test.js.
+  assert.deepEqual([...preview.providers].sort(), ["chatgpt", "gemini"]);
   assert.equal(preview.sessionPolicy, "fresh");
   assert.equal(preview.filesCount, 0);
   assert.equal(preview.concurrency, 1);

@@ -97,7 +97,7 @@ wfa browser-mode headless  # Run Chrome in the background (default)
 
 ask-bridge can reuse an open Chrome instance. To switch an already running instance, wait for active tasks to finish and run `ask-bridge close`. The next request opens Chrome in the saved mode. `wfa login` opens a visible window for manual sign-in.
 
-**Gemini Chat vs Task:** Gemini's landing mode is page state, not a URL parameter, and a reload puts it back on Chat. Set it once with `wfa gemini-mode task` (or per request with `--gemini-mode task`); chat stays the default. WFA attaches to the debugging port ask-bridge's Chrome already opens and presses the switch as the page appears, before the prompt is typed. Because that ordering cannot be guaranteed from outside ask-bridge, the task stores what was observed: `wfa status` prints `Gemini mode: task (switch pressed before typing)` on success, or the reason it did not apply. A detached plain batch has no coordinator process to hold that session and records that it could not press the switch.
+**Gemini Chat vs Task:** Gemini's landing mode is page state, not a URL parameter, and a reload puts it back on Chat. Task is the default landing mode, so an unflagged `wfa ask` already runs the Gemini half in Task; `--gemini-mode chat` (or `wfa gemini-mode chat`) selects Chat for a single request or as the saved default. WFA attaches to the debugging port ask-bridge's Chrome already opens and presses the switch as the page appears, before the prompt is typed. Because that ordering cannot be guaranteed from outside ask-bridge, the task stores what was observed: `wfa status` prints `Gemini mode: task (switch pressed before typing)` on success, or the reason it did not apply. A detached plain batch has no coordinator process to hold that session and records that it could not press the switch.
 
 **Chrome crash-restore repair, built into WFA:** Before each ask-bridge batch or login launch, WFA scans ask-bridge's configuration directory for Chrome `Preferences` files. If `profile.exit_type` is exactly `Crashed`, WFA resets it to `Normal` and marks `exited_cleanly`, using an atomic file replacement. It leaves healthy and malformed profiles unchanged. `wfa doctor` reports the profile inspection and any repairs, and `wfa browser-mode` displays the repair status. WFA also trims `chrome-devtools-mcp.log` above 64 MiB down to its last 4 MiB. The old `wfa-chrome-restore-fix.mjs` external wrapper is no longer required. Never run profile repair concurrently with a Chrome instance that is writing its Preferences; finish/close that instance first.
 
@@ -235,7 +235,7 @@ The `ANCHOR` must match exactly once, including surrounding lines. Missing and a
 
 | Command | Purpose |
 |---|---|
-| `wfa ask` | One or both providers; ChatGPT + Gemini by default, serially |
+| `wfa ask` | One or both providers; Gemini (Task mode) + ChatGPT by default, serially |
 | `wfa compare` | Same prompt to multiple providers, serially by default |
 | `wfa code` | Ask for complete implementation code; a Git remote replaces local file selection |
 | `wfa wait <task-id>` | Observe task state; adopts only verified results and never resends |

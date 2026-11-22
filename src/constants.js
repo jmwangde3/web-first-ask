@@ -28,14 +28,19 @@ export const DEFAULT_CONFIG = Object.freeze({
   // Kept for commands that need exactly one provider (`wfa login`).
   defaultProvider: "chatgpt",
   // Every ask/code request goes to both providers unless the caller narrows it.
-  defaultProviders: ["chatgpt", "gemini"],
+  // With geminiMode below, the default pair is "gemini in Task mode + chatgpt".
+  defaultProviders: ["gemini", "chatgpt"],
   // Serial by default; concurrent browser tabs interfere on known setups.
   defaultConcurrency: 1,
   defaultTimeoutSeconds: 1200,
   maxTimeoutSeconds: 7200,
   defaultCompareProviders: ["chatgpt", "gemini"],
   maxConcurrency: 3,
-  geminiMode: "chat",
+  // Task is the default here: the clicker records what actually happened in
+  // geminiModeReport, so a run that stayed on Chat is visible in `wfa status`
+  // instead of quietly answering from the weaker mode. `--gemini-mode chat`
+  // still selects Chat for one request.
+  geminiMode: "task",
 
   downloadImages: false,
 });
