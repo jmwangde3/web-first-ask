@@ -75,7 +75,9 @@ and committed the returned files.
   terminated a stalled child.
 - `stall-watch` re-parses `metadata.json` only when its mtime changes; job
   metadata is read once per pass; Chrome profile discovery is cached and the
-  cache is invalidated on login.
+  cache is invalidated on login. The metadata cache keys on mtime, size and inode
+  and is dropped when the file disappears, so a terminal rewrite that lands on
+  the same mtime (common on Windows) is still seen.
 - Attachment hashes are computed once per pass, repository bundling appends
   bytes instead of re-encoding, and archive deflate drops to level 6 while still
   storing incompressible entries.

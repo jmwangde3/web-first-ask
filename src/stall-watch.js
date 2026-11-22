@@ -23,10 +23,14 @@ export function browserStillWorking(idleMs, windowSeconds = BROWSER_QUIET_WINDOW
   return idleMs !== null && idleMs < windowSeconds * 1000;
 }
 
+function metadataSignature(info) {
+  return info?.isFile() ? `${info.mtimeMs}:${info.size}:${info.ino}` : null;
+}
+
 export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = () => Date.now()) {
   const observed = new Map(jobs.map((job) => [job.provider, {
     id: job.id, active: false, lastLife: clock(), lastProgressLine: null,
-    metadataMtime: null, metadataState: undefined,
+    metadataMtime: null, metadataKey: null, metadataState: undefined,
   }]));
 
   function progress(line) {
@@ -46,9 +50,16 @@ export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = 
     for (const [provider, item] of observed) {
       const metadataPath = path.join(outputDir, item.id, "metadata.json");
       const info = await stat(metadataPath).catch(() => null);
-      const exists = info?.isFile();
-      if (exists && info.mtimeMs !== item.metadataMtime) {
+      const signature = metadataSignature(info);
+      if (signature === null) {
+        // A missing file must clear any cached signature/state so a later
+        // recreation with the same mtime/size is re-read instead of reusing stale state.
+        item.metadataMtime = null;
+        item.metadataKey = null;
+        item.metadataState = undefined;
+      } else if (signature !== item.metadataKey) {
         item.metadataMtime = info.mtimeMs;
+        item.metadataKey = signature;
         item.lastLife = now;
         try {
           item.metadataState = JSON.parse(await readFile(metadataPath, "utf8")).state;
@@ -56,8 +67,7 @@ export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = 
           item.metadataState = undefined;
         }
       }
-      // A missing file must not reuse a cached terminal state.
-      const state = exists ? item.metadataState : undefined;
+      const state = item.metadataState;
       if (["completed", "failed", "timed_out", "recoverable", "cancelled"].includes(state)) {
         item.active = false;
         continue;
