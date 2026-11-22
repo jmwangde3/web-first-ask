@@ -24,6 +24,10 @@
 - `--stall-timeout` (default 900 s; `0` disables) kills a batch that stops producing progress lines *and* stops advancing its metadata, provided ask-bridge's browser log has also been quiet for two minutes. ask-bridge prints nothing while a page generates, so silence alone is not a stall; a long answer keeps running and the CLI repeats `[wfa] still waiting: ...` every minute so a silent run is never confused with a dead one. When a stall is real, the provider becomes `stalled` — blocking like an uncertain send, never auto-retried — instead of hanging until the full timeout. Already captured stdout/stderr and stalled evidence are retained.
 - Results can be inspected and staged; writing staged code into the workspace requires an explicit `wfa apply --confirm` and SHA-256 revalidation. Stage supports complete `FILE:` blocks or exact `ANCHOR`/`REPLACE` blocks.
 - WFA can continue an existing task conversation with `--followup`.
+- **Native CDP path.** `wfa cdp ask` drives Chrome directly over the DevTools Protocol through a zero-dependency
+  client (`src/browser/cdp.js`), a provider driver (`src/browser/driver.js`) and per-site adapters
+  (`src/browser/adapters/`). No MCP server, no npm package, one Chrome per home directory. It is the migration
+  target for the ask-bridge backend; `wfa broker` adds a queue in front of it.
 - ask-bridge remains an external tool; WFA adds no runtime npm dependency.
 
 ## Architecture
@@ -31,9 +35,12 @@
 ```text
 Codex
   └─ one foreground or detached `wfa` CLI invocation
-       └─ web-first-ask task ledger / idempotency / workspace sessions
-            ├─ concurrency 1: WFA single-job batch worker (one after another)
-            └─ concurrency 2..3: ask-bridge batch (multiple jobs)
+       ├─ native CDP kernel (default for `wfa cdp` / `wfa broker`)
+       │    ├─ src/browser/recovery.js  browser.lock: ADOPT / SAFE_START / RECOVERY_REQUIRED
+       │    ├─ src/browser/cdp.js + driver.js + adapters/{chatgpt,gemini}.js
+       │    └─ src/broker/*  loopback turn queue (same conversation serial, cross-provider parallel)
+       └─ legacy ask-bridge backend (`wfa ask` / `code` / `compare`)
+            └─ web-first-ask task ledger / idempotency / workspace sessions
                  └─ ask-bridge external executable
                       └─ Chrome + provider websites
                            ├─ ChatGPT
@@ -256,6 +263,12 @@ The `ANCHOR` must match exactly once, including surrounding lines. Missing and a
 | `wfa gemini-mode [chat\|task]` | Show or save the Gemini landing mode, and whether it was pressed |
 | `wfa install-skill [--target …]` | Install the Skill to Codex, WorkBuddy or a chosen directory |
 | `wfa upstream update` | Run ask-bridge's official update command |
+| `wfa cdp ask --provider <p> --prompt <text>` | Native CDP turn; `background` (default), `visible`, `headless`; `--json`, `--timeout`, `--settle` |
+| `wfa cdp login [--provider <p>]` | Open our own Chrome profile and poll until the provider reports a logged-in composer |
+| `wfa cdp status [--json]` | Show the broker this home is running, if any |
+| `wfa broker start [--detach]` | Run the turn queue in the foreground, or detach it with a log file |
+| `wfa broker ask --provider <p> --prompt <text> [--wait]` | Submit a turn to the queue instead of driving Chrome directly |
+| `wfa broker status \| turns \| wait <id> \| stop` | Inspect and drain the queue |
 
 Use `--json` for machine-readable summaries. Reuse `--request-id` only when recovering the **exact same logical request with identical prompt, providers, attachments and options**. A changed request must use a new request ID.
 
@@ -275,9 +288,67 @@ Use `--json` for machine-readable summaries. Reuse `--request-id` only when reco
 - Results are stored separately, for example `.../ask-bridge-output/wfa-chatgpt-<id>/response.md` and `.../wfa-chatgpt-<id>/metadata.json`.
 - Codex compares the answers and makes the final decision. It must not blindly merge or trust any provider.
 
+## Native CDP engine
+
+`wfa cdp` and `wfa broker` do not use ask-bridge. They own one Chrome per home directory, driven over the
+DevTools Protocol by a zero-dependency client, and keep all of their state inside `WFA_HOME`:
+
+```text
+<home>/browser.lock      Chrome ownership: phase launching|ready, broker pid/instance, chrome pid, actual port
+<home>/chrome-profile/   our own Chrome profile (log in once, keep the cookies)
+<home>/broker.json       running broker: pid, loopback port, token, startedAt
+<home>/broker.lock       single-broker instance lock
+<home>/logs/             detached broker logs
+```
+
+Browser modes:
+
+| Mode | What it does | Notes |
+|---|---|---|
+| `background` (default) | Headful Chrome positioned off-screen (`-2000,-2000`) | Renders like a real window, never steals the foreground |
+| `visible` | Headful Chrome at `100,100` | For `wfa cdp login` and for watching a run |
+| `headless` | `--headless=new` | Kept for experiments; Cloudflare currently blocks it, see below |
+
+Completion rule for a turn: the send is acknowledged (user turn count increases or the composer empties), the
+answer text is non-empty, the text has been stable for `--settle` milliseconds (default 4000), and the stop
+control is gone — or it has been visible for 60 s, in which case the selector is declared unreliable and the
+answer is still returned with `reason: completed_stop_signal_unreliable`.
+
+Failure reasons are explicit and never retried:
+
+| Reason | Meaning |
+|---|---|
+| `login_required` | The profile reached a logged-out composer (`textarea#mobile-composer-prompt`). Nothing was typed. Run `wfa cdp login`. |
+| `human_verification_required` | Cloudflare interstitial: the page title matches the adapter's challenge pattern (ChatGPT ships `/请稍候|just a moment|verifying|security check|cloudflare|人机验证/i`) or a password input is present, on two consecutive polls. Detected in about 2 s, not at the timeout. |
+| `editor_not_found` | The page loaded but no composer appeared; evidence carries `title`, `adapter` and `bodyLength`. |
+| `send_unconfirmed` | Nothing acknowledged the send within 30 s. Treated as uncertain; never resent. |
+| `no_progress` | The answer stopped growing for `--stall-timeout`. The partial text is returned. |
+| `hard_timeout` / `cancelled` | The overall timeout expired, or the caller aborted. A cancel after submit carries `sendCommittedAt`. |
+| recovery reasons (`lock_corrupt`, `identity_mismatch_profile_held`, …) | `browser.lock` could not be reconciled safely; the turn becomes `needs_human` and `evidence` names the failing check (see `src/browser/recovery.js`). |
+
+`wfa broker` puts a queue in front of the engine. Rules: one turn in flight per provider, at most two overall,
+one lease per conversation (same conversation is serial, different conversations run in parallel), and a turn is
+never retried once submitted. `wfa broker ask` submits and optionally waits; `wfa broker turns` and
+`wfa broker status` read the live queue (`GET /status`, `GET /turns`); `wfa broker stop` drains and exits. In
+`off` mode an idle broker shuts itself down after 60 s; `start` runs in `tray` mode and stays up for
+`scripts/wfa-tray.ps1`, which polls `/status` every two seconds.
+
+Known limits of this path: the broker's turn table lives in memory, so a `SIGKILL`ed broker loses the queue —
+`wfa cdp status` still shows Chrome and `src/browser/recovery.js` will adopt it on the next start, but a turn that
+was running when the broker died can only be found in the provider's own chat history. Only ChatGPT and Gemini
+adapters exist; Claude is still ask-bridge-only.
+
 ## Known issues
 
 `docs/known-issues.md` is the upstream-facing list (U1–U15) of defects measured against ask-bridge 0.4.0, with reproduction, expectation and impact per item: attachment verification failing on ordinary filenames, prompts above roughly 44 KiB being truncated without a signal, ChatGPT long answers landing in Canvas instead of `response.md`, `--new-session` still reusing an open tab, Gemini escaping Markdown diffs, unstable concurrent tabs, missing log rotation, the absence of a `submissionState`, and a serial batch closing the previous job's tab. U7 (`exit_type=Crashed`) is fixed in 0.4.0 and kept only as a record. Each item is tagged with WFA's current workaround, never an upstream fix. Read it before sending large context or relying on provider-side isolation.
+
+**Cloudflare profile challenge (measured 2026-11-23).** With the shared ask-bridge profile, `chatgpt.com` served a
+`请稍候…` interstitial with an empty body to *both* backends, while a brand-new Chrome profile loaded the same URL
+normally in the same minute. The challenge is therefore profile-scoped, not IP-scoped and not caused by the CDP
+client. Consequences: the native engine reports `human_verification_required` or `login_required` instead of
+hanging, and `wfa cdp login` logs in inside our own `chrome-profile` so the tainted legacy profile is never needed.
+If a profile does get challenged, `wfa cdp login --provider chatgpt` shows the interstitial in a visible window
+where it can be solved by hand; the cookies then persist for later runs.
 
 ## Local data and privacy
 

@@ -1,7 +1,8 @@
 # Repository rules
 
 - This project is a local CLI + one Codex Skill. Do not add an MCP server or MCP compatibility entry point.
-- The browser lifecycle belongs to the built-in kernel in `src/browser/` (single-file lock, launch phase, identity verification, recovery decision table). ask-bridge is legacy: reach it only through the fallback path and do not extend its JSONL/artifact contract.
+- The browser lifecycle belongs to the built-in kernel in `src/browser/` (single-file lock, launch phase, identity verification, recovery decision table). `src/browser/cdp.js`, `driver.js` and `adapters/` are the native path; `src/engines/cdp-*.js` expose it as `wfa cdp`, and `src/broker/` is the queue in front of it (`wfa broker`). ask-bridge is legacy: reach it only through the fallback path and do not extend its JSONL/artifact contract.
+- In the native path a prompt is never typed into a logged-out page (`login_required`) and never retried after submit; a cancel after submit must carry `sendCommittedAt`. Provider pages must be verified, not assumed: message parsing differs between logged-in and logged-out DOMs.
 - Preserve `wfa compare` and `wfa code --providers ...` with independent tabs, sessions, metadata and result files per provider. Concurrency rule: different conversations may run in parallel, the same conversation runs strictly serial, and phase one allows one in-flight generation per provider (at most two across providers). `--serial` forces global serial execution.
 - Never automatically resend a prompt after `timed_out`, `recoverable`, `interrupted_unknown`, or ambiguous failure.
 - Preserve request ID + payload fingerprint idempotency and the workspace/provider lock.

@@ -216,6 +216,28 @@ Measured against ask-bridge 0.4.0; full evidence and reproductions are in `docs/
 - **A provider can answer "I cannot open the attachment" and still be `completed`.** Measured on `--bundle-repo=zip`: `state: completed`, body "当前会话环境中没有可用的文件解压或本地文件读取工具", no usable output. `wfa code` and `wfa status` flag this now, but the fix is on your side: resend the content as text, or point the provider at a reachable URL. A `completed` task that says it could not read the files has not answered the question.
 - **Do not assume provider-side session isolation.** See Session rules and `threadMismatch`.
 
+## Native CDP path (`wfa cdp` / `wfa broker`)
+
+`wfa cdp ask` reaches the same two providers without ask-bridge: one Chrome per `WFA_HOME`, driven over the
+DevTools Protocol. Use it when ask-bridge is unavailable, when you want a single turn without the task ledger, or
+when you need the queue (`wfa broker`). Use the legacy `wfa ask` / `wfa code` when you need repository references,
+attachments, staging or the task ledger — the CDP path has none of those yet.
+
+- `--mode background` (default) renders off-screen and never takes the foreground; `visible` is for watching and
+  for `wfa cdp login`; `headless` is blocked by Cloudflare today.
+- Exit codes: `0` completed, `1` any other status. `--json` prints `{status, text, reason, evidence,
+conversationUrl, browser, elapsedMs}`.
+- Read `reason` before acting: `login_required` means nothing was typed — run `wfa cdp login` and retry **after**
+  the login; `human_verification_required` means Cloudflare showed its interstitial — solve it in a visible window,
+  do not retry in a loop; `send_unconfirmed`, `no_progress`, `hard_timeout` and `cancelled` are uncertain or
+  partial outcomes and must never be answered by resending the same prompt.
+- `wfa broker ask --wait` is the queueing form. Same conversation is serialised, different providers run in
+  parallel (max two), and a turn is never retried after it was submitted. A cancelled turn that carries
+  `sendCommittedAt` was already sent.
+- The CDP profile is ours (`<WFA_HOME>/chrome-profile`). A Cloudflare challenge is profile-scoped: measured on
+  2026-11-23, the shared ask-bridge profile was challenged while a fresh profile loaded normally in the same
+  minute. Log in once with `wfa cdp login`; do not copy cookies from the legacy profile.
+
 ## Trust and evidence
 
 - Provider answers are suggestions, not verified facts or test results.
