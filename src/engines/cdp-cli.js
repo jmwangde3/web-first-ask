@@ -174,7 +174,18 @@ async function handleLogin(argv, deps) {
   });
 
   if (!recovery.chrome?.port) {
-    throw new WfaError("CHROME_START_FAILED", "Chrome port is missing from recovery");
+    if (recovery.action === "RECOVERY_REQUIRED") {
+      throw new WfaError(
+        "RECOVERY_REQUIRED",
+        `browser.lock needs a human decision: ${recovery.reason} (run \`wfa cdp status\` for evidence)`,
+        { details: recovery.evidence }
+      );
+    }
+    throw new WfaError(
+      "CHROME_START_FAILED",
+      `Chrome port is missing from recovery: ${recovery.reason || "unknown"}`,
+      { details: recovery.evidence }
+    );
   }
 
   let cdp = null;
@@ -190,6 +201,21 @@ async function handleLogin(argv, deps) {
     const tab = await driver.openTab(cdp, targetUrl, { timeoutMs: timeoutSec * 1000 });
     targetId = tab.targetId;
     sessionId = tab.sessionId;
+
+    if (mode !== "headless") {
+      try {
+        const info = await cdp.send("Browser.getWindowForTarget", { targetId }).catch(() => null);
+        if (info && typeof info.windowId !== "undefined") {
+          await cdp.send("Browser.setWindowBounds", {
+            windowId: info.windowId,
+            bounds: { left: 100, top: 100, windowState: "normal" },
+          }).catch(() => {});
+        }
+      } catch {}
+      if (!options.json) {
+        stdout.write("[cdp] window moved to 100,100\n");
+      }
+    }
 
     if (!options.json) {
       stdout.write("[cdp] a visible Chrome window is open. Log in, then leave it running; this command polls until the logged-in composer appears.\n");

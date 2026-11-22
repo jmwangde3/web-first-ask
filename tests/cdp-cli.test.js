@@ -585,3 +585,141 @@ test("wfa cdp login: invalid --provider rejects with INVALID_ARGUMENT", async ()
   assert.match(stderr.output, /INVALID_ARGUMENT/);
 });
 
+test("wfa cdp login: moves window on-screen to 100,100 and records CDP methods", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  const sentMethods = [];
+  const sentParams = {};
+
+  const mockCdp = {
+    send: async (method, params) => {
+      sentMethods.push(method);
+      if (params) sentParams[method] = params;
+      if (method === "Browser.getWindowForTarget") {
+        return { windowId: 77 };
+      }
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              loggedIn: true,
+              title: "ChatGPT",
+            },
+          },
+        };
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: {
+      openTab: async () => ({ targetId: "target-xyz", sessionId: "session-xyz" }),
+    },
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.ok(sentMethods.includes("Browser.getWindowForTarget"), "Must call Browser.getWindowForTarget");
+  assert.ok(sentMethods.includes("Browser.setWindowBounds"), "Must call Browser.setWindowBounds");
+  assert.deepEqual(sentParams["Browser.getWindowForTarget"], { targetId: "target-xyz" });
+  assert.deepEqual(sentParams["Browser.setWindowBounds"], {
+    windowId: 77,
+    bounds: { left: 100, top: 100, windowState: "normal" },
+  });
+  assert.ok(stdout.output.includes("[cdp] window moved to 100,100\n[cdp] a visible Chrome window is open."));
+});
+
+test("wfa cdp login: rejection on setWindowBounds does not abort login", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Browser.getWindowForTarget") {
+        return { windowId: 88 };
+      }
+      if (method === "Browser.setWindowBounds") {
+        throw new Error("Failed to set window bounds");
+      }
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              loggedIn: true,
+              title: "ChatGPT Logged In",
+            },
+          },
+        };
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: {
+      openTab: async () => ({ targetId: "tab-1", sessionId: "sess-1" }),
+    },
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.match(stdout.output, /logged in as ChatGPT Logged In/);
+});
+
+test("wfa cdp login: recovery RECOVERY_REQUIRED throws RECOVERY_REQUIRED with evidence in details", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  const evidenceObj = { lockPid: 12345, detail: "lock collision" };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({
+      action: "RECOVERY_REQUIRED",
+      reason: "profile_locked",
+      evidence: evidenceObj,
+      chrome: null,
+    }),
+  });
+
+  assert.equal(res.code, 1);
+  assert.equal(res.error?.code, "RECOVERY_REQUIRED");
+  assert.match(res.error?.message, /browser\.lock needs a human decision: profile_locked \(run `wfa cdp status` for evidence\)/);
+  assert.deepEqual(res.error?.details, evidenceObj);
+});
+
+test("wfa cdp login: recovery failure (non-RECOVERY_REQUIRED) throws CHROME_START_FAILED with reason and evidence", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  const evidenceObj = { launchError: "binary not found" };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({
+      action: "SAFE_START",
+      reason: "binary_missing",
+      evidence: evidenceObj,
+      chrome: null,
+    }),
+  });
+
+  assert.equal(res.code, 1);
+  assert.equal(res.error?.code, "CHROME_START_FAILED");
+  assert.match(res.error?.message, /Chrome port is missing from recovery: binary_missing/);
+  assert.deepEqual(res.error?.details, evidenceObj);
+});
+
