@@ -4,6 +4,8 @@
 
 `web-first-ask` (`wfa`) is a local Node.js CLI that calls the independently maintained [`ask-bridge`](https://github.com/doggy8088/ask-bridge) executable. It explicitly selects ask-bridge's `browser` backend because its Batch command does not support SIWC. It does not expose an MCP server to Codex and does not reimplement browser automation.
 
+**Hard rule for agents: code work is delegated, never hand-written.** Every code problem — a bug, a failing test, a refactor, a feature, a review — goes to `wfa` with both providers and comes back as complete file contents or an exact patch. The local agent integrates the patch, runs the tests and reports the result; it does not diagnose first and does not type the fix itself. The only exception is an explicit instruction from the user that the request must not use agents. The same rule is stated at the top of `skills/web-first/SKILL.md` so an installed Skill carries it.
+
 - Codex calls one local command and waits while `ask-bridge batch` performs its own browser-side polling.
 - **ChatGPT and Gemini are the default provider pair**: a bare `wfa ask` / `wfa code` / `wfa compare` asks both. Use `--provider` or `--providers` to narrow. WFA does not set or change provider reasoning strength; it uses the current setting in the provider web UI.
 - Multi-provider runs are **serial by default** (`--concurrency 1`), because concurrent browser tabs interfere with each other on the same machine. WFA now launches each provider as its own single-job batch in sequence, including with `--detach`. `--concurrency 2..3` remains available when the machine tolerates it.

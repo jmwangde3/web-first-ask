@@ -55,7 +55,7 @@ test("compare replay returns nonzero for a partial batch without losing the succ
     const prompt = "Compare the smoke-test inputs.";
     const { task } = await executeTask({
       kind: "compare", providers: ["chatgpt", "gemini"], prompt: buildComparePrompt(prompt),
-      workspace: "repo", requestId: "partial-example",
+      workspace: "repo", requestId: "partial-example", noRepo: true,
     }, {
       home,
       skipPreflight: true,

@@ -64,7 +64,7 @@ test("a fresh request that returns the previous conversation URL is flagged", ()
 
   assert.match(detectSessionIsolationWarning(tasks, current, "chatgpt", shared), /THREAD_MISMATCH \(chatgpt\)/);
   assert.deepEqual(current.children.chatgpt.threadMismatch, {
-    expected: "a new conversation (not the previously saved thread)",
+    expected: "a new conversation (not the previous workspace thread)",
     actual: shared,
   });
   assert.equal(detectSessionIsolationWarning(tasks, current, "chatgpt", "https://chatgpt.com/c/new"), null);

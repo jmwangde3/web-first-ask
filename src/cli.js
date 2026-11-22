@@ -2,12 +2,11 @@ import { copyFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/pr
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { PolicyStore } from "./policy-store.js";
+import { Store } from "./store.js";
 import { resolveRepository } from "./repository.js";
 import { getHomeDir } from "./paths.js";
 import { loadConfig, saveBrowserMode, saveGeminiMode, validateGeminiMode } from "./config.js";
-import { executeTask, refreshTask } from "./managed-runner.js";
-import { runDetachedBatchWorker } from "./runner.js";
+import { executeTask, refreshTask, runDetachedBatchWorker } from "./runner.js";
 import { collectTask, listTasks, abandonProvider, waitForTask } from "./recovery.js";
 import { checkAskBridge, prepareChromeStartup, resolveAskBridge, runProcess } from "./ask-bridge.js";
 import { buildCodePrompt, buildComparePrompt } from "./prompts.js";
@@ -346,7 +345,7 @@ export async function main(argv = process.argv.slice(2)) {
     throw new WfaError("REASONING_DISABLED", "Reasoning-strength selection is temporarily disabled. Remove --reasoning/--reasoning-map; WFA now uses each provider's current web UI setting.");
   }
   const home = getHomeDir();
-  const store = new PolicyStore(home);
+  const store = new Store(home);
 
   // Private detached-worker entry point. It only executes pre-existing tasks;
   // no new provider submission can be triggered by a user-supplied prompt.
@@ -626,7 +625,10 @@ export async function main(argv = process.argv.slice(2)) {
     timeoutSeconds: options.timeout ? Number(options.timeout) : config.defaultTimeoutSeconds,
     concurrency: options.concurrency ? Number(options.concurrency) : undefined,
     model: options.model, modelByProvider, requestId: options["request-id"],
-    fresh: Boolean(options["new-session"] || options.fresh),
+    // New session is the documented default, so the flag the task records is
+    // "fresh unless the caller asked to continue"; executeTask itself keeps a
+    // direct call's sessions when no flag is given.
+    fresh: !options.followup && !options["continue-session"],
     downloadImages: options["download-images"] === undefined ? undefined : Boolean(options["download-images"]),
     onProgressLine: (stream, line) => { process.stderr.write(`[ask-bridge ${stream}] ${line}\n`); },
     onTaskCreated: (task) => {

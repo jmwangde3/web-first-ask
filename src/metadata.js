@@ -1,8 +1,8 @@
 import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 import { sha256 } from "./util.js";
+import { UPSTREAM_TERMINAL_STATES } from "./state.js";
 
-const TERMINAL_STATES = new Set(["completed", "failed", "timed_out", "recoverable", "cancelled"]);
 const PROVIDERS = new Set(["chatgpt", "gemini", "claude"]);
 
 // ask-bridge writes the response body to response.md, but two failure modes
@@ -265,7 +265,7 @@ export async function readBatchMetadata(outputDir, jobId, expectedProvider, { ru
     };
   }
 
-  if (TERMINAL_STATES.has(state)) {
+  if (UPSTREAM_TERMINAL_STATES.has(state)) {
     // ask-bridge can write the answer and then fail to finalize metadata.json
     // (Windows "os error 5"). The text on disk is then the only copy of a
     // finished answer, so report the path as unverified instead of reporting

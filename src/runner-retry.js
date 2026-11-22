@@ -4,9 +4,9 @@ import { fileURLToPath } from "node:url";
 import { runProcess, spawnDetached, resolveAskBridge } from "./ask-bridge.js";
 import { readBatchMetadata } from "./metadata.js";
 import { classifyProviderError } from "./provider-errors.js";
-import { detectSessionIsolationWarning, rememberSession, summarizeTask } from "./state.js";
-import { guardedBatch } from "./runner-stall.js";
-import { PolicyStore } from "./policy-store.js";
+import { detectSessionIsolationWarning, mapProviderErrorState, rememberSession, summarizeTask } from "./state.js";
+import { guardedBatch, refreshTask } from "./runner-stall.js";
+import { Store } from "./store.js";
 import { loadConfig } from "./config.js";
 import { geminiTaskModeNeeded, startGeminiTaskModeForTask } from "./gemini-mode.js";
 import { DEFAULT_STALL_TIMEOUT_SECONDS } from "./constants.js";
@@ -15,16 +15,6 @@ import { startHeartbeat } from "./util.js";
 
 const TAB_CLOSED = /list_pages failed|selected page has been closed/i;
 const WORKER_PATH = fileURLToPath(new URL("../bin/wfa.js", import.meta.url));
-
-function mappedState(state, classified, hasResponse = false) {
-  // A finished answer whose metadata write failed is complete, not failed.
-  if (classified.degraded && hasResponse) return "completed";
-  if (state !== "failed" && state !== "failed_before_start") return state;
-  if (classified.errorCode === "RATE_LIMITED") return "rate_limited";
-  if (classified.errorCode === "LOGIN_REQUIRED") return "login_required";
-  if (classified.errorCode === "CLOUDFLARE_BLOCKED") return "cloudflare_blocked";
-  return state;
-}
 
 function argsFor(config, inputFile, outputDir, concurrency = 1) {
   return ["--backend", "browser", `--headless=${config.browserMode !== "headful"}`,
@@ -41,7 +31,7 @@ async function saveResult({ store, task, provider, result, processResult, retry 
       error: result.error, stderr: processResult.stderr ?? "", jobId: child.jobId,
       state: result.state, hasResponse: Boolean(result.responsePath),
     });
-    child.state = mappedState(result.state, classified, Boolean(result.responsePath));
+    child.state = mapProviderErrorState(result.state, classified, Boolean(result.responsePath));
     child.threadUrl = result.threadUrl ?? child.threadUrl;
     child.error = result.error;
     child.resultPath = result.responsePath ?? child.resultPath;
@@ -54,6 +44,17 @@ async function saveResult({ store, task, provider, result, processResult, retry 
     child.elapsedSeconds = result.elapsedSeconds;
     child.pageId = result.pageId;
     child.childPid = processResult.childMayRun ? processResult.pid : null;
+    // guardedBatch already vetoed silence against ask-bridge's browser log and
+    // killed the batch; that verdict has to survive the metadata write, which
+    // still says in_progress because no provider ever answered.
+    const stall = processResult.stalled?.[provider];
+    if (stall && !result.trustedCompletion
+      && !["completed", "repo_unreadable", "abandoned"].includes(child.state)) {
+      child.state = "stalled";
+      child.stall = stall;
+      child.error = `No progress line or metadata update for ${stall.silentSeconds} seconds, and ask-bridge's browser log was silent for the same period. Submission may have occurred; check the conversation before resending. A long generation looks identical from here, so raise --stall-timeout if the answer was still being written.`;
+      child.recoveryHint = `Run wfa collect ${task.taskId} --provider ${provider} or wfa resolve ${task.taskId} --provider ${provider} --confirm after checking the browser.`;
+    }
     if (retry) {
       child.retriedAsSingleBatch = true;
       child.retryLogs = logPaths;
@@ -196,8 +197,13 @@ async function runSequential({ command, task, config, input, store, run, jobs, t
     current.executionPending = childMayRun;
     for (const child of Object.values(current.children)) {
       if (child.state === "queued" || child.state === "running") {
-        child.state = "failed_before_start";
-        child.error = "The preceding provider stopped before this job could be started. No prompt was sent.";
+        // If the batch process may still be alive it can still submit this job,
+        // so "nothing was sent" is not proven; keep it locked until collected.
+        child.state = childMayRun ? "interrupted_unknown" : "failed_before_start";
+        child.error = childMayRun
+          ? "A preceding batch may still be running; do not resend until its process exits."
+          : "The preceding provider stopped before this job could be started. No prompt was sent.";
+        if (childMayRun) child.childPid = current.childPid;
         child.revision = (child.revision ?? 0) + 1;
       }
     }
@@ -336,14 +342,18 @@ export async function executePreparedTask({ task, command, config, input, store,
     if (serial) await runSequential({ command, task, config, input, store, run, jobs: createdJobs, timeoutSeconds });
     else await runBatch({ command, task, config, input, store, run, jobs: createdJobs, timeoutSeconds });
   });
-  const snapshot = await store.snapshot();
-  return { task: snapshot.tasks.tasks[task.taskId], replayed: false };
+  // The batch result is not the task result: repository readability, stall
+  // promotion and session checks all live in refreshTask, and they used to run
+  // inside the deleted PolicyStore transaction after every write. Refresh once
+  // here so a foreground run returns the same task state a later `status` shows.
+  const refreshed = await refreshTask(task.taskId, { home: store.paths.home, store });
+  return { task: refreshed, replayed: false };
 }
 
 // A detached serial request must remain under WFA's control: the upstream
 // executable cannot safely sequence two jobs in the same batch. This private
 // child command has no user-facing CLI contract and exits on terminal state.
-export async function runDetachedBatchWorker(taskId, workerToken, { home, store = new PolicyStore(home), config } = {}) {
+export async function runDetachedBatchWorker(taskId, workerToken, { home, store = new Store(home), config } = {}) {
   // Claim is atomic across processes. Even a second invocation with the right
   // token cannot resubmit a job that the first worker may already have sent.
   const task = await store.transaction(({ tasks }) => {

@@ -513,7 +513,7 @@ U11–U15 里只有 U14 的一半在 ask-bridge 侧，其余都在 wfa 或本机
 wfa 0.2.3 起：
 
 - 正文超 40 KiB 在发送前拦截（`PROMPT_OVERSIZE`）；`--dry-run` 给文件级 `splitPlan`；`--allow-oversize` 放行。
-- Gemini 遇到归档附件（zip/tar/gz/tgz/7z）走原生上传，且归档名压到 17 字符（`<slug8>-<hex8>.zip`），否则会撞 U1；文本附件自动内联（带行号的源码包直接内联），既避开 U1 的整名匹配，也避免把上传通道当传输层；其它二进制/原生文档提前拒绝（`GEMINI_ATTACHMENT_UNSUPPORTED`）；`--allow-gemini-attachments` 强制走原生上传——此时附件名同样要保持 stem ≤ 20 字符。
+- Gemini 遇到归档附件（zip/tar/gz/tgz/7z）走原生上传，且归档名压到 20 字符（`<slug4>-<hex15>.zip`），否则会撞 U1；文本附件自动内联（带行号的源码包直接内联），既避开 U1 的整名匹配，也避免把上传通道当传输层；其它二进制/原生文档提前拒绝（`GEMINI_ATTACHMENT_UNSUPPORTED`）；`--allow-gemini-attachments` 强制走原生上传——此时附件名同样要保持 stem ≤ 20 字符。
 - `response.md` 出现 Canvas 存根特征或 `\vert{}` 类转义时标记 `responseHeuristics` 并在 CLI 警告，不修改正文；stage/apply 拒绝含污染的内容。
 - `--new-session` 完成后比对上一轮 `threadUrl`，相同则记 `sessionIsolationWarning`。
 - 默认 chatgpt + gemini，多 provider 默认串行（`--concurrency 1`）；由 WFA 自行拆分为独立单 job 请求，含 `--detach` 模式。
@@ -522,3 +522,25 @@ wfa 0.2.3 起：
 - 可证明未提交的失败（tab 打开失败、Send 按钮未激活、附件上传超时）自动解锁 workspace。
 
 以上都只是**检测与规避**，不是修复：U1–U10 的根因仍在 ask-bridge。
+
+---
+
+## 0.2.10 重构：删掉包装层后暴露的 10 个失败测试（2026-11-22）
+
+`managed-runner.js` / `policy-store.js` / `stall-watch.js` 合并进 `runner-orchestration.js` / `runner-stall.js` / `runner-retry.js` 后，`npm test` 有 10 条失败。根因不是新逻辑写错，而是 `PolicyStore.transaction` 里那三处「每次写事务都跑一遍」的后处理随模块一起被删了：
+
+| 丢失的后处理 | 表现 |
+|---|---|
+| 完成后的 REPO_UNREADABLE 判定 | 供应商回 `REPO_UNREADABLE` 仍记 `completed` |
+| `store.stalls` 应用到 child | 前台 stall 被判 `interrupted_unknown`，不是 `stalled` |
+| 串行批次进程可能还活着时的保守标记 | 未启动的 provider 被标 `failed_before_start`（可安全重试），实际可能已提交 |
+
+修复方式：前台执行结束统一走一次 `refreshTask`；`guardedBatch` 的 stall 证据在 `saveResult` 里落成 `stalled`；`childMayRun` 为真时未触碰的 child 记 `interrupted_unknown`。`workspaceHasBlockingTask` 增加「被授权的 repo_unreadable follow-up 不受父任务锁」的显式豁免，代替原来在事务里临时改父任务状态的做法。
+
+另外三处与合并无关、但同样在本轮修掉的问题：
+
+- `request_id` 的 intent hash 含 session policy 与临时附件路径 → 用 `--continue-session` 重放、或重新打包同一仓库都会 `IDEMPOTENCY_CONFLICT`。现在只按内容（附件 sha256）和请求参数算身份。
+- 归档名用纯内容哈希 → 同一仓库同一秒打包两次会撞名、互相覆盖。现在 `<slug4>-<hash15>`，有 `request_id` 时哈希里带它，可复现。
+- `detached` 任务的 `batch.stdout.log` 只要打印过任何一行就必须判 `interrupted_unknown`，不能因为「没出现本 job id」就当没提交（`recovery.test.js`）。
+
+**同时把委派规则写死进 Skill 和 README**：代码问题一律先交给 wfa 双 provider 出完整文件或补丁，本地只做集成、跑测试、汇报；唯一例外是用户明确说这次不要用 agents。

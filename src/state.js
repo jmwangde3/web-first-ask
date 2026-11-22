@@ -1,7 +1,30 @@
 import { BLOCKING_STATES } from "./constants.js";
 
+// One place decides what a state means. Before this, the same six upstream
+// states were spelled out in metadata.js, stall-watch.js and policy-store.js,
+// and the error-code mapping existed twice with one copy silently missing the
+// degraded-success branch.
+export const UPSTREAM_TERMINAL_STATES = new Set(["completed", "failed", "timed_out", "recoverable", "cancelled"]);
+export const ACTIVE_CHILD_STATES = new Set(["queued", "running"]);
+export const SETTLED_CHILD_STATES = new Set(["completed", "failed", "failed_before_start", "abandoned", "cancelled"]);
+
 export function isBlockingChild(child) {
   return BLOCKING_STATES.has(child?.state);
+}
+
+// A metadata write that failed after response.md was written is a complete
+// answer, not a loss (provider-errors.js METADATA_PERSIST_FAILED). The batch
+// path and the refresh path must agree on that, otherwise the same artifact is
+// `completed` when the runner sees it and `failed` when only refresh does.
+export function mapProviderErrorState(state, classified, hasResponse = false) {
+  if (classified?.degraded && hasResponse) return "completed";
+  if (state !== "failed" && state !== "failed_before_start") return state;
+  switch (classified?.errorCode) {
+    case "RATE_LIMITED": return "rate_limited";
+    case "LOGIN_REQUIRED": return "login_required";
+    case "CLOUDFLARE_BLOCKED": return "cloudflare_blocked";
+    default: return state;
+  }
 }
 
 // Failures that provably happened before the prompt reached the page. Without
@@ -33,15 +56,19 @@ export function summarizeTask(task) {
     state = "completed";
   } else if (states.length && states.every((value) => value === "abandoned")) {
     state = "abandoned";
-  } else if (states.length && states.every((value) => ["completed", "failed", "failed_before_start", "abandoned", "cancelled"].includes(value))) {
+  } else if (states.length && states.every((value) => SETTLED_CHILD_STATES.has(value))) {
     state = states.some((value) => value === "completed") ? "partial" : "failed";
-  } else if (states.some((value) => ["stalled", "repo_unreadable", "timed_out", "recoverable", "interrupted_unknown", "failed", "rate_limited", "login_required", "cloudflare_blocked"].includes(value))) {
+  } else if (states.length && !states.some((value) => ACTIVE_CHILD_STATES.has(value))) {
+    // No provider is still working and not every one settled: a provider is
+    // stalled, unreadable, rate-limited or of unknown submission. Only then is
+    // the task waiting on a human. A failed provider next to a running one used
+    // to land here and freeze the whole task before the other answer arrived.
     state = "needs_recovery";
   }
   return { ...task, state, children: task.children };
 }
 
-export function workspaceHasBlockingTask(tasks, workspace, providers, exceptTaskId = null) {
+export function workspaceHasBlockingTask(tasks, workspace, providers, exceptTaskId = null, allowUnreadable = null) {
   const ordered = Object.values(tasks)
     .filter((task) => task.taskId !== exceptTaskId && task.workspace === workspace)
     .reverse();
@@ -57,6 +84,10 @@ export function workspaceHasBlockingTask(tasks, workspace, providers, exceptTask
     if (latest.executionPending) {
       return { taskId: latest.taskId, provider, state: "execution_pending", childState: child.state, executionPending: true };
     }
+    // A follow-up on a repository-unreadable parent is the documented way out of
+    // that state; the parent must not lock the child it authorized.
+    if (allowUnreadable && allowUnreadable.taskId === latest.taskId
+      && allowUnreadable.provider === provider && child.state === "repo_unreadable") continue;
     if (isConfirmedUnsubmittedFailure(child)) continue;
     if (isBlockingChild(child)) return { taskId: latest.taskId, provider, state: child.state };
   }
@@ -85,7 +116,7 @@ export function detectThreadMismatch(task, provider, threadUrl) {
   const expected = task.sessionBaseline?.[provider] ?? null;
   const policy = task.sessionPolicy ?? (task.fresh ? "fresh" : "continue");
   if (policy === "fresh" && expected === threadUrl) {
-    return { expected: "a new conversation (not the previously saved thread)", actual: threadUrl };
+    return { expected: "a new conversation (not the previous workspace thread)", actual: threadUrl };
   }
   if (policy === "continue" && expected && expected !== threadUrl) {
     return { expected, actual: threadUrl };

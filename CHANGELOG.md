@@ -33,6 +33,33 @@ declared safe to resend.
 - Attachment-refusal detection also matches "cannot read/access/open the
   uploaded file". Code results that admit the attachment was unreadable are
   refused at stage/apply when the task had attachments.
+- `managed-runner.js`, `policy-store.js` and `stall-watch.js` are gone. Their
+  behaviour now lives in `runner-orchestration.js`, `runner-stall.js` and
+  `runner-retry.js`: one public `executeTask`, one place that decides what a
+  child state means (`state.js`), and the follow-up authorisation passed
+  explicitly instead of through a `Store` subclass that rewrote parents inside
+  every transaction. Deleting them had removed three post-write checks, which
+  are restored: a foreground run now ends with `refreshTask`, so
+  `REPO_UNREADABLE`, stall promotion and session rollback apply before the CLI
+  returns; a `guardedBatch` stall is saved as `stalled` instead of being
+  overwritten by the `in_progress` metadata; and a serial batch that may still be
+  alive leaves the untouched provider `interrupted_unknown` rather than
+  `failed_before_start`.
+- `request_id` identity is the request, not its packaging: the intent hash no
+  longer includes the session policy or the scratch path of a temporary archive,
+  so a replay with `--continue-session` or a re-packed repository recovers the
+  original task instead of returning `IDEMPOTENCY_CONFLICT`.
+- Repository archives keep the 20-character stem limit but add a random half, so
+  two archives of the same tree no longer overwrite each other; a caller that
+  supplies `request_id` still gets a deterministic name and can replay.
+
+### Added
+- **The delegation rule is now written into the Skill and README as a hard
+  rule.** Every code problem — bug, failing test, refactor, feature, review —
+  goes to `wfa` with both providers and comes back as complete files or an exact
+  patch. The local agent integrates the patch, runs the tests and reports; it
+  does not diagnose first and does not type the fix itself. The only exception
+  is an explicit user instruction that the request must not use agents.
 
 ## 0.2.9 - 2026-11-22
 

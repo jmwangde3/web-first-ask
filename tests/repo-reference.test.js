@@ -7,8 +7,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeRepoUrl, resolveRepository, repositoryBlock, matchRepoUnreadable, bundleRepository } from "../src/repository.js";
 import { createStallWatch } from "../src/stall-watch.js";
-import { executeTask } from "../src/managed-runner.js";
-import { PolicyStore } from "../src/policy-store.js";
+import { executeTask } from "../src/runner.js";
+import { Store } from "../src/store.js";
 import { isLockCollision } from "../src/store.js";
 import { workspaceHasBlockingTask } from "../src/state.js";
 
@@ -100,7 +100,7 @@ test("wfa code needs no --file when current repository has a remote", async () =
 }));
 
 test("repo block reaches each provider in isolated single-job batches and fresh sessions", async () => fixture(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   await store.transaction(({ sessions }) => { sessions.workspaces.x = { chatgpt: "https://chatgpt.com/c/previous" }; });
   const seen = [];
   const result = await executeTask({
@@ -126,7 +126,7 @@ test("repo block reaches each provider in isolated single-job batches and fresh 
 }));
 
 test("--continue-session includes saved conversation and checks expected URL", async () => fixture(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   const previous = "https://chatgpt.com/c/known";
   await store.transaction(({ sessions }) => { sessions.workspaces.x = { chatgpt: previous }; });
   const result = await executeTask({
@@ -143,7 +143,7 @@ test("--continue-session includes saved conversation and checks expected URL", a
 }));
 
 test("REPO_UNREADABLE is unresolved; code fallback keeps code delivery and source authority", async () => fixture(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   const first = await executeTask({
     prompt: "Explain main.js", kind: "code", provider: "chatgpt", workspace: "x", workspaceRoot: root,
   }, { home, store, config, skipPreflight: true,
@@ -202,14 +202,14 @@ test("EPERM is lock collision and dead owner's lock is reclaimed", async () => {
   assert.equal(isLockCollision({ code: "EACCES" }), false);
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-lock-"));
   try {
-    const store = new PolicyStore(home);
+    const store = new Store(home);
     await writeFile(path.join(home, ".store.lock"), JSON.stringify({ host: os.hostname(), pid: 2147483000, createdAt: 0 }));
     assert.equal(await store.withLock(async () => "recovered", 500), "recovered");
   } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("silent in-progress batch becomes stalled rather than completed or retryable", async () => fixture(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   // The watchdog vetoes a stall while ask-bridge's browser log is moving. Point
   // it at a file that does not exist so this test measures the no-evidence path
   // instead of whatever Chrome happens to be doing on the machine.
@@ -243,7 +243,7 @@ test("silent in-progress batch becomes stalled rather than completed or retryabl
 }));
 
 test("zip bundles are a repository payload, so they get no remote reference and no sentinel check", async () => fixture(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   const result = await executeTask({
     prompt: "Explain the attached sources", provider: "chatgpt", workspace: "zip", workspaceRoot: root,
     bundleRepo: true, bundleRepoMode: "zip",

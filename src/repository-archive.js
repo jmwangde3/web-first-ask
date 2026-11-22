@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { promisify, TextDecoder } from "node:util";
 import { lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { crc32, deflateRawSync } from "node:zlib";
 import { WfaError } from "./errors.js";
 import { scanSensitiveText } from "./bundle.js";
+import { sha256, uuid } from "./util.js";
 
 const exec = promisify(execFile);
 
@@ -71,11 +71,11 @@ export async function collectTrackedSources({ cwd = process.cwd(), excludes = []
   return { root, selected, skipped };
 }
 
-function dosStamp(date) {
-  const time = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
-  const day = ((Math.max(date.getFullYear(), 1980) - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
-  return { time, day };
-}
+// A fixed DOS stamp (1980-01-01 00:00) keeps the archive byte-identical for
+// identical sources, so the file name can be derived from its content and one
+// request can be replayed with the same request_id (see the intent hash in
+// runner-orchestration.js). Entry mtimes carried no meaning for a reader.
+const DOS_STAMP = { time: 0, day: 33 };
 
 // Minimal ZIP writer: deflate each entry, fall back to store when compression
 // does not pay off. No external binary (no `zip` on Windows) and no zip64,
@@ -85,7 +85,7 @@ export function buildZip(entries) {
   const local = [];
   const central = [];
   let offset = 0;
-  const { time, day } = dosStamp(new Date());
+  const { time, day } = DOS_STAMP;
   for (const entry of entries) {
     const name = Buffer.from(entry.name.replace(/\\/g, "/"), "utf8");
     const checksum = crc32(entry.data);
@@ -149,7 +149,7 @@ async function pruneArchives(directory, keep, now = Date.now()) {
 }
 
 export async function archiveRepository({ cwd = process.cwd(), excludes = [], outDir, prompt = "",
-  maxFileBytes = 1024 * 1024, maxTotalBytes = 64 * 1024 * 1024, keepArchives = 5 } = {}) {  const { root, selected, skipped } = await collectTrackedSources({ cwd, excludes });
+  maxFileBytes = 1024 * 1024, maxTotalBytes = 64 * 1024 * 1024, keepArchives = 5, requestId = null } = {}) {  const { root, selected, skipped } = await collectTrackedSources({ cwd, excludes });
   if (!selected.length) {
     throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo=zip found no eligible tracked files. Select paths with --file or adjust --exclude.");
   }
@@ -167,7 +167,6 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
   const secretFindings = [];
   let scannedFiles = 0;
   let totalBytes = 0;
-  let uncompressed = 0;
   for (const relative of [...mentioned, ...rest]) {
     const absolute = path.resolve(root, relative);
     const info = await lstat(absolute).catch(() => null);
@@ -190,7 +189,6 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
   if (!entries.length) {
     throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo=zip found no readable tracked files. Select paths with --file or adjust --exclude.");
   }
-  uncompressed = totalBytes;
   const zip = buildZip(entries);
   if (zip.length > MAX_ARCHIVE_BYTES) {
     throw new WfaError("BUNDLE_REPO_TOO_LARGE", `--bundle-repo=zip produced an archive of ${(zip.length / 1024 / 1024).toFixed(1)} MiB, over the 50 MiB attachment limit. Narrow it with --exclude or --file.`);
@@ -201,11 +199,12 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
   // by matching the whole filename against the page text, and Gemini truncates
   // the attachment label past that point, so a timestamped name is uploaded and
   // then reported as never attached 50 s later (docs/known-issues.md U1). The
-  // random suffix is what keeps two archives of the same repository in the same
-  // second apart; file mtime carries the ordering a timestamp would have given.
-  const slug = (path.basename(root).replace(/[^A-Za-z0-9._-]/g, "_") || "repo").slice(0, 8);
-  const file = path.join(directory, `${slug}-${randomBytes(4).toString("hex")}.zip`);
-  await writeFile(file, zip);
+  // content hash makes a replay with the same request_id reuse one path; the
+  // random half keeps two independent requests from colliding, which a pure
+  // content hash did whenever the same repository was archived twice.
+  const slug = (path.basename(root).replace(/[^A-Za-z0-9._-]/g, "_") || "repo").slice(0, 4);
+  const file = path.join(directory, `${slug}-${sha256(`${sha256(zip)}:${requestId ?? uuid()}`).slice(0, 15)}.zip`);
+  if (!(await lstat(file).catch(() => null))?.isFile()) await writeFile(file, zip);
   await pruneArchives(directory, keepArchives);
   return {
     file,
@@ -214,9 +213,9 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
     stats: {
       files: entries.length,
       listed: selected.length,
-      sourceBytes: uncompressed,
+      sourceBytes: totalBytes,
       archiveBytes: zip.length,
-      ratio: uncompressed ? Number((zip.length / uncompressed).toFixed(3)) : 1,
+      ratio: totalBytes ? Number((zip.length / totalBytes).toFixed(3)) : 1,
       skipped: skipped.length,
     },
     skipped,

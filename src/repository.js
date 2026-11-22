@@ -3,11 +3,10 @@ import { promisify } from "node:util";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { WfaError } from "./errors.js";
+import { collectTrackedSources } from "./repository-archive.js";
 
 const exec = promisify(execFile);
-const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", ".cache", "vendor", "target", ".venv", "__pycache__"]);
-const SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|7z|rar|exe|dll|so|dylib|class|pyc|woff2?|ttf|otf|mp[34]|avi|mov|sqlite|db|bin|dat|lock)$/i;
-const CORE_FILES = ["package.json", "src/cli.js", "src/managed-runner.js", "src/repository.js", "src/policy-store.js", "src/ask-bridge.js", "src/jobs.js", "README.md"];
+const CORE_FILES = ["package.json", "src/cli.js", "src/runner-orchestration.js", "src/runner-stall.js", "src/runner-retry.js", "src/repository.js", "src/ask-bridge.js", "src/jobs.js", "README.md"];
 
 async function git(cwd, ...args) {
   const { stdout } = await exec("git", args, { cwd, windowsHide: true, timeout: 5000, maxBuffer: 12 * 1024 * 1024 });
@@ -101,15 +100,6 @@ export function matchRepoUnreadable(answer) {
   return null;
 }
 
-function matchesExclude(file, patterns) {
-  return patterns.some((pattern) => {
-    const p = String(pattern).replace(/\\/g, "/").replace(/^!/, "");
-    if (!p) return false;
-    const escaped = p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "\u0000").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]").replace(/\u0000/g, ".*");
-    return new RegExp(`^(?:${escaped})(?:$|/)`).test(file) || (!p.includes("/") && new RegExp(`(?:^|/)${escaped}$`).test(file));
-  });
-}
-
 // Git reports the toplevel with forward slashes, and one directory can have
 // several spellings on Windows: an 8.3 short name (`RUNNER~1`), a junction, a
 // different drive-letter case. Comparing absolute strings therefore fails on
@@ -143,21 +133,10 @@ async function includeLabelsFor({ root, cwd, includes }) {
 
 export async function bundleRepository({ cwd = process.cwd(), excludes = [], includes = [], prompt = "", maxFileBytes = 65536,
   maxTotalBytes = 8 * 1024 * 1024, maxInlineBytes = 30 * 1024 } = {}) {
-  const root = await git(cwd, "rev-parse", "--show-toplevel").catch(() => null);
-  if (!root) throw new WfaError("BUNDLE_REPO_NOT_GIT", "--bundle-repo requires a Git working tree. Use --file <path> instead.");
-  const { stdout } = await exec("git", ["ls-files", "-z", "--cached", "--exclude-standard"], {
-    cwd: root, windowsHide: true, timeout: 10000, encoding: "buffer", maxBuffer: 12 * 1024 * 1024,
-  });
-  const tracked = Buffer.from(stdout).toString("utf8").split("\0").filter(Boolean);
-  const skipped = [];
-  const eligible = tracked.filter((relative) => {
-    const label = relative.replace(/\\/g, "/");
-    const invalid = label.split("/").some((part) => SKIP_DIRS.has(part)) || SKIP_EXT.test(label)
-      || /(?:^|\/)(?:\.env(?:\.|$)|id_rsa|[^/]*\.min\.(?:js|css)$)/i.test(label)
-      || matchesExclude(label, excludes);
-    if (invalid) skipped.push({ path: label, reason: "excluded/generated/binary filename" });
-    return !invalid;
-  });
+  // One tracked-source filter for both transports. They used to keep separate
+  // rules, and the inline copy shipped .npmrc / credentials / id_ed25519 into
+  // the prompt while the zip copy excluded them.
+  const { root, selected: eligible, skipped } = await collectTrackedSources({ cwd, excludes });
   const selectedPaths = await includeLabelsFor({ root, cwd, includes });
   const matchesInclude = (entry) => selectedPaths.some((item) => {
     const label = foldPath(entry);

@@ -4,7 +4,7 @@ import { Store } from "./store.js";
 import { getPaths } from "./paths.js";
 import { loadConfig } from "./config.js";
 import { buildJobs, normalizeProviders, resolveAttachmentPaths, validateConcurrency } from "./jobs.js";
-import { resolveAskBridge, checkAskBridge } from "./ask-bridge.js";
+import { resolveAskBridge, checkAskBridge, runProcess } from "./ask-bridge.js";
 import { workspaceHasBlockingTask, workspaceSessions } from "./state.js";
 import { WfaError } from "./errors.js";
 import { assertUpstreamAvailable } from "./maintenance.js";
@@ -15,8 +15,11 @@ import {
   scanSensitiveText, writeLineNumberedBundle,
 } from "./bundle.js";
 import { isArchiveAttachment, isSensitiveAttachmentPath, isTextSourceAttachment } from "./attachments.js";
-import { refreshTask } from "./runner-stall.js";
+import { refreshTask, guardedBatch } from "./runner-stall.js";
 import { executePreparedTask } from "./runner-retry.js";
+import { bundleRepository, repositoryBlock, resolveRepository } from "./repository.js";
+import { archiveRepository, repositoryArchiveBlock } from "./repository-archive.js";
+import { DEFAULT_STALL_TIMEOUT_SECONDS } from "./constants.js";
 
 async function validateFiles(paths, label) {
   const result = [];
@@ -91,11 +94,11 @@ async function resolveFollowup(snapshot, followupTaskId, providers, workspace, w
     threadUrl: child.threadUrl, resultPath };
 }
 
-function buildProviderPrompts(input, providers, sessionMap, briefText, followup) {
+function buildProviderPrompts(input, providers, sessionMap, briefText, followup, sessionPolicy) {
   const prompts = {};
   const explicitBrief = Boolean(input.briefFile);
   for (const provider of providers) {
-    const needsNewSession = Boolean(input.fresh) || !sessionMap[provider];
+    const needsNewSession = sessionPolicy === "fresh" || !sessionMap[provider];
     const inject = explicitBrief || (!input.noBrief && !followup && needsNewSession);
     prompts[provider] = prependBrief(input.prompt, inject ? briefText : "");
   }
@@ -159,7 +162,20 @@ function withGeminiInline(prompts, inlineBody, inline) {
     gemini: `${prompts.gemini}\n\n## Inlined attachments (${inline.files} file(s), ${inline.bytes} bytes; ask-bridge cannot upload attachments to Gemini)\n\n${inlineBody}` };
 }
 
-export async function executeTask(input, dependencies = {}) {
+// A follow-up used to borrow its parent through a Store subclass that rewrote
+// the parent state inside every transaction. The only thing that needs the
+// rewrite is the check below, so it is an explicit, in-memory view instead.
+function applyFollowupView(snapshot, allowUnreadableFollowup) {
+  const { taskId, provider } = allowUnreadableFollowup ?? {};
+  if (!taskId || !provider) return;
+  const child = snapshot.tasks.tasks[taskId]?.children?.[provider];
+  if (child?.state === "repo_unreadable" && child.repoUnreadable
+    && (child.completionProof || child.collectionSource === "manual-confirmed-get") && !child.threadMismatch) {
+    child.state = "completed";
+  }
+}
+
+async function prepareRequest(input, dependencies = {}) {
   const home = dependencies.home;
   const store = dependencies.store ?? new Store(home);
   const paths = getPaths(home);
@@ -189,6 +205,7 @@ export async function executeTask(input, dependencies = {}) {
     modelByProvider[providers[0]] = input.model;
   }
   let snapshot = await store.snapshot();
+  applyFollowupView(snapshot, input.allowUnreadableFollowup);
   if (!input.dryRun) {
     const latestTaskIds = new Set();
     for (const provider of providers) {
@@ -197,11 +214,17 @@ export async function executeTask(input, dependencies = {}) {
     }
     for (const existingTaskId of latestTaskIds) await refreshTask(existingTaskId, { home, store });
     snapshot = await store.snapshot();
+    applyFollowupView(snapshot, input.allowUnreadableFollowup);
   }
   const followup = await resolveFollowup(snapshot, input.followupTaskId, providers, workspace, workspaceRoot);
   const sessionMap = workspaceSessions(snapshot.tasks.tasks, snapshot.sessions, workspace, providers);
   if (followup) sessionMap[followup.provider] = followup.threadUrl;
-  const autoBriefNeeded = !input.noBrief && (Boolean(input.fresh) || providers.some((provider) => !sessionMap[provider]));
+  // New session is the documented default; --followup and --continue-session
+  // are the two ways to inherit the conversations the ledger already knows.
+  const sessionPolicy = input.sessionPolicy
+    ?? (input.followupTaskId || input.continueSession ? "continue" : "fresh");
+  const autoBriefNeeded = !input.noBrief
+    && (sessionPolicy === "fresh" || providers.some((provider) => !sessionMap[provider]));
   const briefText = await resolveBriefText({ briefFile: input.briefFile, cwd: workspaceRoot, shouldAutoInject: autoBriefNeeded });
   const bundleLines = Boolean(input.bundleLines);
   const textFiles = bundleLines ? files.filter(isTextSourceAttachment) : [];
@@ -237,9 +260,9 @@ export async function executeTask(input, dependencies = {}) {
       filesByProvider.gemini = [];
     }
   }
-  const basePrompts = buildProviderPrompts(input, providers, sessionMap, briefText, followup);
+  const basePrompts = buildProviderPrompts(input, providers, sessionMap, briefText, followup, sessionPolicy);
   const promptByProvider = withGeminiInline(basePrompts, geminiInlineBody, geminiInline);
-  const sessionFingerprint = relevantSessionFingerprint(sessionMap, providers, Boolean(input.fresh));
+  const sessionFingerprint = relevantSessionFingerprint(sessionMap, providers, sessionPolicy === "fresh");
   const sensitiveScan = await buildSensitiveFindings({ promptByProvider, files, images,
     archiveScan: input.archiveScan,
     briefText: Object.values(basePrompts).some((value) => value !== input.prompt) ? briefText : "" });
@@ -318,10 +341,16 @@ export async function executeTask(input, dependencies = {}) {
   for (const filePath of [...files, ...images]) attachmentIdentities.push({ path: filePath, sha256: await hashFile(filePath) });
   const intentHash = sha256(JSON.stringify({
     prompt: input.prompt, providers, workspace, workspaceRoot,
-    attachments: attachmentIdentities,
+    // Identity comes from the bytes, not from the scratch path: a re-archived
+    // repository mints a different file name for the same sources, and the old
+    // path-inclusive hash turned that replay into IDEMPOTENCY_CONFLICT.
+    attachments: attachmentIdentities.map((item) => item.sha256),
     options: {
       kind: input.kind ?? "ask", mode, timeoutSeconds, modelByProvider,
-      fresh: Boolean(input.fresh), followupTaskId: input.followupTaskId ?? null,
+      // The session policy is deliberately not part of the identity: replaying
+      // request_id with --continue-session must recover the original task, and
+      // the default run must not look like a different request from it.
+      followupTaskId: input.followupTaskId ?? null,
       bundleLines, noBrief: Boolean(input.noBrief),
       briefFile: input.briefFile ? path.resolve(workspaceRoot, input.briefFile) : null,
       explicitBriefSha256: input.briefFile ? sha256(briefText) : null,
@@ -351,6 +380,11 @@ export async function executeTask(input, dependencies = {}) {
   // used to run inside the task-store lock, which made every other session wait
   // for it; nothing in the idempotency check depends on the result.
   const preflight = dependencies.skipPreflight ? null : await checkAskBridge(config);
+  // A follow-up may be authorized to continue a repository-unreadable parent.
+  // The deleted PolicyStore used to make that decision inside every write
+  // transaction; executeTask resolves it once and passes it down, so the lock
+  // check here and the snapshot the prompt is built from agree.
+  const allowUnreadableFollowup = input.allowUnreadableFollowup ?? null;
   let createdJobs = [];
   const created = await store.transaction(async ({ tasks, sessions }) => {
     const previousId = tasks.requestIndex?.[requestId];
@@ -362,7 +396,7 @@ export async function executeTask(input, dependencies = {}) {
       return { existing: previous };
     }
     assertUpstreamAvailable(tasks);
-    const blocking = workspaceHasBlockingTask(tasks.tasks, workspace, providers);
+    const blocking = workspaceHasBlockingTask(tasks.tasks, workspace, providers, null, allowUnreadableFollowup);
     if (blocking) {
       const reason = blocking.executionPending
         ? `The owning ask-bridge process is still finishing cleanup. Run \`wfa wait ${blocking.taskId}\`, then retry after it exits.`
@@ -372,8 +406,8 @@ export async function executeTask(input, dependencies = {}) {
     }
     const latestSessions = workspaceSessions(tasks.tasks, sessions, workspace, providers);
     if (followup) latestSessions[followup.provider] = followup.threadUrl;
-    const latestPrompts = withGeminiInline(buildProviderPrompts(input, providers, latestSessions, briefText, followup), geminiInlineBody, geminiInline);
-    const latestSessionFingerprint = relevantSessionFingerprint(latestSessions, providers, Boolean(input.fresh));
+    const latestPrompts = withGeminiInline(buildProviderPrompts(input, providers, latestSessions, briefText, followup, sessionPolicy), geminiInlineBody, geminiInline);
+    const latestSessionFingerprint = relevantSessionFingerprint(latestSessions, providers, sessionPolicy === "fresh");
     if (JSON.stringify(latestPrompts) !== JSON.stringify(promptByProvider)
       || JSON.stringify(latestSessionFingerprint) !== JSON.stringify(sessionFingerprint)) {
       throw new WfaError("SESSION_CHANGED_RETRY", "Workspace conversation state changed while preparing this request. Re-run the command; no provider request was sent.");
@@ -391,7 +425,7 @@ export async function executeTask(input, dependencies = {}) {
     }
     const jobs = buildJobs({
       taskId, providers, prompt: input.prompt, promptByProvider, timeoutSeconds,
-      sessions: latestSessions, fresh: Boolean(input.fresh), files: jobFiles,
+      sessions: latestSessions, fresh: sessionPolicy === "fresh", files: jobFiles,
       filesByProvider, images, modelByProvider,
       allowGeminiAttachments: Boolean(input.allowGeminiAttachments),
       downloadImages: Boolean(input.downloadImages ?? config.downloadImages),
@@ -408,6 +442,11 @@ export async function executeTask(input, dependencies = {}) {
         recoveryHint: null, childPid: null,
       }];
     }));
+    const sessionBaseline = workspaceSessions(
+      Object.fromEntries(Object.entries(tasks.tasks).filter(([key]) => key !== taskId)),
+      sessions, workspace, providers,
+    );
+    if (followup) sessionBaseline[followup.provider] = followup.threadUrl;
     const task = {
       taskId, requestId, payloadHash, intentHash, kind: input.kind ?? "ask", mode,
       workspace, workspaceRoot, providers, fresh: Boolean(input.fresh),
@@ -415,6 +454,12 @@ export async function executeTask(input, dependencies = {}) {
       attachmentCount: files.length + images.length,
       parentPid: input.detach ? null : process.pid,
       childPid: null, detached: Boolean(input.detach),
+      // Fields the old PolicyStore injected through a mutable side channel.
+      sessionPolicy,
+      sessionBaseline,
+      stallTimeoutSeconds: input.stallTimeoutSeconds ?? DEFAULT_STALL_TIMEOUT_SECONDS,
+      bundleRepo: Boolean(input.bundleRepoShipped),
+      repoReference: input.repoReference ?? null,
       lineage: followup ? [...(tasks.tasks[followup.taskId]?.lineage ?? []), followup.taskId] : [],
       runDir, outputDir, inputFile, timeoutSeconds, concurrency,
       bundlePath: bundleInfo?.bundlePath ?? null, bundleSha256: bundleInfo?.sha256 ?? null,
@@ -448,5 +493,121 @@ export async function executeTask(input, dependencies = {}) {
       createdJobs, workspaceRoot, timeoutSeconds });
   } finally {
     heartbeat.stop();
+  }
+}
+
+function positiveInteger(value, label, allowZero = false) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < (allowZero ? 0 : 1)) {
+    throw new WfaError("ARGUMENT_ERROR", `${label} must be ${allowZero ? "a nonnegative" : "a positive"} integer.`);
+  }
+  return number;
+}
+
+// The single public entry. It used to live in managed-runner.js, a second
+// module that wrapped this one and could be bypassed through runner.js, so the
+// same CLI options were validated in two places and behaved differently.
+export async function executeTask(input, dependencies = {}) {
+  const workspaceRoot = path.resolve(input.workspaceRoot ?? process.cwd());
+  const repository = input.repository ?? await resolveRepository({
+    cwd: workspaceRoot, repoUrl: input.repoUrl, noRepo: input.noRepo,
+  });
+  if (input.kind === "code" && !input.files?.length && !repository.available && !input.bundleRepo) {
+    throw new WfaError("ARGUMENT_ERROR", `wfa code requires --file/--dir or a repository reference (${repository.reason}).`);
+  }
+  if (input.bundleRepo && input.noRepo) {
+    throw new WfaError("ARGUMENT_ERROR", "--bundle-repo cannot be combined with --no-repo.");
+  }
+  // Checked before `fresh` is derived from sessionPolicy below, which would
+  // otherwise hide the conflict.
+  if (input.followupTaskId && input.fresh) {
+    throw new WfaError("FOLLOWUP_FRESH_CONFLICT", "--followup cannot be combined with --new-session/--fresh.");
+  }
+  if (input.continueSession && input.fresh) {
+    throw new WfaError("ARGUMENT_ERROR", "--continue-session cannot be combined with --new-session/--fresh.");
+  }
+  const stallTimeoutSeconds = positiveInteger(input.stallTimeoutSeconds ?? DEFAULT_STALL_TIMEOUT_SECONDS, "--stall-timeout", true);
+  const sessionPolicy = input.followupTaskId || input.continueSession ? "continue" : "fresh";
+  const bundleMode = input.bundleRepoMode === "zip" ? "zip" : "inline";
+  const home = dependencies.home;
+  const store = dependencies.store ?? new Store(home);
+  const bundle = input.bundleRepo && bundleMode === "inline" ? await bundleRepository({
+    cwd: workspaceRoot, excludes: input.repoExcludes ?? [], includes: input.files ?? [], prompt: input.prompt,
+  }) : null;
+  // A zip attachment carries the same sources as the inline bundle but travels
+  // as a native upload, so prompt truncation cannot corrupt it.
+  const archive = input.bundleRepo && bundleMode === "zip" ? await archiveRepository({
+    cwd: workspaceRoot, excludes: input.repoExcludes ?? [], prompt: input.prompt,
+    outDir: path.join(getPaths(home).home, "archives"), requestId: input.requestId ?? null,
+  }) : null;
+  if (bundle && !bundle.stats.listed) {
+    throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo found no eligible tracked files. Select paths with --file or adjust --exclude.");
+  }
+  // Decided before prepareRequest because its transaction has to let this
+  // follow-up past the very lock its unreadable parent holds.
+  let allowUnreadableFollowup = null;
+  if (input.followupTaskId) {
+    const intentSnapshot = await store.snapshot();
+    const followupProvider = input.providers?.length === 1 ? input.providers[0] : input.provider;
+    if (followupProvider
+      && intentSnapshot.tasks.tasks[input.followupTaskId]?.children?.[followupProvider]?.repoUnreadable) {
+      allowUnreadableFollowup = { taskId: input.followupTaskId, provider: followupProvider };
+    }
+  }
+  let prompt = input.prompt;
+  const shipsRepository = repository.available && !bundle && !archive;
+  // The inline bundle and the remote-reading contract are mutually exclusive.
+  // In particular do not ask a bundled follow-up to return REPO_UNREADABLE.
+  if (shipsRepository) prompt = `${repositoryBlock(repository)}\n\n${prompt}`;
+  if (bundle) prompt += `\n\n${bundle.content}\nEND SOURCE BUNDLE`;
+  if (archive) prompt += `\n\n${repositoryArchiveBlock(archive, repository)}\n`;
+  try {
+    const result = await prepareRequest({
+      ...input, prompt, workspaceRoot,
+      // `fresh` stays the caller's explicit flag; the session the run actually
+      // uses comes from sessionPolicy below, so a default ask does not look
+      // like a brand-new request to every provider.
+      fresh: Boolean(input.fresh),
+      noBrief: Boolean(input.noBrief || (shipsRepository && !input.briefFile)),
+      files: bundle ? [] : (archive ? [...(input.files ?? []), archive.file] : input.files),
+      bundleLines: bundle || archive ? false : input.bundleLines,
+      // Zip entries are scanned while they are packed; hand the findings to the
+      // same gate the inline bundle goes through.
+      archiveScan: archive ? {
+        file: archive.file,
+        findings: archive.secretFindings ?? [],
+        scannedFiles: archive.scannedFiles ?? 0,
+        totalFiles: archive.stats.files,
+      } : null,
+      // One provider per batch is the production default so a tab closed by one
+      // job cannot take another provider's page with it. Tests and library
+      // callers that pass no workspaceRoot keep both jobs in one batch.
+      sequentialBatches: Boolean(input.sequentialBatches ?? (Boolean(input.workspaceRoot) && repository.available)),
+      sessionPolicy,
+      allowUnreadableFollowup,
+      stallTimeoutSeconds,
+      bundleRepoShipped: Boolean(bundle) || Boolean(archive),
+      repoReference: shipsRepository ? {
+        url: repository.url, branch: repository.branch, commit: repository.commit,
+        warnings: repository.warnings ?? [],
+      } : null,
+    }, {
+      ...dependencies, store,
+      runProcess: (...args) => guardedBatch(dependencies.runProcess ?? runProcess, ...args, store, stallTimeoutSeconds),
+    });
+    if (result.dryRun) {
+      result.preview.repository = repository;
+      result.preview.repositoryWarnings = repository.warnings ?? [];
+      result.preview.bundleRepo = bundle?.stats ?? null;
+      result.preview.repositoryArchive = archive?.stats ?? null;
+      result.preview.sessionPolicy = sessionPolicy;
+      result.preview.stallTimeoutSeconds = stallTimeoutSeconds;
+    }
+    return result;
+  } catch (error) {
+    if (bundle && error.code === "PROMPT_OVERSIZE") {
+      throw new WfaError("PROMPT_OVERSIZE", `${error.message} For a whole-repository request prefer --bundle-repo=zip, which attaches the sources instead of inlining them; otherwise narrow the bundle with --file <path> and --exclude 'docs/**'. Do not rely on --allow-oversize because upstream truncates prompt text.`);
+    }
+    throw error;
   }
 }

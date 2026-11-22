@@ -5,6 +5,26 @@ description: Default web-first reasoning and complete-code delegation workflow f
 
 # Web-First
 
+## Hard rule: code work is always delegated, never hand-written
+
+Every code problem — a bug, a failing test, a refactor, a feature, a review, a
+"small" fix someone already diagnosed — is sent to `wfa` with **both providers**
+(the default `gemini,chatgpt` pair) and comes back as complete file contents or
+an exact patch. The local agent does not write the fix itself.
+
+- Do not read the codebase to build your own hypothesis before delegating.
+- Do not type a fix the providers did not return. Integrating their patch,
+  running tests, reporting results and committing is the whole local job.
+- The only exception is an explicit instruction from the user that this request
+  must not use agents / must not call `wfa`. "It looked small", "it was faster",
+  "I had already found the cause" are **not** exceptions, and neither is a
+  half-finished refactor you started earlier.
+- When the two providers disagree, take the stricter/safer variant or ask the
+  user. Do not settle the disagreement by writing your own version.
+- If a provider answers off-topic, returns only a link, or hands back a sandbox
+  attachment instead of `FILE:` blocks, that run failed the delivery contract:
+  re-send with a tighter prompt rather than filling the gap yourself.
+
 ## Core role split
 
 - **Gemini (Task mode) + ChatGPT are the default reasoning and implementation partners.** Every `wfa` call goes to both providers, serially, unless the user explicitly asks for one, or one provider is structurally unable to do the task (Gemini document attachments — see Provider known limits). Gemini runs first and lands in Task mode by default, so read the `Gemini mode:` line of every run (see the default pair note below) instead of assuming the switch was pressed.
