@@ -12,8 +12,9 @@
   environments block that. Run with -SelfTest to check capability first:
   it prints whether WinForms can be loaded and exits without showing an icon.
 
-.PARAMETER Home
-  Broker data directory. Defaults to %LOCALAPPDATA%\web-first-ask.
+.PARAMETER BrokerHome
+  Broker data directory. Defaults to %LOCALAPPDATA%\web-first-ask. Pass the same
+  value as WFA_HOME when the CLI uses an override.
 
 .PARAMETER SelfTest
   Only probe WinForms availability, then exit.
