@@ -18,6 +18,7 @@ import { truncate } from "./util.js";
 import { expandAttachmentInputs } from "./attachments.js";
 import { readTaskResult, stageTaskFiles, applyStagedFiles } from "./stage.js";
 import { runCdpCommand } from "./engines/cdp-cli.js";
+import { runBrokerCommand } from "./broker/cli.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const VALUE_FLAGS = new Set([
@@ -194,6 +195,8 @@ Commands:
   wfa gemini-mode [chat|task]          Show or save default Gemini landing mode (chat or task)
   wfa doctor    Check Node.js, ask-bridge integration and Chrome startup repair
   wfa unlock    Clear a task-store lock whose owner is gone (rename first, then unlink)
+  wfa cdp       Native CDP engine (no ask-bridge): ask | login | status
+  wfa broker    Turn queue in front of the CDP engine: start | ask | status | turns | wait | stop
   wfa install-skill [--target codex|workbuddy|path]  Install web-first Skill
   wfa upstream update  Update ask-bridge using its official updater
 
@@ -342,6 +345,10 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   }
   if (command === "cdp") {
     const res = await runCdpCommand(rest, deps);
+    return res?.code ?? 0;
+  }
+  if (command === "broker") {
+    const res = await runBrokerCommand(rest, deps);
     return res?.code ?? 0;
   }
   const { positional, options } = parseArgs(rest);

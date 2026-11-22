@@ -23,6 +23,7 @@ export async function runCdpTurn({
   stallTimeoutMs = 180000,
   hardTimeoutMs = 900000,
   keepBrowser = false,
+  signal,
   deps = {},
 } = {}) {
   const startTime = Date.now();
@@ -63,6 +64,18 @@ export async function runCdpTurn({
     probes: deps.probes,
   });
 
+  if (signal?.aborted) {
+    return {
+      status: "failed",
+      text: "",
+      reason: "cancelled",
+      evidence: null,
+      conversationUrl: "",
+      browser: null,
+      elapsedMs: Date.now() - startTime,
+    };
+  }
+
   if (recovery.action === "RECOVERY_REQUIRED") {
     return {
       status: "needs_human",
@@ -79,7 +92,7 @@ export async function runCdpTurn({
     return {
       status: "failed",
       text: "",
-      reason: recovery.reason || "CHROME_PORT_MISSING",
+      reason: String(recovery.reason || "chrome_port_missing").toLowerCase(),
       evidence: recovery.evidence || null,
       conversationUrl: "",
       browser: null,
@@ -91,13 +104,49 @@ export async function runCdpTurn({
   let targetId = null;
   let sessionId = null;
   let conversationUrl = adapter.url || "";
+  let submitted = false;
+  let submittedAt = null;
+
+  const tryCancelActiveGeneration = async () => {
+    if (submitted && cdp && sessionId) {
+      try {
+        await Promise.race([
+          (async () => {
+            await cdp.send("Input.dispatchKeyEvent", {
+              type: "rawKeyDown",
+              windowsVirtualKeyCode: 27,
+              key: "Escape",
+              code: "Escape",
+            }, sessionId);
+            await cdp.send("Input.dispatchKeyEvent", {
+              type: "keyUp",
+              windowsVirtualKeyCode: 27,
+              key: "Escape",
+              code: "Escape",
+            }, sessionId);
+          })(),
+          new Promise((r) => setTimeout(r, 450)),
+        ]);
+      } catch {}
+    }
+  };
 
   try {
     cdp = await connect(recovery.chrome.port);
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
 
     const tab = await driver.openTab(cdp, adapter.url, { timeoutMs: hardTimeoutMs });
     targetId = tab.targetId;
     sessionId = tab.sessionId;
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
 
     if (mode === "background") {
       try {
@@ -124,14 +173,51 @@ export async function runCdpTurn({
     await driver.waitForEditor(cdp, sessionId, adapter, {
       timeoutMs: hardTimeoutMs,
       sleep: sleepFn,
+      signal,
     });
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
 
     const initialState = await driver.readTurnState(cdp, sessionId, adapter);
+    if (initialState?.loggedOut) {
+      return {
+        status: "needs_human",
+        text: "",
+        reason: "login_required",
+        evidence: { title: initialState.title || "", adapter: adapter.id, loggedOut: true },
+        conversationUrl,
+        browser: {
+          pid: recovery.chrome?.pid ?? null,
+          port: recovery.chrome?.port ?? null,
+          mode,
+          reused: recovery.action === "ADOPT",
+        },
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+
     const baselineUserTurns = initialState?.userTurns ?? 0;
     const baselineAnswerTurns = initialState?.answerTurns ?? 0;
 
     await driver.typePrompt(cdp, sessionId, adapter, prompt);
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
+
     await driver.submitTurn(cdp, sessionId, adapter);
+    submitted = true;
+    submittedAt = Date.now();
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      err.sendCommittedAt = submittedAt;
+      throw err;
+    }
 
     const completion = await driver.waitForCompletion(cdp, sessionId, adapter, {
       baselineUserTurns,
@@ -140,7 +226,14 @@ export async function runCdpTurn({
       stallTimeoutMs,
       hardTimeoutMs,
       sleep: sleepFn,
+      signal,
     });
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      err.sendCommittedAt = submittedAt;
+      throw err;
+    }
 
     try {
       const urlRes = await cdp.send("Runtime.evaluate", {
@@ -155,9 +248,10 @@ export async function runCdpTurn({
     return {
       status: completion.status,
       text: completion.text || "",
-      reason: completion.reason || "",
+      reason: completion.reason ? String(completion.reason).toLowerCase() : "",
       evidence: completion.evidence || null,
       conversationUrl,
+      ...(submittedAt != null ? { sendCommittedAt: submittedAt } : {}),
       browser: {
         pid: recovery.chrome?.pid ?? null,
         port: recovery.chrome?.port ?? null,
@@ -167,17 +261,40 @@ export async function runCdpTurn({
       elapsedMs: Date.now() - startTime,
     };
   } catch (error) {
+    if (signal?.aborted || error?.code === "CANCELLED") {
+      await tryCancelActiveGeneration();
+      const committedAt = submittedAt != null ? submittedAt : (error?.sendCommittedAt != null ? error.sendCommittedAt : null);
+      return {
+        status: "failed",
+        text: "",
+        reason: "cancelled",
+        evidence: null,
+        conversationUrl,
+        ...(committedAt != null ? { sendCommittedAt: committedAt } : {}),
+        browser: {
+          pid: recovery?.chrome?.pid ?? null,
+          port: recovery?.chrome?.port ?? null,
+          mode,
+          reused: recovery?.action === "ADOPT",
+        },
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+
     const classifier = driver.classifyRunError || classifyRunError;
     const classified = typeof classifier === "function"
       ? classifier(error)
       : { state: "failed", code: error?.code || "UNKNOWN_ERROR", detail: error?.message || String(error) };
 
+    const committedAt = submittedAt != null ? submittedAt : (error?.sendCommittedAt != null ? error.sendCommittedAt : null);
+    const reasonCode = error?.code || classified.code || "unknown_error";
     return {
       status: classified.state,
       text: "",
-      reason: error?.code || classified.code || "UNKNOWN_ERROR",
+      reason: String(reasonCode).toLowerCase(),
       evidence: error?.details || { message: error?.message || String(error) },
       conversationUrl,
+      ...(committedAt != null ? { sendCommittedAt: committedAt } : {}),
       browser: {
         pid: recovery?.chrome?.pid ?? null,
         port: recovery?.chrome?.port ?? null,

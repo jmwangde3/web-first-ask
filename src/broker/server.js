@@ -55,6 +55,9 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   let closing = false;
   let idleSince = Date.now();
   let idleTriggered = false;
+  let boundPort = null;
+  let resolveClosed;
+  const closed = new Promise((resolve) => { resolveClosed = resolve; });
 
   function hasWork() {
     const state = snapshot(scheduler);
@@ -135,7 +138,8 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     if (req.method === "GET" && pathname === "/status") {
       const state = snapshot(scheduler);
       send(res, 200, {
-        instanceId, pid: process.pid, startedAt, mode, chrome: runner.chrome ?? null,
+        instanceId, pid: process.pid, port: boundPort, url: boundPort ? `http://127.0.0.1:${boundPort}` : null,
+        startedAt, mode, chrome: runner.chrome ?? null,
         providers: { chatgpt: state.runningByProvider.chatgpt ?? 0, gemini: state.runningByProvider.gemini ?? 0 },
         turns: [...turns.values()].map(publicView), scheduler: state,
       });
@@ -230,8 +234,12 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
           }
         }
       } finally {
-        await clearBrokerRecord(home, instanceId);
-        await lock.release();
+        try {
+          await clearBrokerRecord(home, instanceId);
+          await lock.release();
+        } finally {
+          resolveClosed();
+        }
       }
     })();
     return closePromise;
@@ -255,6 +263,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
       server.listen(0, "127.0.0.1", () => { server.removeListener("error", reject); resolve(); });
     });
     const port = server.address().port;
+    boundPort = port;
     await writeBrokerRecord(home, {
       schema: 1, instanceId, pid: process.pid, host: "127.0.0.1", port,
       token, startedAt, mode, chrome: runner.chrome ?? null,
@@ -276,12 +285,13 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
       }
     }, Math.min(idleTimeoutMs, 1000));
     idleTimer.unref();
-    return { port, token, instanceId, close, url: `http://127.0.0.1:${port}` };
+    return { port, token, instanceId, close, closed, url: `http://127.0.0.1:${port}` };
   } catch (error) {
     closing = true;
     if (server?.listening) await new Promise(resolve => server.close(resolve));
     await clearBrokerRecord(home, instanceId);
     await lock.release();
+    resolveClosed();
     throw error;
   }
 }

@@ -156,8 +156,13 @@ test("HTTP authentication, completion, runner exception, release, and shutdown",
     return r.json.state === "failed" ? r.json : null;
   });
   assert.equal(failed.reason, "TEST_FAIL");
-  assert.equal((await request(record, "GET", "/status")).json.scheduler.runningTotal, 0);
+  const statusRes = await request(record, "GET", "/status");
+  assert.equal(statusRes.json.scheduler.runningTotal, 0);
+  assert.equal(statusRes.json.port, server.port);
+  assert.equal(statusRes.json.url, server.url);
   assert.equal((await request(record, "POST", "/shutdown")).status, 202);
+  await server.closed;
+  assert.ok(true, "server.closed resolved");
   await eventually(async () => !await discoverBroker(home));
   await eventually(async () => {
     try { await fetch(`${server.url}/status`); return false; }

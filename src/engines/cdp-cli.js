@@ -3,6 +3,17 @@ import path from "node:path";
 import { getHomeDir } from "../paths.js";
 import { WfaError } from "../errors.js";
 import { runCdpTurn } from "./cdp-engine.js";
+import { recoverBrowser } from "../browser/recovery.js";
+import { connectCdp } from "../browser/cdp.js";
+import * as defaultDriver from "../browser/driver.js";
+import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
+import * as geminiAdapter from "../browser/adapters/gemini.js";
+import { sleep as defaultSleep } from "../util.js";
+
+const DEFAULT_ADAPTERS = {
+  chatgpt: chatgptAdapter,
+  gemini: geminiAdapter,
+};
 
 const VALUE_FLAGS = new Set([
   "provider",
@@ -68,12 +79,14 @@ Commands:
   wfa cdp ask    --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
                  [--mode background|visible|headless] [--json] [--timeout <s>] [--settle <ms>]
   wfa cdp status [--json]
+  wfa cdp login  [--provider <chatgpt|gemini>] [--mode visible|background]
+                 [--timeout <seconds>] [--json]
 
 Options:
   --provider <name>       chatgpt or gemini
   --prompt <text>         Prompt string
   --prompt-file <path>    Path to prompt file
-  --mode <mode>           background (default), visible, or headless
+  --mode <mode>           background (default for ask, visible for login), visible, or headless
   --json                  Output machine-readable JSON
   --timeout <seconds>     Overall / stall timeout in seconds
   --settle <ms>           Answer stabilization window in milliseconds (default: 4000)
@@ -113,6 +126,142 @@ async function handleStatus(options, deps) {
   }
 
   return { code: 0 };
+}
+
+async function handleLogin(argv, deps) {
+  const stdout = deps.stdout || process.stdout;
+  const { options } = parseArgs(argv);
+
+  if (options.help) {
+    printCdpHelp(stdout);
+    return { code: 0 };
+  }
+
+  const provider = options.provider ? String(options.provider).toLowerCase() : "chatgpt";
+  if (provider !== "chatgpt" && provider !== "gemini") {
+    throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt or gemini.`);
+  }
+
+  let mode = "visible";
+  if (options.mode) {
+    mode = String(options.mode).toLowerCase();
+    if (!["visible", "background", "headless"].includes(mode)) {
+      throw new WfaError("INVALID_ARGUMENT", `Invalid mode: ${options.mode}. Must be visible or background.`);
+    }
+  }
+
+  let timeoutSec = 900;
+  if (options.timeout !== undefined) {
+    const t = Number(options.timeout);
+    if (!Number.isFinite(t) || t <= 0) {
+      throw new WfaError("INVALID_ARGUMENT", `Invalid --timeout: ${options.timeout}`);
+    }
+    timeoutSec = t;
+  }
+
+  const recover = deps.recoverBrowser || recoverBrowser;
+  const connect = deps.connectCdp || connectCdp;
+  const driver = deps.driver || defaultDriver;
+  const sleepFn = deps.sleep || defaultSleep;
+  const nowFn = deps.now || (() => Date.now());
+  const home = deps.home || getHomeDir();
+
+  const recovery = await recover({
+    home,
+    mode,
+    chromePath: options["chrome-path"],
+    probes: deps.probes,
+  });
+
+  if (!recovery.chrome?.port) {
+    throw new WfaError("CHROME_START_FAILED", "Chrome port is missing from recovery");
+  }
+
+  let cdp = null;
+  let targetId = null;
+  let sessionId = null;
+
+  try {
+    cdp = await connect(recovery.chrome.port);
+    const adapters = deps.adapters || DEFAULT_ADAPTERS;
+    const adapter = adapters[provider] || (provider === "gemini" ? geminiAdapter : chatgptAdapter);
+    const targetUrl = adapter.url || (provider === "gemini" ? "https://gemini.google.com/app" : "https://chatgpt.com/");
+
+    const tab = await driver.openTab(cdp, targetUrl, { timeoutMs: timeoutSec * 1000 });
+    targetId = tab.targetId;
+    sessionId = tab.sessionId;
+
+    if (!options.json) {
+      stdout.write("[cdp] a visible Chrome window is open. Log in, then leave it running; this command polls until the logged-in composer appears.\n");
+    }
+
+    const pollIntervalMs = deps.pollIntervalMs || 2000;
+    const startTime = nowFn();
+    const deadline = startTime + timeoutSec * 1000;
+
+    let loggedIn = false;
+    let finalTitle = "";
+
+    const checkExpr = provider === "chatgpt"
+      ? `(() => {
+          const hasLoggedInEditor = Boolean(document.querySelector('div.ProseMirror[contenteditable="true"]')) && !document.querySelector('textarea#mobile-composer-prompt');
+          const title = document.title || "";
+          return { loggedIn: hasLoggedInEditor, title };
+        })()`
+      : `(() => {
+          const hasUserQuery = document.querySelectorAll("user-query").length > 0;
+          const hasAccountBtn = Boolean(document.querySelector('button[aria-label*="Google 账号"], img[aria-label*="个人资料"]'));
+          const title = document.title || "";
+          return { loggedIn: (hasUserQuery || hasAccountBtn), title };
+        })()`;
+
+    const challengePattern = adapter.challengeTitlePattern || /请稍候|just a moment|verifying|security check|cloudflare|人机验证/i;
+
+    while (nowFn() < deadline) {
+      try {
+        const evalRes = await cdp.send("Runtime.evaluate", {
+          expression: checkExpr,
+          returnByValue: true,
+        }, sessionId);
+
+        const val = evalRes?.result?.value;
+        if (val) {
+          finalTitle = val.title || "";
+          const isChallenged = challengePattern.test(finalTitle);
+          if (val.loggedIn && !isChallenged) {
+            loggedIn = true;
+            break;
+          }
+        }
+      } catch (err) {
+        if (err?.code === "CDP_CLOSED") throw err;
+      }
+
+      await sleepFn(pollIntervalMs);
+    }
+
+    if (loggedIn) {
+      if (options.json) {
+        stdout.write(`${JSON.stringify({ status: "completed", provider, title: finalTitle }, null, 2)}\n`);
+      } else {
+        stdout.write(`[cdp] logged in as ${finalTitle}\n`);
+      }
+      return { code: 0, result: { status: "completed", provider, title: finalTitle } };
+    }
+
+    if (options.json) {
+      stdout.write(`${JSON.stringify({ status: "timeout", provider, timeout: timeoutSec }, null, 2)}\n`);
+    } else {
+      stdout.write(`[cdp] login not detected within ${timeoutSec}s; the profile is unchanged\n`);
+    }
+    return { code: 1, result: { status: "timeout", provider, timeout: timeoutSec } };
+  } finally {
+    if (cdp) {
+      try {
+        cdp.close();
+      } catch {}
+    }
+  }
 }
 
 async function handleAsk(argv, deps) {
@@ -221,8 +370,8 @@ export async function runCdpCommand(argv = [], deps = {}) {
   }
 
   const subcmd = argv[0];
-  if (!subcmd || !["ask", "status"].includes(subcmd)) {
-    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|status>\n`);
+  if (!subcmd || !["ask", "status", "login"].includes(subcmd)) {
+    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|status|login>\n`);
     return { code: 2 };
   }
 
@@ -234,6 +383,10 @@ export async function runCdpCommand(argv = [], deps = {}) {
         return { code: 0 };
       }
       return await handleStatus(options, deps);
+    }
+    if (subcmd === "login") {
+      const loginFn = deps.runCdpLogin || handleLogin;
+      return await loginFn(argv.slice(1), deps);
     }
     return await handleAsk(argv.slice(1), deps);
   } catch (error) {

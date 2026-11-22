@@ -1,7 +1,8 @@
 export const id = "chatgpt";
 export const url = "https://chatgpt.com/";
-export const editorSelector = 'div.ProseMirror[contenteditable="true"]';
+export const editorSelector = '#prompt-textarea, div.ProseMirror[contenteditable="true"], textarea#mobile-composer-prompt, [role="textbox"][contenteditable="true"]';
 export const stopSelector = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"]';
+export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证/i;
 
 export function buildAnswerTextJs() {
   return `(() => {
@@ -49,8 +50,8 @@ export function buildReadStateJs() {
     }
   }
 
-  const editor = document.querySelector('div.ProseMirror[contenteditable="true"]');
-  const editorEmpty = !editor || (editor.innerText || editor.textContent || "").trim() === "";
+  const ed = document.querySelector(${JSON.stringify(editorSelector)});
+  const editorEmpty = !ed || ((("value" in ed) ? ed.value : (ed.innerText || ed.textContent || "")).trim() === "");
 
   const stopEl = document.querySelector('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"]');
   let stopVisible = false;
@@ -66,8 +67,11 @@ export function buildReadStateJs() {
   const title = document.title || "";
   const hasChallenge = Boolean(
     document.querySelector('iframe[src*="challenges.cloudflare.com"], input[type="password"]') ||
+    ${challengeTitlePattern.toString()}.test(title) ||
     /cloudflare|just a moment|security check|challenges\\.cloudflare\\.com/i.test(title)
   );
+
+  const loggedOut = !document.querySelector('div.ProseMirror[contenteditable="true"]') && Boolean(document.querySelector('textarea#mobile-composer-prompt'));
 
   return JSON.stringify({
     userTurns,
@@ -77,6 +81,7 @@ export function buildReadStateJs() {
     editorEmpty,
     title,
     hasChallenge,
+    loggedOut,
   });
 })()`;
 }

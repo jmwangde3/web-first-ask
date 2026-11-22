@@ -45,18 +45,35 @@ export async function waitForEditor(cdp, sessionId, adapter, {
   pollIntervalMs = 200,
   now = () => Date.now(),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  signal,
 } = {}) {
   const startTime = now();
   const expression = `(() => {
     const el = document.querySelector(${JSON.stringify(adapter.editorSelector)});
+    const bodyText = (document.body && (document.body.innerText || document.body.textContent) || "").trim();
+    const hasPassword = Boolean(document.querySelector('input[type="password"]'));
     return {
       found: Boolean(el),
       title: document.title || "",
+      hasPassword,
+      bodyLength: bodyText.length,
+      emptyBody: bodyText.length === 0,
     };
   })()`;
 
   let lastTitle = "";
+  let lastBodyLength = 0;
+  let lastHasPassword = false;
+  let consecutiveChallenged = 0;
+
+  const challengePattern = adapter.challengeTitlePattern || /cloudflare|just a moment|security check|challenges\.cloudflare\.com/i;
+
   while (now() - startTime < timeoutMs) {
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
     try {
       const res = await cdp.send("Runtime.evaluate", {
         expression,
@@ -68,14 +85,50 @@ export async function waitForEditor(cdp, sessionId, adapter, {
         if (typeof val.title === "string") {
           lastTitle = val.title;
         }
+        if (typeof val.bodyLength === "number") {
+          lastBodyLength = val.bodyLength;
+        }
         if (val.found) {
           return true;
         }
+
+        const titleMatches = challengePattern.test(val.title || "");
+        const hasPassword = Boolean(val.hasPassword);
+
+        lastHasPassword = hasPassword;
+
+        const isPollChallenged = hasPassword || titleMatches;
+        if (isPollChallenged) {
+          consecutiveChallenged += 1;
+          if (consecutiveChallenged >= 2) {
+            const err = new WfaError(
+              "HUMAN_VERIFICATION_REQUIRED",
+              `Human verification required for ${adapter.id} (title: "${lastTitle}")`,
+              { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength } }
+            );
+            err.title = lastTitle;
+            throw err;
+          }
+        } else {
+          consecutiveChallenged = 0;
+        }
       }
     } catch (err) {
-      if (err?.code === "CDP_CLOSED") throw err;
+      if (err?.code === "CDP_CLOSED" || err?.code === "CANCELLED" || err?.code === "HUMAN_VERIFICATION_REQUIRED") throw err;
     }
     await sleep(pollIntervalMs);
+  }
+
+  const isChallenge = Boolean(lastHasPassword || challengePattern.test(lastTitle));
+
+  if (isChallenge) {
+    const err = new WfaError(
+      "HUMAN_VERIFICATION_REQUIRED",
+      `Human verification required for ${adapter.id} (title: "${lastTitle}")`,
+      { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength } }
+    );
+    err.title = lastTitle;
+    throw err;
   }
 
   const err = new WfaError(
@@ -95,15 +148,14 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
 
   const focusExpr = `(() => {
     const el = document.querySelector(${JSON.stringify(adapter.editorSelector)});
-    if (!el) return false;
+    if (!el) return { kind: "none" };
     el.focus();
-    const r = document.createRange();
-    r.selectNodeContents(el);
-    r.collapse(false);
-    const s = getSelection();
-    s.removeAllRanges();
-    s.addRange(r);
-    return true;
+    const kind = ("value" in el) ? "value" : "editable";
+    if (kind === "editable") {
+      const r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
+      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+    }
+    return { kind };
   })()`;
 
   const focusRes = await cdp.send("Runtime.evaluate", {
@@ -111,14 +163,47 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
     returnByValue: true,
   }, sessionId);
 
-  if (!focusRes?.result?.value) {
+  const val = focusRes?.result?.value;
+  let kind = "none";
+  if (val === true) {
+    kind = "editable";
+  } else if (val && typeof val === "object" && typeof val.kind === "string") {
+    kind = val.kind;
+  }
+
+  if (!kind || kind === "none") {
     const err = new WfaError("EDITOR_NOT_FOUND", `Editor element not found for ${adapter.id}`);
     throw err;
   }
 
-  await cdp.send("Input.insertText", { text }, sessionId);
+  if (kind === "editable") {
+    await cdp.send("Input.insertText", { text }, sessionId);
+    return { typedChars: text.length };
+  }
 
-  return { typedChars: text.length };
+  if (kind === "value") {
+    const valueExpr = `(() => {
+      const el = document.querySelector(${JSON.stringify(adapter.editorSelector)});
+      if (!el) return false;
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+      setter.call(el, ${JSON.stringify(text)});
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      return el.value === ${JSON.stringify(text)};
+    })()`;
+
+    const valRes = await cdp.send("Runtime.evaluate", {
+      expression: valueExpr,
+      returnByValue: true,
+    }, sessionId);
+
+    if (valRes?.result?.value) {
+      return { typedChars: text.length };
+    }
+    throw new WfaError("PROMPT_NOT_TYPED", `Failed to set value on editor for ${adapter.id}`);
+  }
+
+  throw new WfaError("PROMPT_NOT_TYPED", `Unknown editor kind "${kind}" for ${adapter.id}`);
 }
 
 export async function submitTurn(cdp, sessionId, adapter) {
@@ -157,6 +242,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       editorEmpty: false,
       title: "",
       hasChallenge: false,
+      loggedOut: false,
     };
   }
 
@@ -170,6 +256,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       editorEmpty: Boolean(parsed.editorEmpty),
       title: typeof parsed.title === "string" ? parsed.title : "",
       hasChallenge: Boolean(parsed.hasChallenge),
+      loggedOut: Boolean(parsed.loggedOut),
     };
   } catch {
     return {
@@ -180,6 +267,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       editorEmpty: false,
       title: "",
       hasChallenge: false,
+      loggedOut: false,
     };
   }
 }
@@ -195,6 +283,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   pollIntervalMs = 500,
   now = () => Date.now(),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  signal,
 } = {}) {
   const startTime = now();
   let lastProgressAt = startTime;
@@ -204,7 +293,14 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   let lastState = null;
   let stopVisibleSince = null;
 
+  const challengePattern = adapter.challengeTitlePattern || /cloudflare|just a moment|security check|challenges\.cloudflare\.com/i;
+
   while (true) {
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
     const elapsedMs = now() - startTime;
     if (elapsedMs >= hardTimeoutMs) {
       return {
@@ -227,8 +323,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 
     if (
       state.hasChallenge ||
-      /challenges\.cloudflare\.com|input\[type="password"\]/i.test(state.title) ||
-      /cloudflare|just a moment|security check|challenges\.cloudflare\.com/i.test(state.title)
+      challengePattern.test(state.title || "")
     ) {
       return {
         status: "needs_human",

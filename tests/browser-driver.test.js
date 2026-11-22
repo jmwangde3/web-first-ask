@@ -102,7 +102,7 @@ test("waitForEditor: throws EDITOR_NOT_FOUND with document.title on timeout", as
           result: {
             value: {
               found: false,
-              title: "Checking your browser - Cloudflare",
+              title: "ChatGPT - Service Unavailable",
             },
           },
         };
@@ -122,8 +122,8 @@ test("waitForEditor: throws EDITOR_NOT_FOUND with document.title on timeout", as
     }),
     (err) => {
       assert.equal(err.code, "EDITOR_NOT_FOUND");
-      assert.match(err.message, /Checking your browser - Cloudflare/);
-      assert.equal(err.title, "Checking your browser - Cloudflare");
+      assert.match(err.message, /ChatGPT - Service Unavailable/);
+      assert.equal(err.title, "ChatGPT - Service Unavailable");
       return true;
     }
   );

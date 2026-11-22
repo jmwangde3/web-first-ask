@@ -47,6 +47,9 @@ export function buildReadStateJs() {
     /sign in|log in|登录|人机验证/i.test(title)
   );
 
+  const signInEl = document.querySelector('button[aria-label*="登录"], button[aria-label*="Sign in"], button[aria-label*="Sign In"], a[href*="accounts.google.com"]');
+  const loggedOut = userTurns === 0 && Boolean(signInEl);
+
   return JSON.stringify({
     userTurns,
     answerTurns,
@@ -55,6 +58,7 @@ export function buildReadStateJs() {
     editorEmpty,
     title,
     hasChallenge,
+    loggedOut,
   });
 })()`;
 }

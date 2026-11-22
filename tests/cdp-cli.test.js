@@ -201,7 +201,7 @@ test("runCdpTurn: driver throws EDITOR_NOT_FOUND -> returns status failed and re
   });
 
   assert.equal(result.status, "failed");
-  assert.equal(result.reason, "EDITOR_NOT_FOUND");
+  assert.equal(result.reason, "editor_not_found");
 });
 
 test("runCdpCommand ask --json: normal output can be parsed by JSON.parse", async () => {
@@ -413,7 +413,175 @@ test("cli.js dispatch: main(['cdp', '--help']) delegates to cdp-cli and returns 
     const code = await main(["cdp", "--help"]);
     assert.equal(code, 0);
     assert.ok(stdout.output.includes("wfa cdp ask"));
+    assert.ok(stdout.output.includes("wfa cdp login"));
   } finally {
     process.stdout.write = origStdoutWrite;
   }
 });
+
+test("wfa cdp login: success path returns marker on 2nd poll and never kills Chrome", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let pollCount = 0;
+  let killCalled = false;
+  let socketClosed = false;
+
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Runtime.evaluate") {
+        pollCount++;
+        return {
+          result: {
+            value: {
+              loggedIn: pollCount >= 2,
+              title: pollCount >= 2 ? "Logged In - ChatGPT" : "Login to ChatGPT",
+            },
+          },
+        };
+      }
+      return {};
+    },
+    close: () => {
+      socketClosed = true;
+    },
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    kill: () => {
+      killCalled = true;
+    },
+    recoverBrowser: async ({ mode }) => {
+      assert.equal(mode, "visible");
+      return {
+        action: "SAFE_START",
+        chrome: { pid: 777, port: 9222 },
+      };
+    },
+    connectCdp: async () => mockCdp,
+    driver: {
+      openTab: async () => ({ targetId: "tab-1", sessionId: "sess-1" }),
+    },
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.equal(pollCount, 2);
+  assert.equal(killCalled, false, "Chrome must never be killed");
+  assert.equal(socketClosed, true, "CDP socket must be closed");
+  assert.match(stdout.output, /logged in as Logged In - ChatGPT/);
+});
+
+test("wfa cdp login: timeout path exits with code 1 and never kills Chrome", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let killCalled = false;
+
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              loggedIn: false,
+              title: "Login to ChatGPT",
+            },
+          },
+        };
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--timeout", "5"], {
+    stdout,
+    stderr,
+    kill: () => {
+      killCalled = true;
+    },
+    recoverBrowser: async () => ({
+      action: "ADOPT",
+      chrome: { pid: 888, port: 9222 },
+    }),
+    connectCdp: async () => mockCdp,
+    driver: {
+      openTab: async () => ({ targetId: "tab-1", sessionId: "sess-1" }),
+    },
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms + 5000;
+    },
+    pollIntervalMs: 200,
+  });
+
+  assert.equal(res.code, 1);
+  assert.equal(killCalled, false, "Chrome must never be killed on timeout");
+  assert.match(stdout.output, /login not detected within 5s/);
+});
+
+test("wfa cdp login: --json shape on success and timeout", async () => {
+  const stdoutSuccess = createMockStream();
+  const stdoutTimeout = createMockStream();
+
+  // JSON Success
+  const resSuccess = await runCdpCommand(["login", "--provider", "chatgpt", "--json"], {
+    stdout: stdoutSuccess,
+    stderr: createMockStream(),
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => ({
+      send: async () => ({ result: { value: { loggedIn: true, title: "ChatGPT Pro" } } }),
+      close: () => {},
+    }),
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+  });
+  assert.equal(resSuccess.code, 0);
+  const successJson = JSON.parse(stdoutSuccess.output);
+  assert.deepEqual(successJson, {
+    status: "completed",
+    provider: "chatgpt",
+    title: "ChatGPT Pro",
+  });
+
+  // JSON Timeout
+  let virtualTime = 0;
+  const resTimeout = await runCdpCommand(["login", "--provider", "gemini", "--timeout", "10", "--json"], {
+    stdout: stdoutTimeout,
+    stderr: createMockStream(),
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => ({
+      send: async () => ({ result: { value: { loggedIn: false, title: "Sign in" } } }),
+      close: () => {},
+    }),
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms + 11000;
+    },
+    pollIntervalMs: 10,
+  });
+  assert.equal(resTimeout.code, 1);
+  const timeoutJson = JSON.parse(stdoutTimeout.output);
+  assert.deepEqual(timeoutJson, {
+    status: "timeout",
+    provider: "gemini",
+    timeout: 10,
+  });
+});
+
+test("wfa cdp login: invalid --provider rejects with INVALID_ARGUMENT", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+
+  const res = await runCdpCommand(["login", "--provider", "invalid_prov"], {
+    stdout,
+    stderr,
+  });
+
+  assert.equal(res.code, 1);
+  assert.match(stderr.output, /INVALID_ARGUMENT/);
+});
+
