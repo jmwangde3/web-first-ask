@@ -6,8 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { resolveRepository, repositoryBlock, bundleRepository, repositoryFallbackCommand } from "../src/repository.js";
 import { prepareChromeStartup, runProcess } from "../src/ask-bridge.js";
-import { executeTask } from "../src/managed-runner.js";
-import { PolicyStore } from "../src/policy-store.js";
+import { executeTask } from "../src/runner.js";
+import { Store } from "../src/store.js";
 import { abandonProvider } from "../src/recovery.js";
 import { runDetachedBatchWorker } from "../src/runner.js";
 import { main as runCli } from "../src/cli.js";
@@ -86,7 +86,7 @@ test("repo bundle begins with tree and supports exclusions; code fallback remain
 }));
 
 test("managed runner serializes two providers as two single-job batches", async () => withRepo(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   const batches = [];
   const result = await executeTask({ prompt: "Analyze main.js", providers: ["chatgpt", "gemini"],
     workspace: "fixes", workspaceRoot: root }, {
@@ -108,7 +108,7 @@ test("managed runner serializes two providers as two single-job batches", async 
 }));
 
 test("detached two-provider run launches a task-bound WFA worker, not a multi-job ask-bridge", async () => withRepo(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   let launched;
   const result = await executeTask({ prompt: "Analyze", providers: ["chatgpt", "gemini"],
     workspace: "fixes", workspaceRoot: root, detach: true }, {
@@ -133,7 +133,7 @@ test("detached two-provider run launches a task-bound WFA worker, not a multi-jo
 }));
 
 test("leading ./ works; missing or repeated exact ANCHOR fails", async () => withRepo(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   const runDir = path.join(home, "runs", "manual");
   await mkdir(runDir, { recursive: true });
   const resultPath = path.join(runDir, "response.md");
@@ -157,7 +157,7 @@ test("leading ./ works; missing or repeated exact ANCHOR fails", async () => wit
 }));
 
 test("LaTeX pollution blocks stage and apply, including after a prior valid stage", async () => withRepo(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   const runDir = path.join(home, "runs", "latex");
   await mkdir(runDir, { recursive: true });
   const resultPath = path.join(runDir, "response.md");
@@ -211,7 +211,7 @@ test("aborting a foreground process retains already-emitted logs", async () => {
 });
 
 test("single-job pre-submit retry saves per-provider logs and refresh can read them", async () => withRepo(async ({ root, home }) => {
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   const calls = [];
   const result = await executeTask({ prompt: "Retry a closed tab safely", providers: ["chatgpt", "gemini"],
     workspace: "retry", workspaceRoot: root }, {
@@ -244,7 +244,7 @@ test("single-job pre-submit retry saves per-provider logs and refresh can read t
 test("exact ANCHOR/REPLACE preserves original CRLF line endings", async () => withRepo(async ({ root, home }) => {
   const sourcePath = path.join(root, "src", "main.js");
   await writeFile(sourcePath, "export const a = 1;\r\nexport const b = 2;\r\n");
-  const store = new PolicyStore(home);
+  const store = new Store(home);
   const runDir = path.join(home, "runs", "crlf");
   await mkdir(runDir, { recursive: true });
   const resultPath = path.join(runDir, "response.md");
@@ -271,7 +271,7 @@ test("install-skill --target accepts an explicit skills directory", async () => 
 test("a recycled parent pid with a stale heartbeat cannot lock the task forever", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-heartbeat-home-"));
   try {
-    const store = new PolicyStore(home);
+    const store = new Store(home);
     const now = new Date().toISOString();
     await store.transaction(({ tasks }) => {
       tasks.tasks.recycled = {
@@ -289,7 +289,7 @@ test("a recycled parent pid with a stale heartbeat cannot lock the task forever"
 test("a live owner with a fresh heartbeat still blocks resolve", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-heartbeat-live-"));
   try {
-    const store = new PolicyStore(home);
+    const store = new Store(home);
     const now = new Date().toISOString();
     await store.transaction(({ tasks }) => {
       tasks.tasks.owned = {

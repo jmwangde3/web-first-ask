@@ -5,26 +5,83 @@ import { WfaError } from "./errors.js";
 import { isPidAlive, owningProcessAlive } from "./util.js";
 import { readBatchMetadata } from "./metadata.js";
 import { classifyProviderError } from "./provider-errors.js";
-import { detectSessionIsolationWarning, rememberSession, summarizeTask } from "./state.js";
+import { UPSTREAM_TERMINAL_STATES, detectSessionIsolationWarning, detectThreadMismatch, mapProviderErrorState, rememberSession, summarizeTask } from "./state.js";
 import { createStallWatch, browserIdleMs, browserStillWorking } from "./stall-watch.js";
 import { chromeLogPath } from "./ask-bridge.js";
+import { matchRepoUnreadable, repositoryFallbackCommand } from "./repository.js";
 
 // Both logs missing means the path is wrong, not that the batch was silent, so
 // at least one file has to exist before an empty pair is treated as evidence.
-async function batchLogsEmpty(runDir) {
-  if (!runDir) return false;
-  const infos = await Promise.all(["batch.stdout.log", "batch.stderr.log"]
-    .map((name) => lstat(path.join(runDir, name)).catch(() => null)));
-  if (infos.every((info) => info === null)) return false;
-  return infos.every((info) => info === null || !info.isFile() || info.size === 0);
+// Empty logs are also not proof of "never submitted" on their own: a detached
+// serial worker runs ask-bridge itself and writes provider output to per-job
+// logs only after each job ends, so the pair stays empty for the whole run.
+// Callers must combine this with per-job submission evidence (see refreshTask).
+async function batchLogText(runDir) {
+  if (!runDir) return null;
+  const parts = [];
+  let present = false;
+  for (const name of ["batch.stdout.log", "batch.stderr.log"]) {
+    const info = await lstat(path.join(runDir, name)).catch(() => null);
+    if (!info?.isFile()) continue;
+    present = true;
+    parts.push(await readFile(path.join(runDir, name), "utf8").catch(() => ""));
+  }
+  return present ? parts.join("\n") : null;
 }
 
-function stateFromProviderError(state, classified) {
-  if (state !== "failed" && state !== "failed_before_start") return state;
-  if (classified.errorCode === "RATE_LIMITED") return "rate_limited";
-  if (classified.errorCode === "LOGIN_REQUIRED") return "login_required";
-  if (classified.errorCode === "CLOUDFLARE_BLOCKED") return "cloudflare_blocked";
-  return state;
+// A detached task runs its own batch process; the foreground guard that watches
+// progress lines is not alive for it, so a quiet job is only visible to a
+// refresh. This used to sit in PolicyStore.transaction, where every write of any
+// task (including a heartbeat) could scan the whole ledger and SIGTERM another
+// task's pid. Refresh is the place that actually asks "is this task still
+// alive", so the check lives here now.
+async function detachedStallEvidence(task) {
+  // A serial worker has its own guarded per-job watchdog; killing the worker
+  // from a stale aggregate log would strand its next, as-yet-unsent provider.
+  if (task.serialWorker || !task.detached || !task.executionPending || !task.childPid
+    || !Number.isInteger(task.stallTimeoutSeconds) || task.stallTimeoutSeconds === 0) return null;
+  const logPath = path.join(task.runDir, "batch.stdout.log");
+  const logInfo = await lstat(logPath).catch(() => null);
+  const log = logInfo?.isFile() ? await readFile(logPath, "utf8").catch(() => "") : "";
+  const evidence = {};
+  for (const [provider, child] of Object.entries(task.children ?? {})) {
+    if (["completed", "abandoned", "failed_before_start", "stalled", "repo_unreadable"].includes(child.state)) continue;
+    const metadataPath = path.join(task.outputDir, child.jobId, "metadata.json");
+    const info = await lstat(metadataPath).catch(() => null);
+    let state = null;
+    if (info?.isFile()) {
+      try { state = JSON.parse(await readFile(metadataPath, "utf8")).state; } catch {}
+    }
+    if (UPSTREAM_TERMINAL_STATES.has(state)) continue;
+    const relevantLines = log.split(/\r?\n/).filter((line) => line.includes(child.jobId));
+    const lastLine = relevantLines.at(-1) ?? null;
+    if (!["in_progress", "running"].includes(state) && !relevantLines.some((line) => /\brunning\b/i.test(line))) continue;
+    let lastLife = Math.max(Date.parse(task.createdAt ?? "") || 0, info?.mtimeMs || 0,
+      Date.parse(child.watchLastLifeAt ?? "") || 0);
+    if (relevantLines.length > (child.watchProgressCount ?? relevantLines.length)) lastLife = Date.now();
+    child.watchProgressCount = relevantLines.length;
+    if (info?.mtimeMs !== (child.watchMetadataMtime ?? info?.mtimeMs)) lastLife = Date.now();
+    child.watchMetadataMtime = info?.mtimeMs ?? null;
+    child.watchLastLifeAt = new Date(lastLife).toISOString();
+    const silentSeconds = Math.floor((Date.now() - lastLife) / 1000);
+    if (silentSeconds >= task.stallTimeoutSeconds) {
+      evidence[provider] = { silentSeconds, lastProgressLine: lastLine?.slice(0, 500) ?? null,
+        metadataMtime: info?.mtimeMs ?? null };
+    }
+  }
+  if (!Object.keys(evidence).length) return null;
+  // Same veto as the per-job watchdog: the batch log staying quiet proves
+  // nothing while ask-bridge's browser log is still being written.
+  const idleMs = await browserIdleMs(chromeLogPath());
+  if (browserStillWorking(idleMs)) return null;
+  let killedPid = null;
+  if (task.childPid !== process.pid) {
+    try {
+      process.kill(task.childPid, "SIGTERM");
+      killedPid = task.childPid;
+    } catch {}
+  }
+  return { stalls: evidence, killedPid };
 }
 
 // Both the synchronous CLI and the detached worker use this guard. Progress is
@@ -136,12 +193,37 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
       task.executionEndedAt = new Date().toISOString();
     }
 
+    const detectedStall = await detachedStallEvidence(task);
+    const detachedStall = detectedStall?.stalls;
+    if (detectedStall?.killedPid) {
+      task.killedStalledPids ??= [];
+      if (!task.killedStalledPids.includes(detectedStall.killedPid)) {
+        task.killedStalledPids.push(detectedStall.killedPid);
+      }
+    }
+    // Submission evidence is per job. A serial detached run starts one provider
+    // after another; treating "some provider was submitted" as "every queued
+    // provider may have been submitted" locked a provider that never ran.
+    const sawSubmission = {};
     for (const [providerKey, child] of Object.entries(task.children ?? {})) {
       const provider = child.provider ?? providerKey;
-      if (["abandoned", "failed_before_start"].includes(child.state)) continue;
-      if (child.state === "completed" && child.resultPath) continue;
+      if (child.state === "abandoned") continue;
+      // A child that already has a verified result still needs the repository
+      // and session checks below, so it must not be skipped outright: only its
+      // metadata read is skipped, because the artifact on disk is authoritative.
+      const alreadyCompleted = child.state === "completed" && Boolean(child.resultPath);
+      if (alreadyCompleted) sawSubmission[provider] = true;
 
-      const metadata = await readBatchMetadata(task.outputDir, child.jobId, provider, { runDir: task.runDir });
+      const metadata = alreadyCompleted
+        ? {} : await readBatchMetadata(task.outputDir, child.jobId, provider, { runDir: task.runDir });
+      // A terminal artifact, a conversation URL, or even a parsed metadata
+      // file means ask-bridge got as far as this job. That is enough to refuse
+      // the "never started" verdict below: a wrong "safe to resend" is worse
+      // than an extra resolve.
+      if (child.threadUrl || child.resultPath || child.completionProof
+        || metadata.threadUrl || metadata.responsePath || metadata.metadata) {
+        sawSubmission[provider] = true;
+      }
       const previousState = child.state;
       const previousThread = child.threadUrl;
       const previousResult = child.resultPath;
@@ -186,7 +268,52 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
         child.retryAfterSeconds = classified.retryAfterSeconds;
         child.retryAfterAt = classified.retryAfterAt;
         child.retryAfterEstimated = classified.retryAfterEstimated;
-        child.state = stateFromProviderError(child.state, classified);
+        child.state = mapProviderErrorState(child.state, classified, Boolean(metadata.responsePath));
+      }
+
+      // REPO_UNREADABLE is a provider answer, not a failure: the conversation
+      // exists and can be continued, but the code was written against a guessed
+      // tree. Detect it once, after completion, when the result is on disk.
+      if (!task.bundleRepo && task.repoReference && child.state === "completed"
+        && child.resultPath && !child.repoChecked) {
+        const body = await readFile(child.resultPath, "utf8").catch(() => "");
+        const matched = matchRepoUnreadable(body);
+        child.repoChecked = true;
+        if (matched && (child.completionProof || child.collectionSource === "manual-confirmed-get")) {
+          child.repoUnreadable = true;
+          child.repoUnreadableEvidence = matched;
+          child.repoFallbackCommand = repositoryFallbackCommand(taskId, provider, task.workspace, task.kind);
+          child.recoveryHint = `Repository unreadable. Run: ${child.repoFallbackCommand}`;
+          child.state = "repo_unreadable";
+        }
+      }
+      // A completed child that was already judged unreadable must not lose that
+      // verdict on the next refresh, when repoChecked is already true.
+      if (child.repoUnreadable && child.state === "completed") child.state = "repo_unreadable";
+      // A fresh task landing on the previous thread, or a continuation landing
+      // on a different one, is a real signal about where the answer came from.
+      // detectSessionIsolationWarning covers the legacy-record case on the
+      // completion path; this covers everything refresh can observe.
+      if (child.threadUrl && !child.threadMismatch) {
+        const mismatch = detectThreadMismatch(task, provider, child.threadUrl);
+        if (mismatch) child.threadMismatch = mismatch;
+      }
+      const stall = detachedStall?.[provider];
+      if (stall && !["completed", "repo_unreadable", "abandoned", "stalled"].includes(child.state)) {
+        child.state = "stalled";
+        child.stall = stall;
+        child.error = `No progress line or metadata update for ${stall.silentSeconds} seconds, and ask-bridge's browser log was silent for the same period. Submission may have occurred; check the conversation before resending. A long generation looks identical from here, so raise --stall-timeout if the answer was still being written.`;
+        child.recoveryHint = `Run wfa collect ${taskId} --provider ${provider} or wfa resolve ${taskId} --provider ${provider} --confirm after checking the browser.`;
+      }
+      // A wrong thread URL must never stay in sessions.json, or the next
+      // `--continue-session` run inherits the same mistake.
+      if (child.threadMismatch || child.repoUnreadable) {
+        const current = sessions.workspaces?.[task.workspace]?.[provider];
+        if (current === child.threadUrl) {
+          const original = task.sessionBaseline?.[provider] ?? null;
+          if (original && original !== child.threadUrl) sessions.workspaces[task.workspace][provider] = original;
+          else delete sessions.workspaces[task.workspace][provider];
+        }
       }
       if (child.state !== previousState || child.threadUrl !== previousThread
         || child.resultPath !== previousResult
@@ -196,31 +323,32 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
     }
 
     if (!processAlive) {
-      // A detached batch writes ask-bridge's startup banner straight into
-      // batch.stdout.log. Empty logs mean the process died before ask-bridge
-      // said anything, so no job reached a provider and a retry is safe. This
-      // test is only valid for --detach: the foreground runner buffers stdout
-      // in memory and writes it after the batch ends, so an empty file there is
-      // not evidence of anything.
-      const neverStarted = task.detached === true
-        && await batchLogsEmpty(task.runDir);
-      for (const child of Object.values(task.children ?? {})) {
-        if (child.state === "queued" || child.state === "running") {
-          child.state = neverStarted ? "failed_before_start" : "interrupted_unknown";
-          child.error = neverStarted
-            ? "The detached worker was killed before ask-bridge printed anything, so nothing reached a provider. The host that launched wfa clears background processes when its own task ends; run wfa in the foreground, or keep wfa itself in the background instead of using --detach."
-            : "ask-bridge process is no longer running and no trusted terminal artifact was found. The prompt may already have been submitted; do not resend.";
-          if (neverStarted) {
-            // Not a provider failure: there is no provider verdict to classify,
-            // and the generic "do not resend" hint contradicts a run that never
-            // sent anything.
-            child.errorCode = null;
-            child.recoveryHint = null;
-            child.retryAfterAt = null;
-            child.retryAfterSeconds = null;
-          }
-          child.revision = (child.revision ?? 0) + 1;
+      // Empty logs are weak evidence: a detached serial worker keeps them at
+      // zero bytes even after the prompt reached a page, because ask-bridge is
+      // captured by the worker instead of writing to the batch logs. A job is
+      // only "never started" when the detached batch printed nothing at all and
+      // it has no submission artifact of its own. Any banner, even one that does
+      // not name this job, means ask-bridge came up; then a resend is not safe.
+      const batchLog = await batchLogText(task.runDir);
+      for (const [providerKey, child] of Object.entries(task.children ?? {})) {
+        const provider = child.provider ?? providerKey;
+        if (child.state !== "queued" && child.state !== "running") continue;
+        const neverStarted = task.detached === true && batchLog !== null
+          && !batchLog.trim() && !sawSubmission[provider];
+        child.state = neverStarted ? "failed_before_start" : "interrupted_unknown";
+        child.error = neverStarted
+          ? "The detached worker was killed before ask-bridge printed anything: the batch logs are empty and no metadata, thread URL, or result exists. Nothing reached a provider, so this job can be retried. The host that launched wfa clears background processes when its own task ends; run wfa in the foreground, or keep wfa itself in the background instead of using --detach."
+          : "ask-bridge process is no longer running and no trusted terminal artifact was found. The prompt may already have been submitted; do not resend.";
+        if (neverStarted) {
+          // Not a provider failure: there is no provider verdict to classify,
+          // and the generic "do not resend" hint contradicts a run that never
+          // sent anything.
+          child.errorCode = null;
+          child.recoveryHint = null;
+          child.retryAfterAt = null;
+          child.retryAfterSeconds = null;
         }
+        child.revision = (child.revision ?? 0) + 1;
       }
     }
     task.state = summarizeTask(task).state;

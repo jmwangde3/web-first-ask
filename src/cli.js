@@ -2,12 +2,11 @@ import { copyFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/pr
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { PolicyStore } from "./policy-store.js";
+import { Store } from "./store.js";
 import { resolveRepository } from "./repository.js";
 import { getHomeDir } from "./paths.js";
 import { loadConfig, saveBrowserMode, saveGeminiMode, validateGeminiMode } from "./config.js";
-import { executeTask, refreshTask } from "./managed-runner.js";
-import { runDetachedBatchWorker } from "./runner.js";
+import { executeTask, refreshTask, runDetachedBatchWorker } from "./runner.js";
 import { collectTask, listTasks, abandonProvider, waitForTask } from "./recovery.js";
 import { checkAskBridge, prepareChromeStartup, resolveAskBridge, runProcess } from "./ask-bridge.js";
 import { buildCodePrompt, buildComparePrompt } from "./prompts.js";
@@ -134,19 +133,26 @@ function printTask(task, json = false, replayed = false) {
     geminiMode: task.geminiMode ?? null, geminiModeReport: task.geminiModeReport ?? null,
     sessionPolicy: task.sessionPolicy ?? (task.fresh ? "fresh" : "continue"),
     executionPending: Boolean(task.executionPending), replayed,
-    retryWarnings: task.retryWarnings ?? [], providers: children };
+    retryWarnings: task.retryWarnings ?? [], killedStalledPids: task.killedStalledPids ?? [],
+    providers: children };
   if (json) { process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`); return; }
   process.stdout.write(`Task: ${task.taskId}${replayed ? " (existing request; not resent)" : ""}\n`);
   process.stdout.write(`Workspace: ${task.workspace}\nState: ${task.state}\nSession: ${summary.sessionPolicy}\n`);
   if (task.executionPending) process.stdout.write("Execution cleanup: pending; completed results are readable but the workspace/provider lock remains active.\n");
+  if (summary.killedStalledPids.length) {
+    process.stdout.write(`Stall termination: SIGTERM sent to detached PID(s) ${summary.killedStalledPids.join(", ")} during refresh (process exit not confirmed).\n`);
+  }
   if (task.geminiModeReport) {
     const report = task.geminiModeReport;
-    // The switch can apply and still be late: pressing it after the composer
-    // held text may have cleared that text. Saying "before typing" there would
-    // contradict the error printed on the same line.
+    // The switch is page state: pressing it after text was typed does not
+    // clear the composer. Report the character count as an observation, not as
+    // a failure; the older `error` branch stays for tasks recorded before
+    // 0.2.10.
     const outcome = !report.applied
       ? "NOT applied"
-      : report.error ? "applied, but after typing had started" : "switch pressed before typing";
+      : report.typedBeforeClick
+        ? `switch pressed with ${report.typedBeforeClick} characters already in the composer`
+        : report.error ? "applied, but after typing had started" : "switch pressed before typing";
     process.stdout.write(`Gemini mode: ${report.requested} (${outcome})${report.error ? ` - ${report.error}` : ""}\n`);
   }
   for (const warning of task.retryWarnings ?? []) process.stdout.write(`Retry: ${warning}\n`);
@@ -343,7 +349,7 @@ export async function main(argv = process.argv.slice(2)) {
     throw new WfaError("REASONING_DISABLED", "Reasoning-strength selection is temporarily disabled. Remove --reasoning/--reasoning-map; WFA now uses each provider's current web UI setting.");
   }
   const home = getHomeDir();
-  const store = new PolicyStore(home);
+  const store = new Store(home);
 
   // Private detached-worker entry point. It only executes pre-existing tasks;
   // no new provider submission can be triggered by a user-supplied prompt.
@@ -424,8 +430,11 @@ export async function main(argv = process.argv.slice(2)) {
     return result.removed || result.reason === "no lock file" ? 0 : 1;
   }
   if (command === "list") {
-    const tasks = await listTasks({ home, store });
     const limit = Number(options.limit ?? 20);
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new WfaError("ARGUMENT_ERROR", `Invalid --limit "${options.limit}". Expected a positive integer. Hint: use --limit 20.`);
+    }
+    const tasks = await listTasks({ home, store });
     const selected = tasks.slice(0, limit);
     // --no-refresh was parsed but never honoured, so a read-only listing still
     // ran up to `limit` write transactions -- each of them contending for the
@@ -444,9 +453,13 @@ export async function main(argv = process.argv.slice(2)) {
       taskId: task.taskId, workspace: task.workspace, kind: task.kind, state: task.state,
       providers: Object.fromEntries(Object.entries(task.children).map(([key, value]) => [key, value.state])),
       createdAt: task.createdAt,
+      killedStalledPids: task.killedStalledPids ?? [],
     }));
     process.stdout.write(`${options.json ? JSON.stringify(result, null, 2)
-      : result.map((item) => `${item.taskId}  ${item.state.padEnd(16)} ${item.workspace}  ${Object.entries(item.providers).map(([p, s]) => `${p}:${s}`).join(" ")}`).join("\n")}\n`);
+      : result.flatMap((item) => [
+        `${item.taskId}  ${item.state.padEnd(16)} ${item.workspace}  ${Object.entries(item.providers).map(([p, s]) => `${p}:${s}`).join(" ")}`,
+        ...(item.killedStalledPids.length ? [`  Stall termination: SIGTERM sent to detached PID(s) ${item.killedStalledPids.join(", ")} during refresh (process exit not confirmed).`] : []),
+      ]).join("\n")}\n`);
     return;
   }
   if (command === "wait" || command === "attach") {
@@ -623,7 +636,10 @@ export async function main(argv = process.argv.slice(2)) {
     timeoutSeconds: options.timeout ? Number(options.timeout) : config.defaultTimeoutSeconds,
     concurrency: options.concurrency ? Number(options.concurrency) : undefined,
     model: options.model, modelByProvider, requestId: options["request-id"],
-    fresh: Boolean(options["new-session"] || options.fresh),
+    // New session is the documented default, so the flag the task records is
+    // "fresh unless the caller asked to continue"; executeTask itself keeps a
+    // direct call's sessions when no flag is given.
+    fresh: !options.followup && !options["continue-session"],
     downloadImages: options["download-images"] === undefined ? undefined : Boolean(options["download-images"]),
     onProgressLine: (stream, line) => { process.stderr.write(`[ask-bridge ${stream}] ${line}\n`); },
     onTaskCreated: (task) => {

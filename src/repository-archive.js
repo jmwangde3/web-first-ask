@@ -1,20 +1,16 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { promisify, TextDecoder } from "node:util";
 import { lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { crc32, deflateRawSync } from "node:zlib";
 import { WfaError } from "./errors.js";
 import { scanSensitiveText } from "./bundle.js";
+import { sha256, uuid } from "./util.js";
+import { GIT_MAX_BUFFER, GIT_TIMEOUT_MS } from "./constants.js";
+import { matchesExclude, selectionReason } from "./repo-select.js";
 
 const exec = promisify(execFile);
 
-// Kept in sync with repository.js: the archive must ship exactly the files the
-// inline bundle would have shipped, so a task cannot see a different repository
-// depending on which transport it used.
-const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", ".cache", "vendor", "target", ".venv", "__pycache__"]);
-const SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|7z|rar|exe|dll|so|dylib|class|pyc|woff2?|ttf|otf|mp[34]|avi|mov|sqlite|db|bin|dat|lock)$/i;
-const SENSITIVE = /(?:^|\/)(?:\.env(?:\.|$)|\.npmrc|\.netrc|id_rsa|id_ed25519|credentials|secrets\.json|service-account\.json|[^/]*\.(?:pem|key|p12|pfx|keystore))/i;
 const MAX_ENTRIES = 60000;
 // The archive is an attachment, so the attachment ceiling is the real limit.
 // Failing here names the actual problem; the upload would otherwise reject the
@@ -26,7 +22,11 @@ const PRUNE_MIN_AGE_MS = 10 * 60 * 1000;
 
 async function git(cwd, ...args) {
   const { stdout } = await exec("git", args, {
-    cwd, windowsHide: true, timeout: 10000, encoding: "buffer", maxBuffer: 64 * 1024 * 1024,
+    cwd,
+    windowsHide: true,
+    timeout: GIT_TIMEOUT_MS,
+    encoding: "buffer",
+    maxBuffer: GIT_MAX_BUFFER,
   });
   return Buffer.from(stdout).toString("utf8").trimEnd();
 }
@@ -41,41 +41,28 @@ function scanEntry(name, data) {
   return scanSensitiveText(text, name);
 }
 
-function matchesExclude(file, patterns) {
-  return patterns.some((pattern) => {
-    const p = String(pattern).replace(/\\/g, "/").replace(/^!/, "");
-    if (!p) return false;
-    const escaped = p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "\u0000")
-      .replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]").replace(/\u0000/g, ".*");
-    return new RegExp(`^(?:${escaped})(?:$|/)`).test(file)
-      || (!p.includes("/") && new RegExp(`(?:^|/)${escaped}$`).test(file));
-  });
-}
-
 export async function collectTrackedSources({ cwd = process.cwd(), excludes = [] } = {}) {
   const root = await git(cwd, "rev-parse", "--show-toplevel").catch(() => null);
   if (!root) throw new WfaError("BUNDLE_REPO_NOT_GIT", "--bundle-repo requires a Git working tree. Use --file <path> instead.");
   const tracked = (await git(root, "ls-files", "-z", "--cached", "--exclude-standard")).split("\0").filter(Boolean);
   const skipped = [];
   const selected = [];
+
   for (const relative of tracked) {
     const label = relative.replace(/\\/g, "/");
-    let reason = null;
-    if (label.split("/").some((part) => SKIP_DIRS.has(part))) reason = "build/cache directory";
-    else if (SKIP_EXT.test(label)) reason = "binary or generated filename";
-    else if (SENSITIVE.test(label)) reason = "sensitive filename";
-    else if (matchesExclude(label, excludes)) reason = "matched --exclude";
+    const reason = selectionReason(label)
+      ?? (matchesExclude(label, excludes) ? "matched --exclude" : null);
     if (reason) skipped.push({ path: label, reason });
     else selected.push(relative);
   }
   return { root, selected, skipped };
 }
 
-function dosStamp(date) {
-  const time = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
-  const day = ((Math.max(date.getFullYear(), 1980) - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
-  return { time, day };
-}
+// A fixed DOS stamp (1980-01-01 00:00) keeps the archive byte-identical for
+// identical sources, so the file name can be derived from its content and one
+// request can be replayed with the same request_id (see the intent hash in
+// runner-orchestration.js). Entry mtimes carried no meaning for a reader.
+const DOS_STAMP = { time: 0, day: 33 };
 
 // Minimal ZIP writer: deflate each entry, fall back to store when compression
 // does not pay off. No external binary (no `zip` on Windows) and no zip64,
@@ -85,11 +72,13 @@ export function buildZip(entries) {
   const local = [];
   const central = [];
   let offset = 0;
-  const { time, day } = dosStamp(new Date());
+  const { time, day } = DOS_STAMP;
   for (const entry of entries) {
     const name = Buffer.from(entry.name.replace(/\\/g, "/"), "utf8");
     const checksum = crc32(entry.data);
-    const deflated = deflateRawSync(entry.data, { level: 9 });
+    // Level 6 generally captures most of level 9's compression benefit at
+    // substantially lower CPU cost; keep store fallback for incompressible data.
+    const deflated = deflateRawSync(entry.data, { level: 6 });
     const stored = deflated.length >= entry.data.length;
     const payload = stored ? entry.data : deflated;
     const method = stored ? 0 : 8;
@@ -149,7 +138,8 @@ async function pruneArchives(directory, keep, now = Date.now()) {
 }
 
 export async function archiveRepository({ cwd = process.cwd(), excludes = [], outDir, prompt = "",
-  maxFileBytes = 1024 * 1024, maxTotalBytes = 64 * 1024 * 1024, keepArchives = 5 } = {}) {  const { root, selected, skipped } = await collectTrackedSources({ cwd, excludes });
+  maxFileBytes = 1024 * 1024, maxTotalBytes = 64 * 1024 * 1024, keepArchives = 5, requestId = null } = {}) {
+  const { root, selected, skipped } = await collectTrackedSources({ cwd, excludes });
   if (!selected.length) {
     throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo=zip found no eligible tracked files. Select paths with --file or adjust --exclude.");
   }
@@ -167,7 +157,6 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
   const secretFindings = [];
   let scannedFiles = 0;
   let totalBytes = 0;
-  let uncompressed = 0;
   for (const relative of [...mentioned, ...rest]) {
     const absolute = path.resolve(root, relative);
     const info = await lstat(absolute).catch(() => null);
@@ -190,7 +179,6 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
   if (!entries.length) {
     throw new WfaError("BUNDLE_REPO_EMPTY", "--bundle-repo=zip found no readable tracked files. Select paths with --file or adjust --exclude.");
   }
-  uncompressed = totalBytes;
   const zip = buildZip(entries);
   if (zip.length > MAX_ARCHIVE_BYTES) {
     throw new WfaError("BUNDLE_REPO_TOO_LARGE", `--bundle-repo=zip produced an archive of ${(zip.length / 1024 / 1024).toFixed(1)} MiB, over the 50 MiB attachment limit. Narrow it with --exclude or --file.`);
@@ -201,11 +189,12 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
   // by matching the whole filename against the page text, and Gemini truncates
   // the attachment label past that point, so a timestamped name is uploaded and
   // then reported as never attached 50 s later (docs/known-issues.md U1). The
-  // random suffix is what keeps two archives of the same repository in the same
-  // second apart; file mtime carries the ordering a timestamp would have given.
-  const slug = (path.basename(root).replace(/[^A-Za-z0-9._-]/g, "_") || "repo").slice(0, 8);
-  const file = path.join(directory, `${slug}-${randomBytes(4).toString("hex")}.zip`);
-  await writeFile(file, zip);
+  // content hash makes a replay with the same request_id reuse one path; the
+  // random half keeps two independent requests from colliding, which a pure
+  // content hash did whenever the same repository was archived twice.
+  const slug = (path.basename(root).replace(/[^A-Za-z0-9._-]/g, "_") || "repo").slice(0, 4);
+  const file = path.join(directory, `${slug}-${sha256(`${sha256(zip)}:${requestId ?? uuid()}`).slice(0, 15)}.zip`);
+  if (!(await lstat(file).catch(() => null))?.isFile()) await writeFile(file, zip);
   await pruneArchives(directory, keepArchives);
   return {
     file,
@@ -214,9 +203,9 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
     stats: {
       files: entries.length,
       listed: selected.length,
-      sourceBytes: uncompressed,
+      sourceBytes: totalBytes,
       archiveBytes: zip.length,
-      ratio: uncompressed ? Number((zip.length / uncompressed).toFixed(3)) : 1,
+      ratio: totalBytes ? Number((zip.length / totalBytes).toFixed(3)) : 1,
       skipped: skipped.length,
     },
     skipped,

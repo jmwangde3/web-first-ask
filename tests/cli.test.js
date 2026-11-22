@@ -55,7 +55,7 @@ test("compare replay returns nonzero for a partial batch without losing the succ
     const prompt = "Compare the smoke-test inputs.";
     const { task } = await executeTask({
       kind: "compare", providers: ["chatgpt", "gemini"], prompt: buildComparePrompt(prompt),
-      workspace: "repo", requestId: "partial-example",
+      workspace: "repo", requestId: "partial-example", noRepo: true,
     }, {
       home,
       skipPreflight: true,
@@ -161,6 +161,25 @@ test("list --no-refresh reads without taking the write lock", async () => {
     assert.equal(run.status, 0, run.stderr);
     assert.match(run.stdout, /task-1/);
     assert.ok(Date.now() - started < 10000, "list must not wait for the lock");
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("list rejects non-integer and non-positive --limit values", async () => {
+  const bin = fileURLToPath(new URL("../bin/wfa.js", import.meta.url));
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-list-limit-"));
+  try {
+    for (const value of ["abc", "0", "-2", "1.5"]) {
+      const run = spawnSync(process.execPath, [bin, "list", "--limit", value], {
+        env: { ...process.env, WFA_HOME: home, NODE_OPTIONS: "" },
+        encoding: "utf8",
+      });
+      assert.equal(run.status, 1, `--limit ${value}: ${run.stderr}`);
+      assert.match(run.stderr, /Invalid --limit/);
+      assert.match(run.stderr, /Hint: use --limit 20/);
+      assert.equal(run.stdout, "");
+    }
   } finally {
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }

@@ -1,5 +1,20 @@
 export const PROVIDERS = Object.freeze(["chatgpt", "gemini", "claude"]);
 
+export const PROMPT_SIZE_WARN_BYTES = 40 * 1024;
+
+// The upstream ask-bridge truncation risk described by WFA.
+// Changing this constant does not change the external ask-bridge program.
+export const ASK_BRIDGE_PROMPT_TRUNCATION_BYTES = 44 * 1024;
+
+// The browser log can remain active during long generations. Two minutes
+// without browser activity is the existing quiet-window threshold.
+export const BROWSER_QUIET_WINDOW_SECONDS = 120;
+
+// Shared budgets for Git subprocesses used by repository discovery,
+// tracked-file selection and repository archive preparation.
+export const GIT_TIMEOUT_MS = 10000;
+export const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+
 // ask-bridge writes nothing at all while a page generates — no progress line and
 // no metadata update — so the watchdog only sees silence. Five minutes sits
 // inside the normal range for a few hundred lines of code, which made wfa kill
@@ -34,7 +49,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   defaultConcurrency: 1,
   defaultTimeoutSeconds: 1200,
   maxTimeoutSeconds: 7200,
-  defaultCompareProviders: ["chatgpt", "gemini"],
+  // Same pair and same order as defaultProviders: compare must not silently
+  // prefer a different first provider than ask/code.
+  defaultCompareProviders: ["gemini", "chatgpt"],
   maxConcurrency: 3,
   // Task is the default here: the clicker records what actually happened in
   // geminiModeReport, so a run that stayed on Chat is visible in `wfa status`

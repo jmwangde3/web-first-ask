@@ -71,6 +71,9 @@ test("automatic project brief is injected only for providers creating a new sess
       workspace: "repo",
       workspaceRoot,
       requestId: "brief-1",
+      // This case is about reusing the saved chatgpt conversation, so it has to
+      // ask for a continuation; a default run starts a new session.
+      continueSession: true,
     }, {
       home, store, config, skipPreflight: true,
       runProcess: async (_command, args, options) => {

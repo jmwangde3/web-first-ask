@@ -1,8 +1,8 @@
 import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 import { sha256 } from "./util.js";
+import { UPSTREAM_TERMINAL_STATES } from "./state.js";
 
-const TERMINAL_STATES = new Set(["completed", "failed", "timed_out", "recoverable", "cancelled"]);
 const PROVIDERS = new Set(["chatgpt", "gemini", "claude"]);
 
 // ask-bridge writes the response body to response.md, but two failure modes
@@ -16,8 +16,8 @@ const LATEX_ESCAPE_PATTERN = /\\vert\{\}|\\lbrace(?:\{\}|)|\\rbrace(?:\{\}|)|\\t
 // Measured 2026-11-22: a Gemini answer to a `--bundle-repo=zip` request
 // completed with "当前会话环境中没有可用的文件解压或本地文件读取工具" and produced no
 // code at all. wfa called that completed, so the run looked successful.
-const ATTACHMENT_REFUSAL_CN = /(?:没有|缺少|无法|不能|不具备)[^\n]{0,26}(?:解压|解包|解压缩|读取本地|访问本地|下载附件|打开附件)/i;
-const ATTACHMENT_REFUSAL_EN = /(?:unable|can'?t|cannot|could ?not|no (?:tool|way|ability))[^\n]{0,40}(?:extract|unzip|decompress|open|read|download)[^\n]{0,24}(?:attach|archive|zip|uploaded)/i;
+const ATTACHMENT_REFUSAL_CN = /(?:没有|缺少|无法|不能|没法|未能|不提供|不具备)[^\n]{0,26}(?:解压|解包|解压缩|读取|访问|打开|下载)[^\n]{0,12}(?:本地文件|附件|上传|文件|压缩包|归档)/i;
+const ATTACHMENT_REFUSAL_EN = /(?:unable|can'?t|cannot|could ?not|not able|no (?:tool|way|ability))[^\n]{0,40}(?:extract|unzip|decompress|open|read|access|download)[^\n]{0,24}(?:attach|archive|zip|file|upload)/i;
 
 export function inspectResponseHeuristics(responseText) {
   const text = String(responseText ?? "");
@@ -265,7 +265,7 @@ export async function readBatchMetadata(outputDir, jobId, expectedProvider, { ru
     };
   }
 
-  if (TERMINAL_STATES.has(state)) {
+  if (UPSTREAM_TERMINAL_STATES.has(state)) {
     // ask-bridge can write the answer and then fail to finalize metadata.json
     // (Windows "os error 5"). The text on disk is then the only copy of a
     // finished answer, so report the path as unverified instead of reporting

@@ -1,26 +1,18 @@
 import { lstat, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { WfaError } from "./errors.js";
+import { DIRECTORY_FILE_EXTENSIONS, TEXT_SOURCE_EXTENSIONS } from "./repo-select.js";
 
 const IMAGE_EXTENSIONS = new Set([
   ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".avif",
 ]);
-const DIRECTORY_FILE_EXTENSIONS = new Set([
-  ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
-  ".py", ".pyi", ".ps1", ".psm1", ".psd1", ".cs", ".java", ".kt",
-  ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".rb",
-  ".php", ".swift", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".sql",
-  ".html", ".htm", ".css", ".scss", ".less", ".json", ".jsonc",
-  ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml",
-  ".md", ".mdx", ".txt", ".rst", ".adoc", ".csv", ".tsv",
-  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-  ".odt", ".ods", ".odp", ".rtf", ".ipynb",
-]);
+
 const DEFAULT_IGNORED_DIRS = new Set([
   ".git", ".wfa", "node_modules", ".next", ".nuxt", ".turbo",
   "coverage", "dist", "build", "out", "target", "tmp", ".venv", "venv",
   ".cache", ".pytest_cache", ".mypy_cache", "__pycache__",
 ]);
+
 const SENSITIVE_BASENAMES = new Set([
   ".env", ".env.local", ".env.production", "id_rsa", "id_ed25519",
   "credentials", "secrets.json", "service-account.json",
@@ -64,12 +56,17 @@ function globToRegExp(pattern) {
   return new RegExp(`${source}$`, "i");
 }
 
-function matchesPattern(relativePath, pattern) {
-  const normalized = normalizePattern(relativePath);
+function compilePattern(pattern) {
   const candidate = normalizePattern(pattern);
-  const matcher = globToRegExp(candidate);
-  if (matcher.test(normalized)) return true;
-  if (!candidate.includes("/")) return matcher.test(path.posix.basename(normalized));
+  return { candidate, matcher: globToRegExp(candidate) };
+}
+
+function matchesPattern(relativePath, compiled) {
+  const normalized = normalizePattern(relativePath);
+  if (compiled.matcher.test(normalized)) return true;
+  if (!compiled.candidate.includes("/")) {
+    return compiled.matcher.test(path.posix.basename(normalized));
+  }
   return false;
 }
 
@@ -123,6 +120,9 @@ export async function expandAttachmentInputs({
   const target = { files: [], images: [] };
   const exclusionPatterns = [...excludes].map(normalizePattern);
   const explicit = [];
+  // A single expansion reuses metadata between explicit paths, deduplication,
+  // and final byte accounting. No cross-request filesystem cache is retained.
+  const statCache = new Map();
 
   for (const raw of [...files, ...images]) {
     const value = String(raw);
@@ -132,12 +132,19 @@ export async function expandAttachmentInputs({
       explicit.push({ value, imageOnly: images.includes(raw) });
     }
   }
+  const compiledExclusions = exclusionPatterns.map(compilePattern);
 
   const matches = [];
   const globRequests = [];
   for (const item of explicit) {
     const absolute = path.resolve(root, item.value);
-    const info = await lstat(absolute).catch(() => null);
+    let info;
+    if (statCache.has(absolute)) {
+      info = statCache.get(absolute);
+    } else {
+      info = await lstat(absolute).catch(() => null);
+      statCache.set(absolute, info);
+    }
     if (info?.isSymbolicLink()) {
       throw new WfaError("ATTACHMENT_SYMLINK", `Symbolic-link attachments are not followed: ${absolute}`);
     }
@@ -148,7 +155,7 @@ export async function expandAttachmentInputs({
       await walkDirectory(absolute, root, collected, { visited: 0 });
       for (const filePath of collected) matches.push({ absolute: filePath, imageOnly: item.imageOnly, explicit: false });
     } else if (/[*?{]/.test(item.value)) {
-      globRequests.push(item);
+      globRequests.push({ ...item, compiled: compilePattern(item.value) });
     } else {
       throw new WfaError("ATTACHMENT_NOT_FOUND", `Attachment path does not exist: ${absolute}`);
     }
@@ -158,8 +165,7 @@ export async function expandAttachmentInputs({
     const all = [];
     await walkDirectory(root, root, all, { visited: 0 });
     for (const item of globRequests) {
-      const pattern = normalizePattern(item.value);
-      const found = all.filter((filePath) => matchesPattern(path.relative(root, filePath), pattern));
+      const found = all.filter((filePath) => matchesPattern(path.relative(root, filePath), item.compiled));
       if (!found.length) {
         throw new WfaError("ATTACHMENT_GLOB_EMPTY", `Attachment glob matched no files: ${item.value}`);
       }
@@ -171,16 +177,23 @@ export async function expandAttachmentInputs({
   for (const item of matches) {
     const absolute = path.resolve(item.absolute);
     const rel = path.relative(root, absolute).replaceAll("\\", "/");
-    if (exclusionPatterns.some((pattern) => matchesPattern(rel, pattern))) continue;
-    const info = await stat(absolute).catch(() => null);
+    if (compiledExclusions.some((pattern) => matchesPattern(rel, pattern))) continue;
+
+    let info;
+    if (statCache.has(absolute)) {
+      info = statCache.get(absolute);
+    } else {
+      info = await stat(absolute).catch(() => null);
+      statCache.set(absolute, info);
+    }
     if (!info?.isFile()) continue;
+
     if (item.imageOnly && !IMAGE_EXTENSIONS.has(path.extname(absolute).toLowerCase())) {
       throw new WfaError("IMAGE_TYPE_UNSUPPORTED", `--image expects an image file: ${absolute}`);
     }
     const key = process.platform === "win32" ? absolute.toLowerCase() : absolute;
     if (seen.has(key)) continue;
     seen.add(key);
-    if (item.imageOnly && !IMAGE_EXTENSIONS.has(path.extname(absolute).toLowerCase())) continue;
     classifyFile(absolute, target);
   }
 
@@ -195,7 +208,7 @@ export async function expandAttachmentInputs({
   }
   let totalBytes = 0;
   for (const filePath of [...target.files, ...target.images]) {
-    totalBytes += (await stat(filePath)).size;
+    totalBytes += statCache.get(filePath).size;
   }
   if (totalBytes > maxBytes) {
     throw new WfaError("ATTACHMENT_SIZE_LIMIT", `Expanded attachments total ${(totalBytes / 1024 / 1024).toFixed(1)} MiB; the limit is ${(maxBytes / 1024 / 1024).toFixed(0)} MiB.`);
@@ -213,16 +226,8 @@ export function isSensitiveAttachmentPath(filePath) {
   return isSensitiveName(filePath);
 }
 
-export function isTextSourceAttachment(filePath) {  const ext = path.extname(filePath).toLowerCase();
-  return new Set([
-    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
-    ".py", ".pyi", ".ps1", ".psm1", ".psd1", ".cs", ".java", ".kt",
-    ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".rb",
-    ".php", ".swift", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".sql",
-    ".html", ".htm", ".css", ".scss", ".less", ".json", ".jsonc",
-    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml",
-    ".md", ".mdx", ".txt", ".rst", ".adoc", ".csv", ".tsv",
-  ]).has(ext);
+export function isTextSourceAttachment(filePath) {
+  return TEXT_SOURCE_EXTENSIONS.has(path.extname(filePath).toLowerCase());
 }
 
 const ARCHIVE_EXTENSIONS = new Set([".zip", ".tar", ".gz", ".tgz", ".7z"]);

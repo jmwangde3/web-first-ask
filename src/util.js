@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { WfaError } from "./errors.js";
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export const uuid = () => randomUUID();
@@ -17,11 +18,27 @@ export async function hashFile(filePath) {
 }
 
 export async function readJson(filePath, fallback) {
+  let body;
   try {
-    return JSON.parse(await readFile(filePath, "utf8"));
+    body = await readFile(filePath, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") return structuredClone(fallback);
     throw error;
+  }
+
+  try {
+    return JSON.parse(body);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new WfaError(
+      "LEDGER_CORRUPT",
+      `Cannot parse JSON file ${filePath}. This may be a damaged WFA tasks.json, sessions.json or config.json ledger.`,
+      {
+        cause: error,
+        details: { path: filePath },
+        hint: `Back up ${filePath} before deleting or repairing it. Check ${filePath}.bak for a previous copy, or run \`wfa doctor\` for diagnostics.`,
+      },
+    );
   }
 }
 
@@ -35,6 +52,9 @@ export async function writeJsonAtomic(filePath, value) {
   } catch {
     // Windows ACL inheritance is used when POSIX mode bits are unavailable.
   }
+  // Preserve the previous completed version before replacing the ledger.
+  // A missing source or failed backup must not prevent the primary write.
+  await copyFile(filePath, `${filePath}.bak`).catch(() => {});
   await rename(tempPath, filePath);
 }
 

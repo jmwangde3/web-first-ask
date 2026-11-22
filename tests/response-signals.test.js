@@ -43,6 +43,11 @@ test("the English form of the same refusal is flagged", () => {
   assert.equal(result.attachmentUnreadable, true);
 });
 
+test("a refusal that names the uploaded file instead of an archive is still flagged", () => {
+  assert.equal(inspectResponseHeuristics("我无法读取你上传的附件，所以无法据此修改代码。").attachmentUnreadable, true);
+  assert.equal(inspectResponseHeuristics("I cannot access the uploaded file, so I cannot review it.").attachmentUnreadable, true);
+});
+
 test("talking about attachments without refusing them is not flagged", () => {
   const result = inspectResponseHeuristics("I read the attached archive and changed three files.");
   assert.equal(result.attachmentUnreadable, false);
@@ -59,7 +64,7 @@ test("a fresh request that returns the previous conversation URL is flagged", ()
 
   assert.match(detectSessionIsolationWarning(tasks, current, "chatgpt", shared), /THREAD_MISMATCH \(chatgpt\)/);
   assert.deepEqual(current.children.chatgpt.threadMismatch, {
-    expected: "a new conversation (not the previously saved thread)",
+    expected: "a new conversation (not the previous workspace thread)",
     actual: shared,
   });
   assert.equal(detectSessionIsolationWarning(tasks, current, "chatgpt", "https://chatgpt.com/c/new"), null);

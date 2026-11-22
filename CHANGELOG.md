@@ -1,6 +1,104 @@
 # Changelog
 
-## 0.2.9 - Unreleased
+## 0.2.10 - Unreleased
+
+0.2.9 fixed `--detach` locking the workspace by treating two empty batch logs as
+"nothing was ever submitted". That judgement was backwards on the default path:
+`wfa ask` runs a serial worker, the worker captures ask-bridge with
+`inherit: false`, and `batch.stdout.log` stays at zero bytes for the whole run
+even after the prompt reached a page. A worker killed after submission was then
+declared safe to resend.
+
+### Fixed
+- `failed_before_start` now requires the absence of every submission artifact
+  (`metadata.json`, `threadUrl`, `resultPath`, `completionProof`), not just
+  empty logs. Any artifact leaves the job `interrupted_unknown`, which keeps the
+  workspace locked until `wfa resolve`.
+- A trusted `completed` result can correct an earlier `failed_before_start`, so
+  a response that lands after the worker died is still collected.
+- The detached serial worker forwards provider output and the `still waiting`
+  heartbeat to its own stdout, so detached batch logs are no longer always
+  empty and U17's heartbeat also works under `--detach`.
+
+### Changed
+- Gemini Task is pressed even when the composer already holds text. The switch
+  is page state and keeps the composer content until something is submitted, so
+  the click is safe; the report records `typedBeforeClick` and `wfa status`
+  prints the count as a timing observation, not a failure.
+- Gemini page matching accepts `/app/`, `/app/<id>`, `/u/<n>/app` and their
+  query forms. `handled` is recorded only after the switch reports pressed, a
+  failed page is retried up to three times, every CDP command has a 5 s timeout,
+  and a closed socket rejects all pending commands instead of hanging.
+- `defaultCompareProviders` matches `defaultProviders` (`gemini, chatgpt`).
+- Attachment-refusal detection also matches "cannot read/access/open the
+  uploaded file". Code results that admit the attachment was unreadable are
+  refused at stage/apply when the task had attachments.
+- `managed-runner.js`, `policy-store.js` and `stall-watch.js` are gone. Their
+  behaviour now lives in `runner-orchestration.js`, `runner-stall.js` and
+  `runner-retry.js`: one public `executeTask`, one place that decides what a
+  child state means (`state.js`), and the follow-up authorisation passed
+  explicitly instead of through a `Store` subclass that rewrote parents inside
+  every transaction. Deleting them had removed three post-write checks, which
+  are restored: a foreground run now ends with `refreshTask`, so
+  `REPO_UNREADABLE`, stall promotion and session rollback apply before the CLI
+  returns; a `guardedBatch` stall is saved as `stalled` instead of being
+  overwritten by the `in_progress` metadata; and a serial batch that may still be
+  alive leaves the untouched provider `interrupted_unknown` rather than
+  `failed_before_start`.
+- `request_id` identity is the request, not its packaging: the intent hash no
+  longer includes the session policy or the scratch path of a temporary archive,
+  so a replay with `--continue-session` or a re-packed repository recovers the
+  original task instead of returning `IDEMPOTENCY_CONFLICT`.
+- Repository archives keep the 20-character stem limit but add a random half, so
+  two archives of the same tree no longer overwrite each other; a caller that
+  supplies `request_id` still gets a deterministic name and can replay.
+
+### Added
+- **The delegation rule is now written into the Skill and README as a hard
+  rule.** Every code problem — bug, failing test, refactor, feature, review —
+  goes to `wfa` with both providers and comes back as complete files or an exact
+  patch. The local agent integrates the patch, runs the tests and reports; it
+  does not diagnose first and does not type the fix itself. The only exception
+  is an explicit user instruction that the request must not use agents.
+
+### Optimization review of 2026-11-22
+
+Three request batches from the external review were each answered by the
+gemini/chatgpt pair and integrated here; the local agent only applied, tested
+and committed the returned files.
+
+- Gemini Task failures now name a reason: the click window records its last
+  failure, an exhausted page replays it, and `stop()` falls back to the page URL
+  it actually visited, so `NOT applied` is no longer bare.
+- `--limit` rejects non-integers and non-positive values instead of returning an
+  empty list; `status`/`list` print `killedStalledPids` when a read command
+  terminated a stalled child.
+- `stall-watch` re-parses `metadata.json` only when its mtime changes; job
+  metadata is read once per pass; Chrome profile discovery is cached and the
+  cache is invalidated on login. The metadata cache keys on mtime, size and inode
+  and is dropped when the file disappears, so a terminal rewrite that lands on
+  the same mtime (common on Windows) is still seen.
+- Attachment hashes are computed once per pass, repository bundling appends
+  bytes instead of re-encoding, and archive deflate drops to level 6 while still
+  storing incompressible entries.
+- Gemini polls `/json/list` every 500 ms and rechecks the model switch every
+  150 ms, both bounded by the remaining click window.
+- Captured stdout/stderr keep the newest bytes instead of the oldest.
+- Attachment globs compile once per request and share one `stat`; the sensitive
+  scan walks the shared prompt once and each provider delta separately, keeping
+  per-provider sources and line numbers.
+- Inline bundles, ZIP archives and attachments take their skip/sensitive/extension
+  lists from one module (`repo-select.js`), so the three copies can no longer
+  drift. Core entry points come from the repository's own `package.json`
+  (`bin`, `main`, `exports`, `scripts`) instead of a hard-coded list of wfa files.
+- Git helpers share `GIT_TIMEOUT_MS`/`GIT_MAX_BUFFER`; native `Error`s keep their
+  message through the CLI exit path (`errors.js`, `util.js`), and the unused
+  `assert`/`getDefaultConfigPath` helpers are gone.
+- `README.md` states the real 900 s default and the actual
+  `failed_before_start` condition; `skills/web-first/SKILL.md` carries a version
+  stamp.
+
+## 0.2.9 - 2026-11-22
 
 Two earlier conclusions in `docs/known-issues.md` were wrong, and one of them was
 wrong in a way that stayed invisible: ask-bridge decides whether an attachment

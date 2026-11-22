@@ -3,15 +3,82 @@ import { promisify } from "node:util";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { WfaError } from "./errors.js";
+import { collectTrackedSources } from "./repository-archive.js";
+import { GIT_MAX_BUFFER, GIT_TIMEOUT_MS } from "./constants.js";
 
 const exec = promisify(execFile);
-const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", ".cache", "vendor", "target", ".venv", "__pycache__"]);
-const SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|7z|rar|exe|dll|so|dylib|class|pyc|woff2?|ttf|otf|mp[34]|avi|mov|sqlite|db|bin|dat|lock)$/i;
-const CORE_FILES = ["package.json", "src/cli.js", "src/managed-runner.js", "src/repository.js", "src/policy-store.js", "src/ask-bridge.js", "src/jobs.js", "README.md"];
 
 async function git(cwd, ...args) {
-  const { stdout } = await exec("git", args, { cwd, windowsHide: true, timeout: 5000, maxBuffer: 12 * 1024 * 1024 });
+  const { stdout } = await exec("git", args, {
+    cwd, windowsHide: true,
+    timeout: GIT_TIMEOUT_MS,
+    maxBuffer: GIT_MAX_BUFFER,
+  });
   return stdout.trimEnd();
+}
+
+// Select entry points from repository metadata and tracked eligible paths,
+// rather than using the source paths of web-first-ask itself.
+export async function selectCoreEntries(root, eligible) {
+  const available = new Set(eligible);
+  const selected = [];
+  const seen = new Set();
+
+  const add = (candidate) => {
+    if (typeof candidate !== "string" || !candidate) return;
+    const raw = candidate.replace(/\\/g, "/");
+    if (raw.startsWith("/") || /^[A-Za-z]:\//.test(raw)) return;
+    const normalized = path.posix.normalize(raw.replace(/^\.\//, ""));
+    if (!normalized || normalized === "." || normalized === ".."
+      || normalized.startsWith("../")) return;
+    if (!available.has(normalized) || seen.has(normalized)) return;
+    if (selected.length >= 8) return;
+    seen.add(normalized);
+    selected.push(normalized);
+  };
+
+  add("package.json");
+  add("README.md");
+
+  if (available.has("package.json")) {
+    let manifest = null;
+    try {
+      manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+    } catch {
+      // Invalid or unreadable package metadata must not break the inventory.
+    }
+
+    if (manifest && typeof manifest === "object" && !Array.isArray(manifest)) {
+      add(manifest.main);
+
+      if (typeof manifest.bin === "string") {
+        add(manifest.bin);
+      } else if (manifest.bin && typeof manifest.bin === "object") {
+        for (const candidate of Object.values(manifest.bin)) add(candidate);
+      }
+
+      const visitExports = (entry) => {
+        if (selected.length >= 8) return;
+        if (typeof entry === "string") {
+          add(entry);
+        } else if (Array.isArray(entry)) {
+          for (const value of entry) visitExports(value);
+        } else if (entry && typeof entry === "object") {
+          for (const value of Object.values(entry)) visitExports(value);
+        }
+      };
+      visitExports(manifest.exports);
+    }
+  }
+
+  for (const candidate of [
+    "src/index.js", "index.js", "main.py",
+    "Cargo.toml", "go.mod", "pyproject.toml",
+  ]) {
+    add(candidate);
+  }
+
+  return selected;
 }
 
 export function normalizeRepoUrl(remote) {
@@ -101,15 +168,6 @@ export function matchRepoUnreadable(answer) {
   return null;
 }
 
-function matchesExclude(file, patterns) {
-  return patterns.some((pattern) => {
-    const p = String(pattern).replace(/\\/g, "/").replace(/^!/, "");
-    if (!p) return false;
-    const escaped = p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "\u0000").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]").replace(/\u0000/g, ".*");
-    return new RegExp(`^(?:${escaped})(?:$|/)`).test(file) || (!p.includes("/") && new RegExp(`(?:^|/)${escaped}$`).test(file));
-  });
-}
-
 // Git reports the toplevel with forward slashes, and one directory can have
 // several spellings on Windows: an 8.3 short name (`RUNNER~1`), a junction, a
 // different drive-letter case. Comparing absolute strings therefore fails on
@@ -143,21 +201,10 @@ async function includeLabelsFor({ root, cwd, includes }) {
 
 export async function bundleRepository({ cwd = process.cwd(), excludes = [], includes = [], prompt = "", maxFileBytes = 65536,
   maxTotalBytes = 8 * 1024 * 1024, maxInlineBytes = 30 * 1024 } = {}) {
-  const root = await git(cwd, "rev-parse", "--show-toplevel").catch(() => null);
-  if (!root) throw new WfaError("BUNDLE_REPO_NOT_GIT", "--bundle-repo requires a Git working tree. Use --file <path> instead.");
-  const { stdout } = await exec("git", ["ls-files", "-z", "--cached", "--exclude-standard"], {
-    cwd: root, windowsHide: true, timeout: 10000, encoding: "buffer", maxBuffer: 12 * 1024 * 1024,
-  });
-  const tracked = Buffer.from(stdout).toString("utf8").split("\0").filter(Boolean);
-  const skipped = [];
-  const eligible = tracked.filter((relative) => {
-    const label = relative.replace(/\\/g, "/");
-    const invalid = label.split("/").some((part) => SKIP_DIRS.has(part)) || SKIP_EXT.test(label)
-      || /(?:^|\/)(?:\.env(?:\.|$)|id_rsa|[^/]*\.min\.(?:js|css)$)/i.test(label)
-      || matchesExclude(label, excludes);
-    if (invalid) skipped.push({ path: label, reason: "excluded/generated/binary filename" });
-    return !invalid;
-  });
+  // One tracked-source filter for both transports. They used to keep separate
+  // rules, and the inline copy shipped .npmrc / credentials / id_ed25519 into
+  // the prompt while the zip copy excluded them.
+  const { root, selected: eligible, skipped } = await collectTrackedSources({ cwd, excludes });
   const selectedPaths = await includeLabelsFor({ root, cwd, includes });
   const matchesInclude = (entry) => selectedPaths.some((item) => {
     const label = foldPath(entry);
@@ -171,9 +218,10 @@ export async function bundleRepository({ cwd = process.cwd(), excludes = [], inc
   // unrelated repository files under an arbitrary byte budget.
   const priority = includes.length ? eligible.filter(matchesInclude) : mentioned;
   const tree = eligible.map((item) => `- ${item}`).join("\n");
-  const core = CORE_FILES.filter((item) => eligible.includes(item));
+  const core = await selectCoreEntries(root, eligible);
   const intro = `REPOSITORY SOURCE BUNDLE\nDIRECTORY TREE (tracked, eligible files):\n${tree}\n\nCORE ENTRY POINTS:\n${core.map((item) => `- ${item}`).join("\n") || "(none detected)"}\n\nThe sources included below are authoritative for this request. The tree is only an inventory; do not claim to have read unlisted source contents. Ask for exact additional paths if needed.\n`;
   let content = intro;
+  let usedBytes = Buffer.byteLength(intro, "utf8");
   let sourceBytes = 0;
   let files = 0;
   for (const relative of priority) {
@@ -192,12 +240,14 @@ export async function bundleRepository({ cwd = process.cwd(), excludes = [], inc
     try { body = new TextDecoder("utf-8", { fatal: true }).decode(buffer); }
     catch { skipped.push({ path: relative, reason: "invalid UTF-8" }); continue; }
     const section = `\n===== FILE: ${relative} =====\n${body}\n===== END FILE: ${relative} =====\n`;
+    const sectionBytes = Buffer.byteLength(section, "utf8");
     const limit = includes.length ? maxTotalBytes : Math.min(maxTotalBytes, maxInlineBytes);
-    if (sourceBytes + buffer.length > limit || Buffer.byteLength(content + section, "utf8") > maxTotalBytes) {
+    if (sourceBytes + buffer.length > limit || usedBytes + sectionBytes > maxTotalBytes) {
       skipped.push({ path: relative, reason: "inline budget; use --file to select this source explicitly" });
       continue;
     }
     content += section;
+    usedBytes += sectionBytes;
     sourceBytes += buffer.length;
     files += 1;
   }
@@ -211,7 +261,7 @@ export async function bundleRepository({ cwd = process.cwd(), excludes = [], inc
       : `every requested path was skipped: ${skipped.filter((item) => priority.includes(item.path)).map((item) => `${item.path} (${item.reason})`).join(", ") || includes.join(", ")}`;
     throw new WfaError("BUNDLE_REPO_INCLUDE_UNMATCHED", `--bundle-repo could not inline any requested file: ${detail}. A path passed with --file must be relative to the repository root, not to the current directory.`);
   }
-  return { content, stats: { files, bytes: Buffer.byteLength(content, "utf8"), skipped: skipped.length,
+  return { content, stats: { files, bytes: usedBytes, skipped: skipped.length,
     listed: eligible.length, sourceBytes, coreEntryPoints: core }, skipped };
 }
 

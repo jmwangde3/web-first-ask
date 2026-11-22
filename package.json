@@ -1,6 +1,6 @@
 {
   "name": "web-first-ask",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "A Codex-first CLI for context-aware web AI delegation, safe task recovery and staged code application through ask-bridge.",
   "type": "module",
   "private": false,
@@ -13,7 +13,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check bin/wfa.js && node --check src/cli.js && node --check src/runner.js && node --check src/managed-runner.js && node --check src/repository.js && node --check src/policy-store.js && node --check src/stall-watch.js && node --check src/jobs.js && node --check src/ask-bridge.js && node --check src/gemini-mode.js && node --check src/metadata.js && node --check src/state.js && node --check src/store.js && node --check src/recovery.js && node --check src/attachments.js && node --check src/bundle.js && node --check src/provider-errors.js && node --check src/stage.js && node --check src/prompts.js && node --check src/constants.js && node --check src/paths.js && node --check src/util.js && node --check src/errors.js"
+    "check": "node scripts/check-syntax.mjs"
   },
   "keywords": [
     "codex",

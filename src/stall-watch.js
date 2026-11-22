@@ -1,5 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { BROWSER_QUIET_WINDOW_SECONDS } from "./constants.js";
 
 // Milliseconds since ask-bridge last wrote to its browser log, or null when the
 // file is unavailable. Used as a veto: silence in wfa's own output during a long
@@ -16,15 +17,20 @@ export async function browserIdleMs(logPath, now = Date.now()) {
 // The window is fixed rather than tied to --stall-timeout: while a page
 // generates, ask-bridge writes this log every ~200 ms, so two quiet minutes is
 // already a strong signal, and a long --stall-timeout must not widen it.
-export const BROWSER_QUIET_WINDOW_SECONDS = 120;
+export { BROWSER_QUIET_WINDOW_SECONDS };
 
 export function browserStillWorking(idleMs, windowSeconds = BROWSER_QUIET_WINDOW_SECONDS) {
   return idleMs !== null && idleMs < windowSeconds * 1000;
 }
 
+function metadataSignature(info) {
+  return info?.isFile() ? `${info.mtimeMs}:${info.size}:${info.ino}` : null;
+}
+
 export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = () => Date.now()) {
   const observed = new Map(jobs.map((job) => [job.provider, {
-    id: job.id, active: false, lastLife: clock(), lastProgressLine: null, metadataMtime: null,
+    id: job.id, active: false, lastLife: clock(), lastProgressLine: null,
+    metadataMtime: null, metadataKey: null, metadataState: undefined,
   }]));
 
   function progress(line) {
@@ -44,14 +50,24 @@ export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = 
     for (const [provider, item] of observed) {
       const metadataPath = path.join(outputDir, item.id, "metadata.json");
       const info = await stat(metadataPath).catch(() => null);
-      if (info?.isFile() && info.mtimeMs !== item.metadataMtime) {
+      const signature = metadataSignature(info);
+      if (signature === null) {
+        // A missing file must clear any cached signature/state so a later
+        // recreation with the same mtime/size is re-read instead of reusing stale state.
+        item.metadataMtime = null;
+        item.metadataKey = null;
+        item.metadataState = undefined;
+      } else if (signature !== item.metadataKey) {
         item.metadataMtime = info.mtimeMs;
+        item.metadataKey = signature;
         item.lastLife = now;
+        try {
+          item.metadataState = JSON.parse(await readFile(metadataPath, "utf8")).state;
+        } catch {
+          item.metadataState = undefined;
+        }
       }
-      let state;
-      if (info?.isFile()) {
-        try { state = JSON.parse(await readFile(metadataPath, "utf8")).state; } catch {}
-      }
+      const state = item.metadataState;
       if (["completed", "failed", "timed_out", "recoverable", "cancelled"].includes(state)) {
         item.active = false;
         continue;

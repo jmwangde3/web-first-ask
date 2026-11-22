@@ -292,8 +292,53 @@ test("a detached worker killed before ask-bridge printed anything is retryable, 
   }
 });
 
-test("a detached worker that had already printed stays ambiguous", async () => {
-  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-detach-printed-"));
+test("empty batch logs do not prove a detached job was never submitted", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-detach-submitted-"));
+  try {
+    const store = await detachedFixture(home, "detach-submitted", "");
+    const jobDir = path.join(home, "runs", "detach-submitted", "ask-bridge-output", "job-g");
+    await mkdir(jobDir, { recursive: true });
+    // ask-bridge already wrote a conversation URL: the prompt reached a page
+    // even though the worker's own batch logs are still empty.
+    await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({
+      id: "job-g", provider: "gemini", state: "in_progress",
+      threadUrl: "https://gemini.google.com/app/ba22855df654c75a",
+    }));
+    const refreshed = await (await import("../src/runner.js")).refreshTask("detach-submitted", { home, store });
+    assert.equal(refreshed.children.gemini.state, "interrupted_unknown");
+    assert.equal(refreshed.children.gemini.threadUrl, "https://gemini.google.com/app/ba22855df654c75a");
+    assert.equal(refreshed.state, "needs_recovery");
+    assert.ok(workspaceHasBlockingTask((await store.snapshot()).tasks.tasks, "repo", ["gemini"]));
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("a trusted completion corrects an earlier failed_before_start", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-detach-late-"));
+  try {
+    const store = await detachedFixture(home, "detach-late", "");
+    const first = await (await import("../src/runner.js")).refreshTask("detach-late", { home, store });
+    assert.equal(first.children.gemini.state, "failed_before_start");
+
+    const jobDir = path.join(home, "runs", "detach-late", "ask-bridge-output", "job-g");
+    await mkdir(jobDir, { recursive: true });
+    await writeFile(path.join(jobDir, "response.md"), "late answer");
+    await writeFile(path.join(jobDir, "metadata.json"), JSON.stringify({
+      id: "job-g", provider: "gemini", state: "completed",
+      threadUrl: "https://gemini.google.com/app/ba22855df654c75a",
+    }));
+
+    const second = await (await import("../src/runner.js")).refreshTask("detach-late", { home, store });
+    assert.equal(second.children.gemini.state, "completed");
+    assert.ok(second.children.gemini.resultPath);
+    assert.equal(second.children.gemini.error, null);
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("a detached worker that had already printed stays ambiguous", async () => {  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-detach-printed-"));
   try {
     const store = await detachedFixture(home, "detach-printed", "[batch] running 1 job(s), concurrency 1\n");
     const refreshed = await (await import("../src/runner.js")).refreshTask("detach-printed", { home, store });

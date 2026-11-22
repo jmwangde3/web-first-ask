@@ -3,7 +3,29 @@ name: web-first
 description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Every nontrivial request — requirements, root cause, architecture, debugging, code design or implementation — goes through the local wfa CLI to Gemini (Task mode) + ChatGPT by default, serially, and must return complete file contents or exact replacement blocks, not a plan or a diff. For a project with a Git remote the local agent submits the repository reference plus the requirement and lets the providers read the repository; it only sends code or files when a provider asks for them.
 ---
 
+Version: 0.2.10
+
 # Web-First
+
+## Hard rule: code work is always delegated, never hand-written
+
+Every code problem — a bug, a failing test, a refactor, a feature, a review, a
+"small" fix someone already diagnosed — is sent to `wfa` with **both providers**
+(the default `gemini,chatgpt` pair) and comes back as complete file contents or
+an exact patch. The local agent does not write the fix itself.
+
+- Do not read the codebase to build your own hypothesis before delegating.
+- Do not type a fix the providers did not return. Integrating their patch,
+  running tests, reporting results and committing is the whole local job.
+- The only exception is an explicit instruction from the user that this request
+  must not use agents / must not call `wfa`. "It looked small", "it was faster",
+  "I had already found the cause" are **not** exceptions, and neither is a
+  half-finished refactor you started earlier.
+- When the two providers disagree, take the stricter/safer variant or ask the
+  user. Do not settle the disagreement by writing your own version.
+- If a provider answers off-topic, returns only a link, or hands back a sandbox
+  attachment instead of `FILE:` blocks, that run failed the delivery contract:
+  re-send with a tighter prompt rather than filling the gap yourself.
 
 ## Core role split
 
@@ -141,8 +163,8 @@ The default batch runs providers one after another (`--concurrency 1`), because 
 The default pair is **Gemini in Task mode, then ChatGPT**, and that is what an unflagged call sends. Gemini's Chat/Task switch is page state — not a URL parameter, not `localStorage`, reset to Chat by a reload — so `wfa` presses it through Chrome's debugging port right after the page appears and records the outcome instead of promising it. Read the `Gemini mode:` line of every run:
 
 - `Gemini mode: task (switch pressed before typing)` — the switch landed before any prompt text existed. Trust the mode.
-- `Gemini mode: task (applied, but after typing had started) - …` — the click may have cleared text ask-bridge had already typed. Treat that answer as uncertain: check it against ChatGPT's, and say so if the two disagree.
-- `Gemini mode: task (NOT applied) - <reason>` — the run completed in Chat. The answer is still usable, but it did not come from Task mode; state that rather than reporting a clean Task run.
+- `Gemini mode: task (switch pressed with N characters already in the composer)` — ask-bridge had started typing. The switch is page state: switching back and forth keeps the composer content until something is submitted, so the click does not clear the prompt and the mode is still trustworthy. The count is a timing observation, not a warning.
+- `Gemini mode: task (NOT applied) - <reason>` — the page never appeared, the switch was missing, or the CDP connection dropped. The run completed in Chat; state that rather than reporting a clean Task run.
 
 `--gemini-mode chat` sends one request in Chat (`wfa gemini-mode chat` saves it for later). Use it when a task is known to break in Task mode, never to paper over a failure you have not diagnosed. A detached plain batch has no coordinator process to hold the debugging session and will record `NOT applied`; that is expected, not an error to retry.
 
@@ -161,7 +183,7 @@ wfa ask --providers 'chatgpt,gemini,claude' ...
 - `timed_out`, `recoverable`, `interrupted_unknown`, `stalled` and ambiguous `failed` states may mean the prompt was already submitted. Never resend automatically.
 - A `stalled` provider means ask-bridge stayed silent **and** the browser stopped working: no progress line, no metadata change, and no write to ask-bridge's `chrome-devtools-mcp.log` for the last two minutes. The default threshold is `--stall-timeout` 900 s. Generation itself is silent — ask-bridge writes nothing until the answer is done — so five minutes of quiet is normal for a long answer and is not evidence of death. It still locks the workspace: inspect the browser, then `wfa collect` or `wfa resolve`.
 - While a batch is quiet, `guardedBatch` prints `[wfa] still waiting: gemini quiet 240s (stall limit 900s)` once a minute. That line is synthetic: it carries no job id and is not written to `batch.stdout.log`. If it stops appearing while the process is alive, the process is no longer in the waiting loop; if the process is gone entirely, use `wfa status` once rather than resubmitting.
-- `--detach` does not outlive a host that reaps background processes. Measured in an IDE/agent runner: the worker is killed when the calling tool call ends, so `batch.stdout.log` and `batch.stderr.log` both stay 0 bytes and nothing reaches a provider. wfa now reports that state as `failed_before_start` (plain `failed`, no workspace lock, safe to rerun) instead of a locked `needs_recovery`; if you see it, do not run `wfa resolve`, just run again in the foreground or put `wfa ask` itself in the background.
+- `--detach` does not outlive a host that reaps background processes. Measured in an IDE/agent runner: the worker is killed when the calling tool call ends; whether the prompt had already been submitted is then unknown, and guessing wrong means sending it twice. **Empty `batch.*.log` is not proof that nothing was sent** — a detached serial worker captures ask-bridge itself, so those files used to stay at 0 bytes for the whole run. Since 0.2.10 the worker forwards provider output and the `still waiting` heartbeat to the batch log, and `failed_before_start` (plain `failed`, no lock, safe to rerun) requires that no `metadata.json`, thread URL, result, or completion proof exists at all. If any of those exists the job becomes `interrupted_unknown`: run `wfa status` once, check the conversation, then `wfa resolve` — do not resubmit. In practice, prefer the foreground or put `wfa ask` itself in the background.
 - A `WORKSPACE_PROVIDER_LOCKED` error is not a transient failure. Read the task ID it names, run `wfa status <task-id>` once, and either collect the result or, after confirming the generation is dead in the browser, `wfa resolve <task-id> --provider <provider> --confirm`.
 - `--new-session` does not bypass the lock. A request that may already have reached the provider stays blocking on purpose; a resend into an uncertain conversation is worse than an explicit resolve.
 - Failures that provably happened before submission — the tab never loaded, the send button never became enabled, or a Gemini attachment upload timed out — release the lock automatically. Do not spend a `wfa resolve` on them; just fix the cause and retry.
