@@ -45,6 +45,14 @@ which meant `--bundle-repo=zip` never worked on Gemini without saying so.
   now warn that the attached files were probably unused and say to resend the
   content as text or point the provider at a reachable URL.
 
+### Changed
+- The default pair is now Gemini in Task mode plus ChatGPT, in that order
+  (`defaultProviders` and `defaultCompareProviders` = `["gemini", "chatgpt"]`,
+  `geminiMode` = `"task"`). Previously Gemini landed on Chat unless
+  `--gemini-mode task` was passed, so the default run never touched the switch
+  and `wfa status` had nothing to report. `--gemini-mode chat` and
+  `wfa gemini-mode chat` still select Chat, per request or as the saved default.
+
 ### Fixed
 - Repository archives are named `<slug8>-<hex8>.zip` (17-character stem) instead
   of `<slug>-<timestamp>-<hex>.zip` (~50). Measured on one machine with the same

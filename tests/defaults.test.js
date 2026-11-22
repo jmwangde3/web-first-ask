@@ -30,9 +30,11 @@ function dryRunCli(home, args) {
 test("config defaults to both providers, serial execution and a single login provider", async () => {
   await withHome("wfa-defaults-", async (home) => {
     const config = await loadConfig(home);
-    assert.deepEqual(config.defaultProviders, ["chatgpt", "gemini"]);
+    assert.deepEqual(config.defaultProviders, ["gemini", "chatgpt"]);
     assert.equal(config.defaultConcurrency, 1);
     assert.equal(config.defaultProvider, "chatgpt");
+    // Gemini runs in Task mode by default, so the pair is "gemini task + chatgpt".
+    assert.equal(config.geminiMode, "task");
 
     await writeFile(path.join(home, "config.json"), JSON.stringify({
       defaultProviders: "claude,chatgpt",
@@ -44,11 +46,11 @@ test("config defaults to both providers, serial execution and a single login pro
   });
 });
 
-test("CLI defaults to chatgpt+gemini serially and still allows narrowing", async () => {
+test("CLI defaults to gemini+chatgpt serially and still allows narrowing", async () => {
   await withHome("wfa-defaults-cli-", async (home) => {
     const wide = dryRunCli(home, ["ask", "--prompt", "x", "--dry-run"]);
     assert.equal(wide.status, 0, wide.stderr);
-    assert.deepEqual(wide.preview.providers, ["chatgpt", "gemini"]);
+    assert.deepEqual(wide.preview.providers, ["gemini", "chatgpt"]);
     assert.equal(wide.preview.concurrency, 1);
 
     const narrow = dryRunCli(home, ["ask", "--provider", "chatgpt", "--prompt", "x", "--dry-run"]);

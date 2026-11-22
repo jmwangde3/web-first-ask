@@ -6,10 +6,11 @@ import path from "node:path";
 import { loadConfig, validateGeminiMode } from "../src/config.js";
 import { geminiTaskModeNeeded, startGeminiTaskModeForTask } from "../src/gemini-mode.js";
 
-test("gemini mode defaults to chat and rejects anything else", async () => {
+test("gemini mode defaults to task, and anything else is rejected", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-gmode-"));
   try {
-    assert.equal((await loadConfig(home)).geminiMode, "chat");
+    assert.equal((await loadConfig(home)).geminiMode, "task");
+    assert.equal(validateGeminiMode("chat"), "chat");
     assert.equal(validateGeminiMode("task"), "task");
     assert.throws(() => validateGeminiMode("tasks"), /chat.*or.*task/i);
     assert.throws(() => validateGeminiMode(undefined), /chat.*or.*task/i);
