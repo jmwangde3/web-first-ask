@@ -1,13 +1,13 @@
 ---
 name: web-first
-description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Every nontrivial request — requirements, root cause, architecture, debugging, code design or implementation — goes through the local wfa CLI to ChatGPT + Gemini by default, serially, and must return complete file contents or exact replacement blocks, not a plan or a diff. For a project with a Git remote the local agent submits the repository reference plus the requirement and lets the providers read the repository; it only sends code or files when a provider asks for them.
+description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Every nontrivial request — requirements, root cause, architecture, debugging, code design or implementation — goes through the local wfa CLI to Gemini (Task mode) + ChatGPT by default, serially, and must return complete file contents or exact replacement blocks, not a plan or a diff. For a project with a Git remote the local agent submits the repository reference plus the requirement and lets the providers read the repository; it only sends code or files when a provider asks for them.
 ---
 
 # Web-First
 
 ## Core role split
 
-- **ChatGPT + Gemini are the default reasoning and implementation partners.** Every `wfa` call goes to both providers, serially, unless the user explicitly asks for one, or one provider is structurally unable to do the task (Gemini document attachments — see Provider known limits).
+- **Gemini (Task mode) + ChatGPT are the default reasoning and implementation partners.** Every `wfa` call goes to both providers, serially, unless the user explicitly asks for one, or one provider is structurally unable to do the task (Gemini document attachments — see Provider known limits). Gemini runs first and lands in Task mode by default, so read the `Gemini mode:` line of every run (see Gemini's landing mode below) instead of assuming the switch was pressed.
 - **You (the local coding agent) own execution only**: resolve the remote, write the requirement, apply what comes back, run tests, verify, commit. You do not pre-read the repository to build context and you do not reason the design through yourself when a provider can. Do not rewrite their answer from scratch.
 - **You submit a repository reference, not a dossier.** The default request is the requirement plus the URL/branch/commit that `wfa` resolves from the Git remote. Files, excerpts or a whole-repository bundle go out only when a provider asks for them (see Repository-first workflow).
 - Both providers receive the same prompt in one serial batch. Their answers are independent; compare them, take the stricter/safer variant on conflict, and discard any fragment that arrived corrupted.
@@ -111,7 +111,7 @@ Attach files only when the question is about material the providers cannot reach
 
 ## Parallel multi-provider consultation
 
-Multi-provider is the default, not an opt-in. `wfa` sends every request to ChatGPT + Gemini unless you narrow it deliberately.
+Multi-provider is the default, not an opt-in. `wfa` sends every request to Gemini (Task mode) + ChatGPT unless you narrow it deliberately.
 
 Narrow to a single provider only when:
 
@@ -136,6 +136,14 @@ Both providers receive the same prompt and attachments in one batch and answer i
 
 The default batch runs providers one after another (`--concurrency 1`), because concurrent browser tabs interfere with each other on this setup. Keep it serial. Do not work around interference by launching two separate `wfa` processes against different workspaces.
 
+The default pair is **Gemini in Task mode, then ChatGPT**, and that is what an unflagged call sends. Gemini's Chat/Task switch is page state — not a URL parameter, not `localStorage`, reset to Chat by a reload — so `wfa` presses it through Chrome's debugging port right after the page appears and records the outcome instead of promising it. Read the `Gemini mode:` line of every run:
+
+- `Gemini mode: task (switch pressed before typing)` — the switch landed before any prompt text existed. Trust the mode.
+- `Gemini mode: task (applied, but after typing had started) - …` — the click may have cleared text ask-bridge had already typed. Treat that answer as uncertain: check it against ChatGPT's, and say so if the two disagree.
+- `Gemini mode: task (NOT applied) - <reason>` — the run completed in Chat. The answer is still usable, but it did not come from Task mode; state that rather than reporting a clean Task run.
+
+`--gemini-mode chat` sends one request in Chat (`wfa gemini-mode chat` saves it for later). Use it when a task is known to break in Task mode, never to paper over a failure you have not diagnosed. A detached plain batch has no coordinator process to hold the debugging session and will record `NOT applied`; that is expected, not an error to retry.
+
 Claude is available when explicitly selected:
 
 ```powershell
@@ -149,7 +157,8 @@ wfa ask --providers 'chatgpt,gemini,claude' ...
 - A nonzero exit from `ask`, `compare` or `code` can still include completed provider results. Read the task summary and use successful result files before deciding how to recover the unfinished providers.
 - If the terminal tool returns while the process is still running, inspect `wfa status <task-id>` once when needed. If it is still running, do not submit again.
 - `timed_out`, `recoverable`, `interrupted_unknown`, `stalled` and ambiguous `failed` states may mean the prompt was already submitted. Never resend automatically.
-- A `stalled` provider means ask-bridge produced no progress line and no metadata change for `--stall-timeout` seconds (default 300) and the batch was killed. It still locks the workspace: inspect the browser, then `wfa collect` or `wfa resolve`.
+- A `stalled` provider means ask-bridge stayed silent **and** the browser stopped working: no progress line, no metadata change, and no write to ask-bridge's `chrome-devtools-mcp.log` for the last two minutes. The default threshold is `--stall-timeout` 900 s. Generation itself is silent — ask-bridge writes nothing until the answer is done — so five minutes of quiet is normal for a long answer and is not evidence of death. It still locks the workspace: inspect the browser, then `wfa collect` or `wfa resolve`.
+- While a batch is quiet, `guardedBatch` prints `[wfa] still waiting: gemini quiet 240s (stall limit 900s)` once a minute. That line is synthetic: it carries no job id and is not written to `batch.stdout.log`. If it stops appearing while the process is alive, the process is no longer in the waiting loop; if the process is gone entirely, use `wfa status` once rather than resubmitting.
 - A `WORKSPACE_PROVIDER_LOCKED` error is not a transient failure. Read the task ID it names, run `wfa status <task-id>` once, and either collect the result or, after confirming the generation is dead in the browser, `wfa resolve <task-id> --provider <provider> --confirm`.
 - `--new-session` does not bypass the lock. A request that may already have reached the provider stays blocking on purpose; a resend into an uncertain conversation is worse than an explicit resolve.
 - Failures that provably happened before submission — the tab never loaded, the send button never became enabled, or a Gemini attachment upload timed out — release the lock automatically. Do not spend a `wfa resolve` on them; just fix the cause and retry.
@@ -178,7 +187,8 @@ Measured against ask-bridge 0.4.0; full evidence and reproductions are in `docs/
 - **ChatGPT long answers may land in Canvas.** When the response is replaced by a download link plus a hash, `response.md` does not contain the artifact. Ask for smaller chunks, or request the content to be repeated inline in the chat.
 - **Gemini corrupts Markdown diffs.** `||` becomes `\vert{}\vert{}`, quoted variables get mangled and `diff --git` headers disappear. Never ask Gemini for a patch; ask for "file path + original block + replacement block" and apply it locally.
 - **Gemini often cannot read a public repository.** Measured today: a repository-first request came back as `REPO_UNREADABLE` in 12 seconds. That is a normal outcome, not a failure of the request — run the `--bundle-repo=zip` fallback. Do not inline a whole repository and do not retry the same prompt hoping for a different result.
-- **ChatGPT repository reading is slow, not broken.** A repository-first implementation request took 28 minutes and still finished. Do not kill it early; `--stall-timeout` only fires when the page goes completely silent.
+- **ChatGPT repository reading is slow, not broken.** A repository-first implementation request took 28 minutes and still finished. Do not kill it early; the stall watchdog only fires when both wfa and the browser have been quiet, and a generating tab keeps writing `chrome-devtools-mcp.log`.
+- **A provider can answer "I cannot open the attachment" and still be `completed`.** Measured on `--bundle-repo=zip`: `state: completed`, body "当前会话环境中没有可用的文件解压或本地文件读取工具", no usable output. `wfa code` and `wfa status` flag this now, but the fix is on your side: resend the content as text, or point the provider at a reachable URL. A `completed` task that says it could not read the files has not answered the question.
 - **Do not assume provider-side session isolation.** See Session rules and `threadMismatch`.
 
 ## Trust and evidence
