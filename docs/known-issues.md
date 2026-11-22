@@ -379,6 +379,31 @@ wfa: EPERM: operation not permitted, mkdir 'C:\Users\<user>\AppData\Local\web-fi
 
 **已修**：`inspectResponseHeuristics` 增加附件拒绝特征（中英），命中时在 `wfa code` 与 `wfa status` 都打警告，说明附件很可能没被使用、该改发文本或给可达 URL。仍是 `completed` —— 任务确实完成，只是产出没用上附件，所以用警告而不是假造一个新的失败态。
 
+## U19 `--detach` 启动的 worker 立即消失，任务落 `needs_recovery`（2026-11-22 10:05 复现，未修）
+
+**现象**：`wfa ask --detach` 正常打印 `Started task <id>; detached worker`，`wfa status` 立刻是 `running`，两个 provider `queued`。约 1 分钟后变成 `needs_recovery`，两个 provider 都是 `interrupted_unknown`：
+
+```
+ask-bridge process is no longer running and no trusted terminal artifact was found.
+The prompt may already have been submitted; do not resend.
+```
+
+**证据**：run 目录只有 `jobs.jsonl` 和两个 **0 字节**的 `batch.stdout.log` / `batch.stderr.log`，`ask-bridge-output/` 为空；`ps` 里没有 ask-bridge，也没有 Chrome。
+
+**复现**：
+
+```bash
+wfa ask --no-repo --workspace <新名> --prompt-file note.md --timeout 1800 --detach
+# 等待 60–90 秒
+wfa status <task-id>
+```
+
+**绕过**：不用 `--detach`，把 `wfa ask` 本身放进调用方的后台任务里。同一 prompt、同一 workspace 规则、只换 workspace 名重发，Gemini 75 秒正常完成（run `ade9f7bd`），说明问题在 detach 的进程托管，不在 provider 或 prompt。
+
+**推测**：detach worker 的 stdin 一关就退出（与 U16 里的 `Shutting down (stdin end)` 同源），batch 还没见到 job 就结束了。没有实测上游代码，未确认。
+
+**期望**：`--detach` 的 worker 与调用方 stdin 解耦；即使立刻关闭终端，任务也应继续。若做不到，`--detach` 应直接拒绝并提示改用后台运行。
+
 
 
 U11–U15 里只有 U14 的一半在 ask-bridge 侧，其余都在 wfa 或本机守卫，已在 0.2.8 处理。
