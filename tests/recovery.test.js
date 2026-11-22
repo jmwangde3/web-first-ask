@@ -254,3 +254,53 @@ test("a collection finishing after resolve cannot resurrect the abandoned provid
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
+
+async function detachedFixture(home, id, stdoutBody) {
+  const runDir = path.join(home, "runs", id);
+  await mkdir(runDir, { recursive: true });
+  await writeFile(path.join(runDir, "batch.stdout.log"), stdoutBody);
+  await writeFile(path.join(runDir, "batch.stderr.log"), "");
+  const store = new Store(home);
+  await store.transaction(({ tasks }) => {
+    tasks.tasks[id] = {
+      taskId: id, workspace: "repo", workspaceRoot: home, runDir,
+      outputDir: path.join(runDir, "ask-bridge-output"),
+      state: "running", detached: true, childPid: 99999999, workerPid: 99999999,
+      executionPending: true, processExitCode: null,
+      children: {
+        gemini: { provider: "gemini", jobId: "job-g", state: "queued", revision: 1 },
+        chatgpt: { provider: "chatgpt", jobId: "job-c", state: "queued", revision: 1 },
+      },
+    };
+  });
+  return store;
+}
+
+test("a detached worker killed before ask-bridge printed anything is retryable, not ambiguous", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-detach-silent-"));
+  try {
+    const store = await detachedFixture(home, "detach-silent", "");
+    const refreshed = await (await import("../src/runner.js")).refreshTask("detach-silent", { home, store });
+    // Nothing reached a provider, so the workspace must not stay locked.
+    assert.equal(refreshed.children.gemini.state, "failed_before_start");
+    assert.equal(refreshed.children.chatgpt.state, "failed_before_start");
+    assert.equal(refreshed.state, "failed");
+    assert.match(refreshed.children.gemini.error, /nothing reached a provider/i);
+    assert.equal(workspaceHasBlockingTask((await store.snapshot()).tasks.tasks, "repo", ["gemini"]), null);
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("a detached worker that had already printed stays ambiguous", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "wfa-detach-printed-"));
+  try {
+    const store = await detachedFixture(home, "detach-printed", "[batch] running 1 job(s), concurrency 1\n");
+    const refreshed = await (await import("../src/runner.js")).refreshTask("detach-printed", { home, store });
+    assert.equal(refreshed.children.gemini.state, "interrupted_unknown");
+    assert.equal(refreshed.state, "needs_recovery");
+    assert.ok(workspaceHasBlockingTask((await store.snapshot()).tasks.tasks, "repo", ["gemini"]));
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});

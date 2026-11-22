@@ -26,6 +26,7 @@
 | U16 | 长生成被判 `stalled` 并杀进程：ask-bridge 生成期间不产进度行、不更新 metadata | 阻断 | 0.2.9：浏览器日志仍在写就不杀；默认阈值 300 → 900 s |
 | U17 | 批次运行期 CLI 全程静默，无法区分「在等 provider」与「进程已死」 | 严重 | 0.2.9：每 60 s 打一行 `[wfa] still waiting` |
 | U18 | 附件打不开时 provider 仍以 `completed` 收敛，产出为零 | 严重 | 0.2.9：识别「无法解压/读取附件」并警告 |
+| U19 | `--detach` worker 被调用方宿主清理，任务落 `needs_recovery` 并锁住工作区 | 严重 | 0.2.9：空 `batch.*.log` 判 `failed_before_start`（从未提交，可直接重跑）并说明宿主限制 |
 
 ---
 
@@ -379,7 +380,7 @@ wfa: EPERM: operation not permitted, mkdir 'C:\Users\<user>\AppData\Local\web-fi
 
 **已修**：`inspectResponseHeuristics` 增加附件拒绝特征（中英），命中时在 `wfa code` 与 `wfa status` 都打警告，说明附件很可能没被使用、该改发文本或给可达 URL。仍是 `completed` —— 任务确实完成，只是产出没用上附件，所以用警告而不是假造一个新的失败态。
 
-## U19 `--detach` 启动的 worker 立即消失，任务落 `needs_recovery`（2026-11-22 10:05 复现，未修）
+## U19 `--detach` 启动的 worker 立即消失，任务落 `needs_recovery`（2026-11-22 10:05 复现，0.2.9 已修判定）
 
 **现象**：`wfa ask --detach` 正常打印 `Started task <id>; detached worker`，`wfa status` 立刻是 `running`，两个 provider `queued`。约 1 分钟后变成 `needs_recovery`，两个 provider 都是 `interrupted_unknown`：
 
@@ -400,9 +401,15 @@ wfa status <task-id>
 
 **绕过**：不用 `--detach`，把 `wfa ask` 本身放进调用方的后台任务里。同一 prompt、同一 workspace 规则、只换 workspace 名重发，Gemini 75 秒正常完成（run `ade9f7bd`），说明问题在 detach 的进程托管，不在 provider 或 prompt。
 
-**推测**：detach worker 的 stdin 一关就退出（与 U16 里的 `Shutting down (stdin end)` 同源），batch 还没见到 job 就结束了。没有实测上游代码，未确认。
+**推测（已否证）**：原以为是 detach worker 的 stdin 一关就退出。实测不是。
 
-**期望**：`--detach` 的 worker 与调用方 stdin 解耦；即使立刻关闭终端，任务也应继续。若做不到，`--detach` 应直接拒绝并提示改用后台运行。
+**实测原因（2026-11-22 13:40）**：`spawn` 的三个关键点都对——`detached: true`、`stdio: ["ignore", fd, fd]`、`unref()`，而且用 wfa 自己的 `spawnDetached` 在隔离脚本里启动同一个 `ask-bridge.exe batch`，父进程退出后它照样死。用同一个 launcher 起一个每 300 ms 写心跳的 `node -e`，父进程退出后心跳停在 10 行。**父进程活着时一切正常**：把 `spawnDetached` 返回前临时挂住 8 秒，同一任务跑到 `exit code=0`、`batch.stdout.log` 412 字节。
+
+也就是说，终止方不是 wfa、不是 ask-bridge、也不是 stdin，而是**调用方宿主的进程树清理**：本机 agent 的 shell 执行器在一个工具调用结束时收掉整棵树，`detached` 标志只能脱离控制台，脱不出这个 job。同一个 `--detach` 在普通终端里预期仍然有效，所以 wfa 不拒绝它。
+
+**修复（0.2.9）**：ask-bridge 的启动横幅是直接写进 `batch.stdout.log` 的，所以**两个 batch 日志都是 0 字节**只能说明 batch 还没说第一句话，任何 provider 都没见到 prompt。`refreshTask` 对 `detached` 任务用这条判据：满足即记 `failed_before_start`（`task.state` 为 `failed`，不占工作区锁，可直接重跑），并在错误里点明宿主清理与两条出路；有任何一个字节的日志就维持 `interrupted_unknown` + `needs_recovery`（可能已提交，不自动重试）。前台任务不适用该判据——它的 stdout 由 runner 缓存在内存里、批次结束才落盘，0 字节不代表没提交。
+
+**给使用者的结论**：在会清理后台进程的宿主（IDE / agent 的执行器）里，`--detach` 保不住 worker。把 `wfa ask` 本身放进宿主的后台任务，或直接前台跑。
 
 
 

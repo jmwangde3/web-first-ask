@@ -54,6 +54,19 @@ which meant `--bundle-repo=zip` never worked on Gemini without saying so.
   `wfa gemini-mode chat` still select Chat, per request or as the saved default.
 
 ### Fixed
+- `--detach` no longer turns "the host killed the worker" into a locked task.
+  Measured: the spawn flags were already right (`detached`, ignored stdin,
+  `unref()`), and an isolated script using wfa's own `spawnDetached` showed the
+  same death for both `ask-bridge.exe batch` and a plain node heartbeat — while
+  the same run finished normally when the parent was held open for 8 s. The
+  killer is the calling host's process-tree cleanup, which `detached` cannot
+  escape. ask-bridge writes its startup banner straight into `batch.stdout.log`,
+  so a detached task whose two batch logs are both 0 bytes provably never
+  reached a provider; `refreshTask` now records `failed_before_start` for that
+  case (a plain `failed`, no workspace lock, safe to rerun) and says why. Any
+  output at all keeps the conservative `interrupted_unknown` verdict. Foreground
+  runs are excluded: their stdout is buffered in the runner, so an empty file
+  there means nothing.
 - Repository archives are named `<slug8>-<hex8>.zip` (17-character stem) instead
   of `<slug>-<timestamp>-<hex>.zip` (~50). Measured on one machine with the same
   55,699-byte file: stems of 8, 19 and 20 characters complete in 13-17 s, a
