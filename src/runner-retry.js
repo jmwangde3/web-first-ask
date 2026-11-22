@@ -9,6 +9,7 @@ import { guardedBatch } from "./runner-stall.js";
 import { PolicyStore } from "./policy-store.js";
 import { loadConfig } from "./config.js";
 import { geminiTaskModeNeeded, startGeminiTaskModeForTask } from "./gemini-mode.js";
+import { DEFAULT_STALL_TIMEOUT_SECONDS } from "./constants.js";
 import { WfaError } from "./errors.js";
 import { startHeartbeat } from "./util.js";
 
@@ -363,7 +364,7 @@ export async function runDetachedBatchWorker(taskId, workerToken, { home, store 
     throw new WfaError("INVALID_BATCH_WORKER", "Detached task input does not match the persisted provider list.");
   }
   const command = resolveAskBridge(settings);
-  const run = (cmd, args, options) => guardedBatch(runProcess, cmd, args, options, store, task.stallTimeoutSeconds ?? 300);
+  const run = (cmd, args, options) => guardedBatch(runProcess, cmd, args, options, store, task.stallTimeoutSeconds ?? DEFAULT_STALL_TIMEOUT_SECONDS);
   const heartbeat = startHeartbeat({ taskId, store });
   try {
     await withGeminiMode(task, store, () => {}, () => runSequential({
