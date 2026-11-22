@@ -21,9 +21,10 @@ declared safe to resend.
   empty and U17's heartbeat also works under `--detach`.
 
 ### Changed
-- Gemini Task is not pressed when the composer already holds text. Clicking
-  then can rebuild the editor and drop the prompt; the run records
-  `task switch not pressed: the composer already held N characters` instead.
+- Gemini Task is pressed even when the composer already holds text. The switch
+  is page state and keeps the composer content until something is submitted, so
+  the click is safe; the report records `typedBeforeClick` and `wfa status`
+  prints the count as a timing observation, not a failure.
 - Gemini page matching accepts `/app/`, `/app/<id>`, `/u/<n>/app` and their
   query forms. `handled` is recorded only after the switch reports pressed, a
   failed page is retried up to three times, every CDP command has a 5 s timeout,

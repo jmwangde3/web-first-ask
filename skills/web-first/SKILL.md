@@ -141,8 +141,8 @@ The default batch runs providers one after another (`--concurrency 1`), because 
 The default pair is **Gemini in Task mode, then ChatGPT**, and that is what an unflagged call sends. Gemini's Chat/Task switch is page state — not a URL parameter, not `localStorage`, reset to Chat by a reload — so `wfa` presses it through Chrome's debugging port right after the page appears and records the outcome instead of promising it. Read the `Gemini mode:` line of every run:
 
 - `Gemini mode: task (switch pressed before typing)` — the switch landed before any prompt text existed. Trust the mode.
-- `Gemini mode: task (NOT applied) - task switch not pressed: the composer already held N characters` — ask-bridge was already typing, so wfa refused to click rather than risk clearing the prompt. The run stayed in Chat; treat the answer as a Chat answer and do not retry just to get Task mode.
-- `Gemini mode: task (NOT applied) - <other reason>` — the page never appeared, the switch was missing, or the CDP connection dropped. The run completed in Chat; state that rather than reporting a clean Task run.
+- `Gemini mode: task (switch pressed with N characters already in the composer)` — ask-bridge had started typing. The switch is page state: switching back and forth keeps the composer content until something is submitted, so the click does not clear the prompt and the mode is still trustworthy. The count is a timing observation, not a warning.
+- `Gemini mode: task (NOT applied) - <reason>` — the page never appeared, the switch was missing, or the CDP connection dropped. The run completed in Chat; state that rather than reporting a clean Task run.
 
 `--gemini-mode chat` sends one request in Chat (`wfa gemini-mode chat` saves it for later). Use it when a task is known to break in Task mode, never to paper over a failure you have not diagnosed. A detached plain batch has no coordinator process to hold the debugging session and will record `NOT applied`; that is expected, not an error to retry.
 

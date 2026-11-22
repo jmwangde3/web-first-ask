@@ -470,7 +470,7 @@ U11–U15 里只有 U14 的一半在 ask-bridge 侧，其余都在 wfa 或本机
 | U16 长生成误杀 | 部分解决 | 900 s 与浏览器日志否决保留；日志不可读时不否决（退回旧行为），日志被其它任务共用时永远否决——两条都已写进注释，未改判定 |
 | U17 运行期静默 | 部分解决 | detach 串行 worker 现在有输出与心跳 |
 | U19 detach 误锁 | **未解决且方向相反** | 判据加提交证据 + 允许可信完成覆盖（见上） |
-| Gemini Task 开关 | 部分解决 | 输入非空时拒绝点击；URL 覆盖 `/app/<id>`、`/u/<n>/app`、`/app/`；`handled` 只在确认成功后记录，失败最多重试 3 次；CDP 命令 5 s 超时，断线时 reject 全部 pending |
+| Gemini Task 开关 | 部分解决 | 输入非空也照点，只把字符数记进 `typedBeforeClick`（切换不清空输入）；URL 覆盖 `/app/<id>`、`/u/<n>/app`、`/app/`；`handled` 只在确认成功后记录，失败最多重试 3 次；CDP 命令 5 s 超时，断线时 reject 全部 pending |
 | 默认 gemini(Task)+chatgpt | 基本解决 | `defaultCompareProviders` 与服务商顺序对齐 |
 | 附件打不开仍 completed | 部分解决 | 拒绝特征补「读取/访问/打开 + 上传/文件/附件」；带附件的 code 任务在 stage/apply 时直接拒绝（`RESPONSE_ATTACHMENT_UNUSED`） |
 

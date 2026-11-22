@@ -82,15 +82,17 @@ function runClickSource(editorText) {
   return { parsed, clicks };
 }
 
-test("the Task switch is pressed only while the composer is empty", () => {
+test("the Task switch is pressed even when the composer already holds text", () => {
   const empty = runClickSource("");
   assert.equal(empty.parsed.step, "clicked");
+  assert.equal(empty.parsed.typed, 0);
   assert.equal(empty.clicks, 1);
 
-  // Clicking after ask-bridge has typed can rebuild the editor and drop the
-  // prompt. Refusing is the only safe outcome wfa can guarantee.
+  // The switch is page state: switching back and forth keeps the composer
+  // content until something is submitted, so the count is recorded, not
+  // treated as a reason to skip the click.
   const typed = runClickSource("请复核这段代码");
-  assert.equal(typed.parsed.step, "typed");
+  assert.equal(typed.parsed.step, "clicked");
   assert.equal(typed.parsed.typed, 7);
-  assert.equal(typed.clicks, 0);
+  assert.equal(typed.clicks, 1);
 });

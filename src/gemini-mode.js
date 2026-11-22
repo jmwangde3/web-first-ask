@@ -8,10 +8,12 @@
 // Timing is the whole problem: ask-bridge types into the composer right after
 // the editor is ready. Measured on Windows, the toggle is clickable about 1.4 s
 // after the page appears and the composer is still empty at that point, so the
-// click is placed before any text exists. If text is already there the click is
-// refused: switching modes can rebuild the editor and drop the prompt, and a
-// job that submits nothing is worse than a job that stayed on Chat. The caller
-// is always told what was observed rather than being told it worked.
+// click is placed before any text exists. When text is already there the click
+// is still safe: the switch is page state, and switching back and forth keeps
+// the composer content until something is submitted. The character count is
+// recorded on the report (`typedBeforeClick`) instead of being treated as a
+// failure. The caller is always told what was observed rather than being told
+// it worked.
 
 const DEFAULT_PORT = 9223;
 const TASK_LABELS = ["Task", "任务"];
@@ -44,9 +46,8 @@ export const CLICK_TASK_SOURCE = `(() => {
   if (button.getAttribute("aria-pressed") === "true") return JSON.stringify({ step: "already" });
   const editor = document.querySelector('[contenteditable=true]');
   const typed = editor ? editor.innerText.trim().length : 0;
-  if (typed > 0) return JSON.stringify({ step: "typed", typed });
   button.click();
-  return JSON.stringify({ step: "clicked", typed: 0 });
+  return JSON.stringify({ step: "clicked", typed });
 })()`;
 
 export const TASK_STATE_SOURCE = `(() => {
@@ -77,7 +78,7 @@ export function startGeminiTaskMode({
   clickWindowMs = 20000,
   log = () => {},
 } = {}) {
-  const state = { requested: "task", applied: false, clickedAt: null, pageUrl: null, error: null, clicks: 0 };
+  const state = { requested: "task", applied: false, clickedAt: null, pageUrl: null, error: null, clicks: 0, typedBeforeClick: null };
   const handled = new Set();
   const inFlight = new Set();
   const attempts = new Map();
@@ -164,14 +165,13 @@ export function startGeminiTaskMode({
         state.error ??= error.message;
         return false;
       }
-      if (parsed?.step === "typed") {
-        // Clicking now can clear what ask-bridge already typed. Refuse and say
-        // so instead of trading a wrong mode for an empty prompt.
-        state.error ??= `task switch not pressed: the composer already held ${parsed.typed} characters`;
-        return false;
-      }
       if (parsed?.step === "clicked") {
         state.clicks += 1;
+        // The switch is a page-state toggle, not a composer reset: measured in
+        // Chat/Task on this host, text already typed survives the click as long
+        // as nothing is submitted. Keep the count for the report, but do not
+        // treat it as a failure.
+        if (parsed.typed > 0) state.typedBeforeClick = parsed.typed;
       }
       if (parsed?.step === "clicked" || parsed?.step === "already") {
         // aria-pressed flips on the next Angular tick, so confirm before
