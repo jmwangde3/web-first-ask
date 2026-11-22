@@ -6,15 +6,11 @@ import { crc32, deflateRawSync } from "node:zlib";
 import { WfaError } from "./errors.js";
 import { scanSensitiveText } from "./bundle.js";
 import { sha256, uuid } from "./util.js";
+import { GIT_MAX_BUFFER, GIT_TIMEOUT_MS } from "./constants.js";
+import { matchesExclude, selectionReason } from "./repo-select.js";
 
 const exec = promisify(execFile);
 
-// Kept in sync with repository.js: the archive must ship exactly the files the
-// inline bundle would have shipped, so a task cannot see a different repository
-// depending on which transport it used.
-const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", ".cache", "vendor", "target", ".venv", "__pycache__"]);
-const SKIP_EXT = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|7z|rar|exe|dll|so|dylib|class|pyc|woff2?|ttf|otf|mp[34]|avi|mov|sqlite|db|bin|dat|lock)$/i;
-const SENSITIVE = /(?:^|\/)(?:\.env(?:\.|$)|\.npmrc|\.netrc|id_rsa|id_ed25519|credentials|secrets\.json|service-account\.json|[^/]*\.(?:pem|key|p12|pfx|keystore))/i;
 const MAX_ENTRIES = 60000;
 // The archive is an attachment, so the attachment ceiling is the real limit.
 // Failing here names the actual problem; the upload would otherwise reject the
@@ -26,7 +22,11 @@ const PRUNE_MIN_AGE_MS = 10 * 60 * 1000;
 
 async function git(cwd, ...args) {
   const { stdout } = await exec("git", args, {
-    cwd, windowsHide: true, timeout: 10000, encoding: "buffer", maxBuffer: 64 * 1024 * 1024,
+    cwd,
+    windowsHide: true,
+    timeout: GIT_TIMEOUT_MS,
+    encoding: "buffer",
+    maxBuffer: GIT_MAX_BUFFER,
   });
   return Buffer.from(stdout).toString("utf8").trimEnd();
 }
@@ -41,30 +41,17 @@ function scanEntry(name, data) {
   return scanSensitiveText(text, name);
 }
 
-function matchesExclude(file, patterns) {
-  return patterns.some((pattern) => {
-    const p = String(pattern).replace(/\\/g, "/").replace(/^!/, "");
-    if (!p) return false;
-    const escaped = p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "\u0000")
-      .replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]").replace(/\u0000/g, ".*");
-    return new RegExp(`^(?:${escaped})(?:$|/)`).test(file)
-      || (!p.includes("/") && new RegExp(`(?:^|/)${escaped}$`).test(file));
-  });
-}
-
 export async function collectTrackedSources({ cwd = process.cwd(), excludes = [] } = {}) {
   const root = await git(cwd, "rev-parse", "--show-toplevel").catch(() => null);
   if (!root) throw new WfaError("BUNDLE_REPO_NOT_GIT", "--bundle-repo requires a Git working tree. Use --file <path> instead.");
   const tracked = (await git(root, "ls-files", "-z", "--cached", "--exclude-standard")).split("\0").filter(Boolean);
   const skipped = [];
   const selected = [];
+
   for (const relative of tracked) {
     const label = relative.replace(/\\/g, "/");
-    let reason = null;
-    if (label.split("/").some((part) => SKIP_DIRS.has(part))) reason = "build/cache directory";
-    else if (SKIP_EXT.test(label)) reason = "binary or generated filename";
-    else if (SENSITIVE.test(label)) reason = "sensitive filename";
-    else if (matchesExclude(label, excludes)) reason = "matched --exclude";
+    const reason = selectionReason(label)
+      ?? (matchesExclude(label, excludes) ? "matched --exclude" : null);
     if (reason) skipped.push({ path: label, reason });
     else selected.push(relative);
   }

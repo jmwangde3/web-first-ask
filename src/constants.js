@@ -1,5 +1,20 @@
 export const PROVIDERS = Object.freeze(["chatgpt", "gemini", "claude"]);
 
+export const PROMPT_SIZE_WARN_BYTES = 40 * 1024;
+
+// The upstream ask-bridge truncation risk described by WFA.
+// Changing this constant does not change the external ask-bridge program.
+export const ASK_BRIDGE_PROMPT_TRUNCATION_BYTES = 44 * 1024;
+
+// The browser log can remain active during long generations. Two minutes
+// without browser activity is the existing quiet-window threshold.
+export const BROWSER_QUIET_WINDOW_SECONDS = 120;
+
+// Shared budgets for Git subprocesses used by repository discovery,
+// tracked-file selection and repository archive preparation.
+export const GIT_TIMEOUT_MS = 10000;
+export const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+
 // ask-bridge writes nothing at all while a page generates — no progress line and
 // no metadata update — so the watchdog only sees silence. Five minutes sits
 // inside the normal range for a few hundred lines of code, which made wfa kill

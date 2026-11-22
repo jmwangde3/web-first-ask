@@ -19,7 +19,11 @@ import { refreshTask, guardedBatch } from "./runner-stall.js";
 import { executePreparedTask } from "./runner-retry.js";
 import { bundleRepository, repositoryBlock, resolveRepository } from "./repository.js";
 import { archiveRepository, repositoryArchiveBlock } from "./repository-archive.js";
-import { DEFAULT_STALL_TIMEOUT_SECONDS } from "./constants.js";
+import {
+  ASK_BRIDGE_PROMPT_TRUNCATION_BYTES,
+  DEFAULT_STALL_TIMEOUT_SECONDS,
+  PROMPT_SIZE_WARN_BYTES,
+} from "./constants.js";
 
 async function validateFiles(paths, label) {
   const result = [];
@@ -312,7 +316,6 @@ async function prepareRequest(input, dependencies = {}) {
   const sensitiveFindings = sensitiveScan.findings;
   const unscannedAttachments = sensitiveScan.unscannedAttachments;
 
-  const PROMPT_SIZE_WARN_BYTES = 40 * 1024;
   const attachmentStats = await Promise.all(files.map(async (filePath) => ({
     filePath: path.relative(workspaceRoot, filePath) || filePath, bytes: (await stat(filePath)).size,
   })));
@@ -330,7 +333,7 @@ async function prepareRequest(input, dependencies = {}) {
     splitPlan: splitAttachmentFiles(attachmentStats.filter((item) => !isArchiveAttachment(item.filePath)), PROMPT_SIZE_WARN_BYTES),
     splitPlanNote: "Reference grouping only. Attachments upload natively and are not cut at 40 KiB; these groups describe what a forced inline fallback would look like. Prompt text is never split automatically.",
     message: promptRiskProviders.length
-      ? `Prompt text exceeds ${PROMPT_SIZE_WARN_BYTES / 1024} KiB for: ${promptRiskProviders.join(", ")}. ask-bridge can truncate long prompt text around 44 KiB, so the provider may answer from a partial prompt. Attachments are unaffected because they travel outside the prompt.`
+      ? `Prompt text exceeds ${PROMPT_SIZE_WARN_BYTES / 1024} KiB for: ${promptRiskProviders.join(", ")}. ask-bridge can truncate long prompt text around ${ASK_BRIDGE_PROMPT_TRUNCATION_BYTES / 1024} KiB, so the provider may answer from a partial prompt. Attachments are unaffected because they travel outside the prompt.`
       : null,
   };
   if (input.dryRun) {

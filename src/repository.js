@@ -4,13 +4,81 @@ import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { WfaError } from "./errors.js";
 import { collectTrackedSources } from "./repository-archive.js";
+import { GIT_MAX_BUFFER, GIT_TIMEOUT_MS } from "./constants.js";
 
 const exec = promisify(execFile);
-const CORE_FILES = ["package.json", "src/cli.js", "src/runner-orchestration.js", "src/runner-stall.js", "src/runner-retry.js", "src/repository.js", "src/ask-bridge.js", "src/jobs.js", "README.md"];
 
 async function git(cwd, ...args) {
-  const { stdout } = await exec("git", args, { cwd, windowsHide: true, timeout: 5000, maxBuffer: 12 * 1024 * 1024 });
+  const { stdout } = await exec("git", args, {
+    cwd, windowsHide: true,
+    timeout: GIT_TIMEOUT_MS,
+    maxBuffer: GIT_MAX_BUFFER,
+  });
   return stdout.trimEnd();
+}
+
+// Select entry points from repository metadata and tracked eligible paths,
+// rather than using the source paths of web-first-ask itself.
+export async function selectCoreEntries(root, eligible) {
+  const available = new Set(eligible);
+  const selected = [];
+  const seen = new Set();
+
+  const add = (candidate) => {
+    if (typeof candidate !== "string" || !candidate) return;
+    const raw = candidate.replace(/\\/g, "/");
+    if (raw.startsWith("/") || /^[A-Za-z]:\//.test(raw)) return;
+    const normalized = path.posix.normalize(raw.replace(/^\.\//, ""));
+    if (!normalized || normalized === "." || normalized === ".."
+      || normalized.startsWith("../")) return;
+    if (!available.has(normalized) || seen.has(normalized)) return;
+    if (selected.length >= 8) return;
+    seen.add(normalized);
+    selected.push(normalized);
+  };
+
+  add("package.json");
+  add("README.md");
+
+  if (available.has("package.json")) {
+    let manifest = null;
+    try {
+      manifest = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+    } catch {
+      // Invalid or unreadable package metadata must not break the inventory.
+    }
+
+    if (manifest && typeof manifest === "object" && !Array.isArray(manifest)) {
+      add(manifest.main);
+
+      if (typeof manifest.bin === "string") {
+        add(manifest.bin);
+      } else if (manifest.bin && typeof manifest.bin === "object") {
+        for (const candidate of Object.values(manifest.bin)) add(candidate);
+      }
+
+      const visitExports = (entry) => {
+        if (selected.length >= 8) return;
+        if (typeof entry === "string") {
+          add(entry);
+        } else if (Array.isArray(entry)) {
+          for (const value of entry) visitExports(value);
+        } else if (entry && typeof entry === "object") {
+          for (const value of Object.values(entry)) visitExports(value);
+        }
+      };
+      visitExports(manifest.exports);
+    }
+  }
+
+  for (const candidate of [
+    "src/index.js", "index.js", "main.py",
+    "Cargo.toml", "go.mod", "pyproject.toml",
+  ]) {
+    add(candidate);
+  }
+
+  return selected;
 }
 
 export function normalizeRepoUrl(remote) {
@@ -150,7 +218,7 @@ export async function bundleRepository({ cwd = process.cwd(), excludes = [], inc
   // unrelated repository files under an arbitrary byte budget.
   const priority = includes.length ? eligible.filter(matchesInclude) : mentioned;
   const tree = eligible.map((item) => `- ${item}`).join("\n");
-  const core = CORE_FILES.filter((item) => eligible.includes(item));
+  const core = await selectCoreEntries(root, eligible);
   const intro = `REPOSITORY SOURCE BUNDLE\nDIRECTORY TREE (tracked, eligible files):\n${tree}\n\nCORE ENTRY POINTS:\n${core.map((item) => `- ${item}`).join("\n") || "(none detected)"}\n\nThe sources included below are authoritative for this request. The tree is only an inventory; do not claim to have read unlisted source contents. Ask for exact additional paths if needed.\n`;
   let content = intro;
   let usedBytes = Buffer.byteLength(intro, "utf8");

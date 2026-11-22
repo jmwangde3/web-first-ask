@@ -19,7 +19,3 @@ export function getPaths(home = getHomeDir()) {
     runs: path.join(home, "runs"),
   };
 }
-
-export function getDefaultConfigPath() {
-  return path.join(getHomeDir(), "config.json");
-}

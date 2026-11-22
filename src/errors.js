@@ -4,9 +4,6 @@ export class WfaError extends Error {
     this.name = "WfaError";
     this.code = code;
     this.details = options.details ?? null;
+    this.hint = options.hint ?? null;
   }
-}
-
-export function assert(condition, code, message) {
-  if (!condition) throw new WfaError(code, message);
 }

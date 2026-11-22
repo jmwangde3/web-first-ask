@@ -61,6 +61,41 @@ declared safe to resend.
   does not diagnose first and does not type the fix itself. The only exception
   is an explicit user instruction that the request must not use agents.
 
+### Optimization review of 2026-11-22
+
+Three request batches from the external review were each answered by the
+gemini/chatgpt pair and integrated here; the local agent only applied, tested
+and committed the returned files.
+
+- Gemini Task failures now name a reason: the click window records its last
+  failure, an exhausted page replays it, and `stop()` falls back to the page URL
+  it actually visited, so `NOT applied` is no longer bare.
+- `--limit` rejects non-integers and non-positive values instead of returning an
+  empty list; `status`/`list` print `killedStalledPids` when a read command
+  terminated a stalled child.
+- `stall-watch` re-parses `metadata.json` only when its mtime changes; job
+  metadata is read once per pass; Chrome profile discovery is cached and the
+  cache is invalidated on login.
+- Attachment hashes are computed once per pass, repository bundling appends
+  bytes instead of re-encoding, and archive deflate drops to level 6 while still
+  storing incompressible entries.
+- Gemini polls `/json/list` every 500 ms and rechecks the model switch every
+  150 ms, both bounded by the remaining click window.
+- Captured stdout/stderr keep the newest bytes instead of the oldest.
+- Attachment globs compile once per request and share one `stat`; the sensitive
+  scan walks the shared prompt once and each provider delta separately, keeping
+  per-provider sources and line numbers.
+- Inline bundles, ZIP archives and attachments take their skip/sensitive/extension
+  lists from one module (`repo-select.js`), so the three copies can no longer
+  drift. Core entry points come from the repository's own `package.json`
+  (`bin`, `main`, `exports`, `scripts`) instead of a hard-coded list of wfa files.
+- Git helpers share `GIT_TIMEOUT_MS`/`GIT_MAX_BUFFER`; native `Error`s keep their
+  message through the CLI exit path (`errors.js`, `util.js`), and the unused
+  `assert`/`getDefaultConfigPath` helpers are gone.
+- `README.md` states the real 900 s default and the actual
+  `failed_before_start` condition; `skills/web-first/SKILL.md` carries a version
+  stamp.
+
 ## 0.2.9 - 2026-11-22
 
 Two earlier conclusions in `docs/known-issues.md` were wrong, and one of them was

@@ -1,5 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { BROWSER_QUIET_WINDOW_SECONDS } from "./constants.js";
 
 // Milliseconds since ask-bridge last wrote to its browser log, or null when the
 // file is unavailable. Used as a veto: silence in wfa's own output during a long
@@ -16,7 +17,7 @@ export async function browserIdleMs(logPath, now = Date.now()) {
 // The window is fixed rather than tied to --stall-timeout: while a page
 // generates, ask-bridge writes this log every ~200 ms, so two quiet minutes is
 // already a strong signal, and a long --stall-timeout must not widen it.
-export const BROWSER_QUIET_WINDOW_SECONDS = 120;
+export { BROWSER_QUIET_WINDOW_SECONDS };
 
 export function browserStillWorking(idleMs, windowSeconds = BROWSER_QUIET_WINDOW_SECONDS) {
   return idleMs !== null && idleMs < windowSeconds * 1000;

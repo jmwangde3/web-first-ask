@@ -1,26 +1,18 @@
 import { lstat, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { WfaError } from "./errors.js";
+import { DIRECTORY_FILE_EXTENSIONS, TEXT_SOURCE_EXTENSIONS } from "./repo-select.js";
 
 const IMAGE_EXTENSIONS = new Set([
   ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".avif",
 ]);
-const DIRECTORY_FILE_EXTENSIONS = new Set([
-  ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
-  ".py", ".pyi", ".ps1", ".psm1", ".psd1", ".cs", ".java", ".kt",
-  ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".rb",
-  ".php", ".swift", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".sql",
-  ".html", ".htm", ".css", ".scss", ".less", ".json", ".jsonc",
-  ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml",
-  ".md", ".mdx", ".txt", ".rst", ".adoc", ".csv", ".tsv",
-  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-  ".odt", ".ods", ".odp", ".rtf", ".ipynb",
-]);
+
 const DEFAULT_IGNORED_DIRS = new Set([
   ".git", ".wfa", "node_modules", ".next", ".nuxt", ".turbo",
   "coverage", "dist", "build", "out", "target", "tmp", ".venv", "venv",
   ".cache", ".pytest_cache", ".mypy_cache", "__pycache__",
 ]);
+
 const SENSITIVE_BASENAMES = new Set([
   ".env", ".env.local", ".env.production", "id_rsa", "id_ed25519",
   "credentials", "secrets.json", "service-account.json",
@@ -202,7 +194,6 @@ export async function expandAttachmentInputs({
     const key = process.platform === "win32" ? absolute.toLowerCase() : absolute;
     if (seen.has(key)) continue;
     seen.add(key);
-    if (item.imageOnly && !IMAGE_EXTENSIONS.has(path.extname(absolute).toLowerCase())) continue;
     classifyFile(absolute, target);
   }
 
@@ -235,16 +226,8 @@ export function isSensitiveAttachmentPath(filePath) {
   return isSensitiveName(filePath);
 }
 
-export function isTextSourceAttachment(filePath) {  const ext = path.extname(filePath).toLowerCase();
-  return new Set([
-    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
-    ".py", ".pyi", ".ps1", ".psm1", ".psd1", ".cs", ".java", ".kt",
-    ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".rb",
-    ".php", ".swift", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".sql",
-    ".html", ".htm", ".css", ".scss", ".less", ".json", ".jsonc",
-    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml",
-    ".md", ".mdx", ".txt", ".rst", ".adoc", ".csv", ".tsv",
-  ]).has(ext);
+export function isTextSourceAttachment(filePath) {
+  return TEXT_SOURCE_EXTENSIONS.has(path.extname(filePath).toLowerCase());
 }
 
 const ARCHIVE_EXTENSIONS = new Set([".zip", ".tar", ".gz", ".tgz", ".7z"]);
