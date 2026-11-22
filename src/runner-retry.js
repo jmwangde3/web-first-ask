@@ -366,9 +366,16 @@ export async function runDetachedBatchWorker(taskId, workerToken, { home, store 
   const command = resolveAskBridge(settings);
   const run = (cmd, args, options) => guardedBatch(runProcess, cmd, args, options, store, task.stallTimeoutSeconds ?? DEFAULT_STALL_TIMEOUT_SECONDS);
   const heartbeat = startHeartbeat({ taskId, store });
+  // The worker's own stdout is the detached task's batch log. Forwarding
+  // provider lines keeps that log honest: otherwise it stays at zero bytes for
+  // the whole run and an empty log looks like "nothing was ever submitted".
+  const writeLine = (stream, line) => {
+    const target = stream === "stderr" ? process.stderr : process.stdout;
+    try { target.write(`${line}\n`); } catch {}
+  };
   try {
-    await withGeminiMode(task, store, () => {}, () => runSequential({
-      command, task, config: settings, input: {}, store, run, jobs, timeoutSeconds: task.timeoutSeconds,
+    await withGeminiMode(task, store, (line) => writeLine("stdout", line), () => runSequential({
+      command, task, config: settings, input: { onProgressLine: writeLine }, store, run, jobs, timeoutSeconds: task.timeoutSeconds,
     }));
     return 0;
   } finally {

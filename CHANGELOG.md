@@ -1,6 +1,39 @@
 # Changelog
 
-## 0.2.9 - Unreleased
+## 0.2.10 - Unreleased
+
+0.2.9 fixed `--detach` locking the workspace by treating two empty batch logs as
+"nothing was ever submitted". That judgement was backwards on the default path:
+`wfa ask` runs a serial worker, the worker captures ask-bridge with
+`inherit: false`, and `batch.stdout.log` stays at zero bytes for the whole run
+even after the prompt reached a page. A worker killed after submission was then
+declared safe to resend.
+
+### Fixed
+- `failed_before_start` now requires the absence of every submission artifact
+  (`metadata.json`, `threadUrl`, `resultPath`, `completionProof`), not just
+  empty logs. Any artifact leaves the job `interrupted_unknown`, which keeps the
+  workspace locked until `wfa resolve`.
+- A trusted `completed` result can correct an earlier `failed_before_start`, so
+  a response that lands after the worker died is still collected.
+- The detached serial worker forwards provider output and the `still waiting`
+  heartbeat to its own stdout, so detached batch logs are no longer always
+  empty and U17's heartbeat also works under `--detach`.
+
+### Changed
+- Gemini Task is not pressed when the composer already holds text. Clicking
+  then can rebuild the editor and drop the prompt; the run records
+  `task switch not pressed: the composer already held N characters` instead.
+- Gemini page matching accepts `/app/`, `/app/<id>`, `/u/<n>/app` and their
+  query forms. `handled` is recorded only after the switch reports pressed, a
+  failed page is retried up to three times, every CDP command has a 5 s timeout,
+  and a closed socket rejects all pending commands instead of hanging.
+- `defaultCompareProviders` matches `defaultProviders` (`gemini, chatgpt`).
+- Attachment-refusal detection also matches "cannot read/access/open the
+  uploaded file". Code results that admit the attachment was unreadable are
+  refused at stage/apply when the task had attachments.
+
+## 0.2.9 - 2026-11-22
 
 Two earlier conclusions in `docs/known-issues.md` were wrong, and one of them was
 wrong in a way that stayed invisible: ask-bridge decides whether an attachment

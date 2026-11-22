@@ -1,7 +1,7 @@
 # ask-bridge 上游问题清单
 
 > **范围**：只保留必须由 ask-bridge（Rust 二进制）修的问题。wfa 侧能提前拦截、标注或绕过的，已落实的规避方案见文末「wfa 侧已做」，不占本清单。
-> **环境**：Windows 11 24H2 zh-CN / Git Bash / ask-bridge 0.4.0（`7d4731f`）/ wfa 0.2.2→0.2.9 / Chrome stable / providers: ChatGPT + Gemini。
+> **环境**：Windows 11 24H2 zh-CN / Git Bash / ask-bridge 0.4.0（`7d4731f`）/ wfa 0.2.2→0.2.10 / Chrome stable / providers: ChatGPT + Gemini。
 > **证据**：2026-11-21 与 2026-11-22 两次单机实测，命令与耗时均为真实运行结果。U1、U7 已于 11-22 用对照实验与源码复核修正（见各条）。
 
 ## 汇总
@@ -26,7 +26,7 @@
 | U16 | 长生成被判 `stalled` 并杀进程：ask-bridge 生成期间不产进度行、不更新 metadata | 阻断 | 0.2.9：浏览器日志仍在写就不杀；默认阈值 300 → 900 s |
 | U17 | 批次运行期 CLI 全程静默，无法区分「在等 provider」与「进程已死」 | 严重 | 0.2.9：每 60 s 打一行 `[wfa] still waiting` |
 | U18 | 附件打不开时 provider 仍以 `completed` 收敛，产出为零 | 严重 | 0.2.9：识别「无法解压/读取附件」并警告 |
-| U19 | `--detach` worker 被调用方宿主清理，任务落 `needs_recovery` 并锁住工作区 | 严重 | 0.2.9：空 `batch.*.log` 判 `failed_before_start`（从未提交，可直接重跑）并说明宿主限制 |
+| U19 | `--detach` worker 被调用方宿主清理，任务落 `needs_recovery` 并锁住工作区 | 严重 | 0.2.10：空日志不再单独判「未提交」；有 threadUrl/metadata/结果即 `interrupted_unknown`，可信完成可覆盖 `failed_before_start` |
 
 ---
 
@@ -409,6 +409,13 @@ wfa status <task-id>
 
 **修复（0.2.9）**：ask-bridge 的启动横幅是直接写进 `batch.stdout.log` 的，所以**两个 batch 日志都是 0 字节**只能说明 batch 还没说第一句话，任何 provider 都没见到 prompt。`refreshTask` 对 `detached` 任务用这条判据：满足即记 `failed_before_start`（`task.state` 为 `failed`，不占工作区锁，可直接重跑），并在错误里点明宿主清理与两条出路；有任何一个字节的日志就维持 `interrupted_unknown` + `needs_recovery`（可能已提交，不自动重试）。前台任务不适用该判据——它的 stdout 由 runner 缓存在内存里、批次结束才落盘，0 字节不代表没提交。
 
+**复核（2026-11-22 14:10，0.2.9）**：0.2.9 的判据在默认路径上是反的。默认 `wfa ask`（双 provider、`--concurrency 1`）走 `serialWorker`，worker 用 `inherit: false` 收走 ask-bridge 的输出，只在单个 job 结束后才写 `batch.stdout.<provider>.log`；`batch.stdout.log` / `batch.stderr.log` 在整个运行期都是 0 字节。所以 worker 一旦在提交后被杀，0.2.9 会判 `failed_before_start` 并解锁工作区，用户重跑就造成重复提交。用真实 `refreshTask` + 构造状态复现：metadata 已带 `threadUrl`、两个日志 0 字节 → `failed_before_start`；随后补写 `completed` + `response.md`，状态仍卡在 `failed_before_start`（`refreshTask` 对该状态直接跳过）。
+
+**修复（0.2.10）**：
+- 空日志只是弱证据。只有同时不存在 `metadata.json`、`threadUrl`、`resultPath`、`completionProof` 时才判 `failed_before_start`；任一存在即 `interrupted_unknown`（不自动重试，需要 `resolve`）。
+- 可信 `completed` 结果可以覆盖 `failed_before_start`，迟到的产物不再被永久丢弃。
+- detach 串行 worker 把 provider 输出与 `still waiting` 心跳实时写到自己的 stdout，`batch.*.log` 不再恒为空；detach 场景也恢复 U17 的心跳。
+
 **给使用者的结论**：在会清理后台进程的宿主（IDE / agent 的执行器）里，`--detach` 保不住 worker。把 `wfa ask` 本身放进宿主的后台任务，或直接前台跑。
 
 
@@ -451,6 +458,23 @@ U11–U15 里只有 U14 的一半在 ask-bridge 侧，其余都在 wfa 或本机
 - 全套 `node --test tests` 通过（本地 Windows，含上述竞态用例）。
 
 以上第 2、4、5、6 条来自 ask-bridge 侧评审（ChatGPT 读本仓 zip 后给出），其中「rename 自动接管不安全」的 ABA 反例成立，最终实现改成 claim + 代次复验。
+
+---
+
+## 0.2.10 复核记录（2026-11-22 14:20）
+
+同一份源码（`gemini-mode.js`、`runner-stall.js`、`stall-watch.js`、`runner-retry.js`、`constants.js`、`metadata.js`、`recovery.js` + 本文档）发给 Gemini Task 与 ChatGPT 各评一次，两边独立结论在 U19 上一致：**0.2.9 把「没有输出」当成了「没有提交」，方向是反的**。
+
+| 项 | 复核判定 | 0.2.10 |
+| --- | --- | --- |
+| U16 长生成误杀 | 部分解决 | 900 s 与浏览器日志否决保留；日志不可读时不否决（退回旧行为），日志被其它任务共用时永远否决——两条都已写进注释，未改判定 |
+| U17 运行期静默 | 部分解决 | detach 串行 worker 现在有输出与心跳 |
+| U19 detach 误锁 | **未解决且方向相反** | 判据加提交证据 + 允许可信完成覆盖（见上） |
+| Gemini Task 开关 | 部分解决 | 输入非空时拒绝点击；URL 覆盖 `/app/<id>`、`/u/<n>/app`、`/app/`；`handled` 只在确认成功后记录，失败最多重试 3 次；CDP 命令 5 s 超时，断线时 reject 全部 pending |
+| 默认 gemini(Task)+chatgpt | 基本解决 | `defaultCompareProviders` 与服务商顺序对齐 |
+| 附件打不开仍 completed | 部分解决 | 拒绝特征补「读取/访问/打开 + 上传/文件/附件」；带附件的 code 任务在 stage/apply 时直接拒绝（`RESPONSE_ATTACHMENT_UNUSED`） |
+
+新增但不修的观测：`chrome-devtools-mcp.log` 是全局 profile 路径，无法按任务隔离，因此它只能证明「这台机器上还有浏览器在动」，不能证明「当前 job 还在生成」。真正的修复需要 ask-bridge 暴露按 job 的进度信号。
 
 ---
 

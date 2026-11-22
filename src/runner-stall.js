@@ -11,6 +11,10 @@ import { chromeLogPath } from "./ask-bridge.js";
 
 // Both logs missing means the path is wrong, not that the batch was silent, so
 // at least one file has to exist before an empty pair is treated as evidence.
+// Empty logs are also not proof of "never submitted" on their own: a detached
+// serial worker runs ask-bridge itself and writes provider output to per-job
+// logs only after each job ends, so the pair stays empty for the whole run.
+// Callers must combine this with submission evidence (see refreshTask).
 async function batchLogsEmpty(runDir) {
   if (!runDir) return false;
   const infos = await Promise.all(["batch.stdout.log", "batch.stderr.log"]
@@ -136,12 +140,24 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
       task.executionEndedAt = new Date().toISOString();
     }
 
+    let sawSubmission = false;
     for (const [providerKey, child] of Object.entries(task.children ?? {})) {
       const provider = child.provider ?? providerKey;
-      if (["abandoned", "failed_before_start"].includes(child.state)) continue;
-      if (child.state === "completed" && child.resultPath) continue;
+      if (child.state === "abandoned") continue;
+      if (child.state === "completed" && child.resultPath) {
+        sawSubmission = true;
+        continue;
+      }
 
       const metadata = await readBatchMetadata(task.outputDir, child.jobId, provider, { runDir: task.runDir });
+      // A terminal artifact, a conversation URL, or even a parsed metadata
+      // file means ask-bridge got as far as this job. That is enough to refuse
+      // the "never started" verdict below: a wrong "safe to resend" is worse
+      // than an extra resolve.
+      if (child.threadUrl || child.resultPath || child.completionProof
+        || metadata.threadUrl || metadata.responsePath || metadata.metadata) {
+        sawSubmission = true;
+      }
       const previousState = child.state;
       const previousThread = child.threadUrl;
       const previousResult = child.resultPath;
@@ -196,19 +212,19 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
     }
 
     if (!processAlive) {
-      // A detached batch writes ask-bridge's startup banner straight into
-      // batch.stdout.log. Empty logs mean the process died before ask-bridge
-      // said anything, so no job reached a provider and a retry is safe. This
-      // test is only valid for --detach: the foreground runner buffers stdout
-      // in memory and writes it after the batch ends, so an empty file there is
-      // not evidence of anything.
+      // Empty logs are weak evidence: a detached serial worker keeps them at
+      // zero bytes even after the prompt reached a page, because ask-bridge is
+      // captured by the worker instead of writing to the batch logs. Only a run
+      // with no submission evidence at all may be called "failed before start";
+      // anything else stays ambiguous so nobody is told a resend is safe.
       const neverStarted = task.detached === true
+        && !sawSubmission
         && await batchLogsEmpty(task.runDir);
       for (const child of Object.values(task.children ?? {})) {
         if (child.state === "queued" || child.state === "running") {
           child.state = neverStarted ? "failed_before_start" : "interrupted_unknown";
           child.error = neverStarted
-            ? "The detached worker was killed before ask-bridge printed anything, so nothing reached a provider. The host that launched wfa clears background processes when its own task ends; run wfa in the foreground, or keep wfa itself in the background instead of using --detach."
+            ? "The detached worker was killed before ask-bridge left any trace: the batch logs are empty and no metadata, thread URL, or result exists. Nothing reached a provider, so this job can be retried. The host that launched wfa clears background processes when its own task ends; run wfa in the foreground, or keep wfa itself in the background instead of using --detach."
             : "ask-bridge process is no longer running and no trusted terminal artifact was found. The prompt may already have been submitted; do not resend.";
           if (neverStarted) {
             // Not a provider failure: there is no provider verdict to classify,

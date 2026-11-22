@@ -31,6 +31,8 @@ test("config defaults to both providers, serial execution and a single login pro
   await withHome("wfa-defaults-", async (home) => {
     const config = await loadConfig(home);
     assert.deepEqual(config.defaultProviders, ["gemini", "chatgpt"]);
+    // compare must not silently prefer a different first provider than ask.
+    assert.deepEqual(config.defaultCompareProviders, ["gemini", "chatgpt"]);
     assert.equal(config.defaultConcurrency, 1);
     assert.equal(config.defaultProvider, "chatgpt");
     // Gemini runs in Task mode by default, so the pair is "gemini task + chatgpt".

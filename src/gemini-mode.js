@@ -8,13 +8,30 @@
 // Timing is the whole problem: ask-bridge types into the composer right after
 // the editor is ready. Measured on Windows, the toggle is clickable about 1.4 s
 // after the page appears and the composer is still empty at that point, so the
-// click is placed before any text exists. If it ever lands after typing, the
-// worst case is a job that submits empty, which is why the caller is told what
-// was observed rather than being told it worked.
+// click is placed before any text exists. If text is already there the click is
+// refused: switching modes can rebuild the editor and drop the prompt, and a
+// job that submits nothing is worse than a job that stayed on Chat. The caller
+// is always told what was observed rather than being told it worked.
 
 const DEFAULT_PORT = 9223;
 const TASK_LABELS = ["Task", "任务"];
 const TASK_SEGMENT_VALUE = "40";
+const CDP_TIMEOUT_MS = 5000;
+const RETRY_DELAY_MS = 5000;
+const MAX_ATTEMPTS_PER_PAGE = 3;
+// /app, /app/, /app/<id>, and the same paths behind a Google account prefix
+// (/u/1/app). ask-bridge opens all of these depending on --followup.
+const GEMINI_APP_PATH = /^\/app(?:\/[^/?#]+)?\/?$/;
+
+export function isGeminiAppPage(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" || parsed.hostname !== "gemini.google.com") return false;
+    return GEMINI_APP_PATH.test(parsed.pathname.replace(/^\/u\/\d+/, ""));
+  } catch {
+    return false;
+  }
+}
 
 export const CLICK_TASK_SOURCE = `(() => {
   const labels = ${JSON.stringify(TASK_LABELS)};
@@ -27,8 +44,9 @@ export const CLICK_TASK_SOURCE = `(() => {
   if (button.getAttribute("aria-pressed") === "true") return JSON.stringify({ step: "already" });
   const editor = document.querySelector('[contenteditable=true]');
   const typed = editor ? editor.innerText.trim().length : 0;
+  if (typed > 0) return JSON.stringify({ step: "typed", typed });
   button.click();
-  return JSON.stringify({ step: "clicked", typed });
+  return JSON.stringify({ step: "clicked", typed: 0 });
 })()`;
 
 export const TASK_STATE_SOURCE = `(() => {
@@ -61,6 +79,9 @@ export function startGeminiTaskMode({
 } = {}) {
   const state = { requested: "task", applied: false, clickedAt: null, pageUrl: null, error: null, clicks: 0 };
   const handled = new Set();
+  const inFlight = new Set();
+  const attempts = new Map();
+  const retryAt = new Map();
   let stopped = false;
   let socket = null;
 
@@ -70,11 +91,24 @@ export function startGeminiTaskMode({
     const ws = new WebSocket(url);
     let next = 0;
     const pending = new Map();
+    // A closed socket must settle every in-flight command. Without this the
+    // caller's `await evaluate(...)` never returns and the loop stops polling
+    // while pretending to still run.
+    const failAll = (error) => {
+      for (const entry of pending.values()) {
+        clearTimeout(entry.timer);
+        entry.reject(error);
+      }
+      pending.clear();
+    };
     const ready = new Promise((resolve, reject) => {
       ws.addEventListener("open", () => resolve());
       ws.addEventListener("error", () => reject(new Error("websocket error")));
       ws.addEventListener("close", () => reject(new Error("websocket closed")));
     });
+    // `ready` is only awaited inside send(); keep an unobserved rejection from
+    // surfacing as an unhandled rejection when the browser never appears.
+    ready.catch(() => {});
     ws.addEventListener("message", (event) => {
       let message;
       try {
@@ -83,16 +117,30 @@ export function startGeminiTaskMode({
         return;
       }
       if (!message.id || !pending.has(message.id)) return;
-      const { resolve, reject } = pending.get(message.id);
+      const entry = pending.get(message.id);
       pending.delete(message.id);
-      message.error ? reject(new Error(message.error.message ?? "cdp error")) : resolve(message.result);
+      clearTimeout(entry.timer);
+      message.error ? entry.reject(new Error(message.error.message ?? "cdp error")) : entry.resolve(message.result);
     });
+    ws.addEventListener("close", () => failAll(new Error("websocket closed")));
+    ws.addEventListener("error", () => failAll(new Error("websocket error")));
     const send = async (method, params = {}, sessionId) => {
       await ready;
+      if (ws.readyState !== 1) throw new Error("websocket is not open");
       const id = ++next;
       return new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject });
-        ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+        const timer = setTimeout(() => {
+          if (pending.delete(id)) reject(new Error(`cdp timeout: ${method}`));
+        }, CDP_TIMEOUT_MS);
+        timer.unref?.();
+        pending.set(id, { resolve, reject, timer });
+        try {
+          ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+        } catch (error) {
+          clearTimeout(timer);
+          pending.delete(id);
+          reject(error);
+        }
       });
     };
     return { send, close: () => { try { ws.close(); } catch {} } };
@@ -103,6 +151,8 @@ export function startGeminiTaskMode({
     return result?.result?.value;
   };
 
+  // Returns true only when the switch is confirmed pressed. A page that is not
+  // ready yet (or whose composer already holds text) must stay retryable.
   const pressOnPage = async (client, sessionId, url) => {
     const deadline = Date.now() + clickWindowMs;
     while (!stopped && Date.now() < deadline) {
@@ -112,15 +162,16 @@ export function startGeminiTaskMode({
       } catch (error) {
         // Target went away (tab closed, navigation committed elsewhere).
         state.error ??= error.message;
-        return;
+        return false;
+      }
+      if (parsed?.step === "typed") {
+        // Clicking now can clear what ask-bridge already typed. Refuse and say
+        // so instead of trading a wrong mode for an empty prompt.
+        state.error ??= `task switch not pressed: the composer already held ${parsed.typed} characters`;
+        return false;
       }
       if (parsed?.step === "clicked") {
         state.clicks += 1;
-        if (parsed.typed > 0) {
-          // The composer already held ask-bridge's prompt: the click may have
-          // cleared it. Record it instead of pretending the job is healthy.
-          state.error ??= `task switch clicked after ${parsed.typed} characters were already typed`;
-        }
       }
       if (parsed?.step === "clicked" || parsed?.step === "already") {
         // aria-pressed flips on the next Angular tick, so confirm before
@@ -133,17 +184,18 @@ export function startGeminiTaskMode({
               state.clickedAt ??= new Date().toISOString();
               state.pageUrl = url;
               log(`[wfa] gemini task mode on (${parsed.step})`);
-              return;
+              return true;
             }
           } catch {
-            return;
+            return false;
           }
         }
         state.error ??= "task switch did not report pressed";
-        return;
+        return false;
       }
       await sleep(80);
     }
+    return false;
   };
 
   const browserUrl = async () => {
@@ -173,18 +225,29 @@ export function startGeminiTaskMode({
       let pages = [];
       try {
         pages = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json())
-          .filter((target) => target.type === "page" && /^https:\/\/gemini\.google\.com\/app(\?|$)/.test(target.url));
+          .filter((target) => target.type === "page" && isGeminiAppPage(target.url));
       } catch (error) {
         state.error ??= error.message;
       }
       for (const target of pages) {
-        if (stopped || handled.has(target.id)) continue;
-        handled.add(target.id);
+        if (stopped || handled.has(target.id) || inFlight.has(target.id)) continue;
+        if ((attempts.get(target.id) ?? 0) >= MAX_ATTEMPTS_PER_PAGE) continue;
+        if ((retryAt.get(target.id) ?? 0) > Date.now()) continue;
+        inFlight.add(target.id);
+        attempts.set(target.id, (attempts.get(target.id) ?? 0) + 1);
         try {
           const { sessionId } = await socket.send("Target.attachToTarget", { targetId: target.id, flatten: true });
-          await pressOnPage(socket, sessionId, target.url);
+          if (await pressOnPage(socket, sessionId, target.url)) {
+            handled.add(target.id);
+            retryAt.delete(target.id);
+          } else {
+            retryAt.set(target.id, Date.now() + RETRY_DELAY_MS);
+          }
         } catch (error) {
           state.error ??= error.message;
+          retryAt.set(target.id, Date.now() + RETRY_DELAY_MS);
+        } finally {
+          inFlight.delete(target.id);
         }
       }
       await sleep(100);

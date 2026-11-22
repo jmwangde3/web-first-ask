@@ -34,7 +34,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   defaultConcurrency: 1,
   defaultTimeoutSeconds: 1200,
   maxTimeoutSeconds: 7200,
-  defaultCompareProviders: ["chatgpt", "gemini"],
+  // Same pair and same order as defaultProviders: compare must not silently
+  // prefer a different first provider than ask/code.
+  defaultCompareProviders: ["gemini", "chatgpt"],
   maxConcurrency: 3,
   // Task is the default here: the clicker records what actually happened in
   // geminiModeReport, so a run that stayed on Chat is visible in `wfa status`

@@ -412,6 +412,7 @@ export async function executeTask(input, dependencies = {}) {
       taskId, requestId, payloadHash, intentHash, kind: input.kind ?? "ask", mode,
       workspace, workspaceRoot, providers, fresh: Boolean(input.fresh),
       state: "preparing", createdAt: now, updatedAt: now, heartbeatAt: input.detach ? null : now,
+      attachmentCount: files.length + images.length,
       parentPid: input.detach ? null : process.pid,
       childPid: null, detached: Boolean(input.detach),
       lineage: followup ? [...(tasks.tasks[followup.taskId]?.lineage ?? []), followup.taskId] : [],

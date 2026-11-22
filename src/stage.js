@@ -121,9 +121,16 @@ export function parseFileBlocks(markdown = "") {
   return blocks;
 }
 
-function assertCleanProviderOutput(markdown, child) {
+function assertCleanProviderOutput(markdown, child, task) {
   if (child.responseHeuristics?.latexEscaping || inspectResponseHeuristics(markdown).latexEscaping) {
     throw new WfaError("RESPONSE_LATEX_CORRUPTED", "Provider result contains LaTeX-escaped code (\\vert{}, \\lbrace, \\rbrace, or \\textbackslash). Refusing to stage/apply; request a clean complete response.");
+  }
+  // The answer says the attached files could not be read. For a code task that
+  // was given attachments, the whole result is suspect: staging it would write
+  // code written without the files it was asked to work from.
+  const heuristics = child.responseHeuristics ?? inspectResponseHeuristics(markdown);
+  if (heuristics.attachmentUnreadable && (task?.attachmentCount ?? 0) > 0) {
+    throw new WfaError("RESPONSE_ATTACHMENT_UNUSED", "Provider says the attached files could not be read, so this result was produced without them. Refusing to stage/apply; send the content as text or ask again with a readable attachment.");
   }
 }
 
@@ -160,7 +167,7 @@ async function loadCompletedCodeTask(taskId, provider, { home, store }) {
       throw new WfaError("RESULT_INTEGRITY_FAILED", proof.error ?? "The ask-bridge terminal result changed after verification.");
     }
   }
-  assertCleanProviderOutput(await readFile(resultPath, "utf8"), child);
+  assertCleanProviderOutput(await readFile(resultPath, "utf8"), child, task);
   return { task, child, selected, runDir, resultPath, workspaceRoot, responseHash };
 }
 
