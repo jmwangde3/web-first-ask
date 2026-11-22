@@ -190,7 +190,7 @@ export async function recoverBrowser(options = {}) {
   const {
     home = getHomeDir(), hasUncollectedWork, mode = "headless", chromePath, probes = {},
   } = options;
-  if (typeof home !== "string" || !home || !["headless", "headful"].includes(mode) ||
+  if (typeof home !== "string" || !home || !["headless", "headful", "background", "visible"].includes(mode) ||
       (chromePath != null && typeof chromePath !== "string") ||
       !probes || typeof probes !== "object" || Array.isArray(probes)) {
     throw invalidArgument("Invalid browser recovery arguments");

@@ -56,7 +56,7 @@ export async function cdpProbe(port, { timeoutMs = 1500, attempts = 3 } = {}) {
 
 export async function launchChrome({ profileDir, mode = "headless", chromePath, timeoutMs = 20000 } = {}) {
   if (!profileDir) throw new Error("PROFILE_DIR_REQUIRED");
-  if (!["headless", "headful"].includes(mode)) throw new Error("INVALID_BROWSER_MODE");
+  if (!["headless", "headful", "background", "visible"].includes(mode)) throw new Error("INVALID_BROWSER_MODE");
   const executable = await resolveChromeExecutable(chromePath);
   const userDataDir = path.resolve(profileDir);
   await mkdir(userDataDir, { recursive: true });
@@ -69,8 +69,13 @@ export async function launchChrome({ profileDir, mode = "headless", chromePath, 
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-background-networking",
+    // Cloudflare fingerprints the automation switch itself: both headless and a
+    // plain headful launch land on the interstitial. Keep it in every mode.
+    "--disable-blink-features=AutomationControlled",
   ];
   if (mode === "headless") args.push("--headless=new");
+  if (mode === "background" || mode === "headful") args.push("--window-size=1440,1200", "--window-position=-2000,-2000");
+  if (mode === "visible") args.push("--window-size=1440,1200", "--window-position=100,100");
 
   let child;
   let pid = null;

@@ -17,6 +17,7 @@ import { updateAskBridge } from "./maintenance.js";
 import { truncate } from "./util.js";
 import { expandAttachmentInputs } from "./attachments.js";
 import { readTaskResult, stageTaskFiles, applyStagedFiles } from "./stage.js";
+import { runCdpCommand } from "./engines/cdp-cli.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const VALUE_FLAGS = new Set([
@@ -331,13 +332,17 @@ async function doctor(config) {
   printChromeStatus(chrome);
 }
 
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), deps = {}) {
   const [command, ...rest] = argv;
   if (!command || command === "--help" || command === "help") { help(); return; }
   if (command === "--version" || command === "-V" || command === "version") {
     const pkg = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
     process.stdout.write(`wfa ${pkg.version}\n`);
     return;
+  }
+  if (command === "cdp") {
+    const res = await runCdpCommand(rest, deps);
+    return res?.code ?? 0;
   }
   const { positional, options } = parseArgs(rest);
   if (options.help) { help(); return; }
