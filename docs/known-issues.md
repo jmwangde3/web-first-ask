@@ -380,7 +380,7 @@ wfa: EPERM: operation not permitted, mkdir 'C:\Users\<user>\AppData\Local\web-fi
 
 **已修**：`inspectResponseHeuristics` 增加附件拒绝特征（中英），命中时在 `wfa code` 与 `wfa status` 都打警告，说明附件很可能没被使用、该改发文本或给可达 URL。仍是 `completed` —— 任务确实完成，只是产出没用上附件，所以用警告而不是假造一个新的失败态。
 
-## U19 `--detach` 启动的 worker 立即消失，任务落 `needs_recovery`（2026-11-22 10:05 复现，0.2.9 已修判定）
+## U19 `--detach` 启动的 worker 立即消失，任务落 `needs_recovery`（2026-11-22 10:05 复现，0.2.10 已修判定）
 
 **现象**：`wfa ask --detach` 正常打印 `Started task <id>; detached worker`，`wfa status` 立刻是 `running`，两个 provider `queued`。约 1 分钟后变成 `needs_recovery`，两个 provider 都是 `interrupted_unknown`：
 
