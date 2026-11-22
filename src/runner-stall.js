@@ -74,10 +74,14 @@ async function detachedStallEvidence(task) {
   // nothing while ask-bridge's browser log is still being written.
   const idleMs = await browserIdleMs(chromeLogPath());
   if (browserStillWorking(idleMs)) return null;
+  let killedPid = null;
   if (task.childPid !== process.pid) {
-    try { process.kill(task.childPid, "SIGTERM"); } catch {}
+    try {
+      process.kill(task.childPid, "SIGTERM");
+      killedPid = task.childPid;
+    } catch {}
   }
-  return evidence;
+  return { stalls: evidence, killedPid };
 }
 
 // Both the synchronous CLI and the detached worker use this guard. Progress is
@@ -189,7 +193,14 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
       task.executionEndedAt = new Date().toISOString();
     }
 
-    const detachedStall = await detachedStallEvidence(task);
+    const detectedStall = await detachedStallEvidence(task);
+    const detachedStall = detectedStall?.stalls;
+    if (detectedStall?.killedPid) {
+      task.killedStalledPids ??= [];
+      if (!task.killedStalledPids.includes(detectedStall.killedPid)) {
+        task.killedStalledPids.push(detectedStall.killedPid);
+      }
+    }
     // Submission evidence is per job. A serial detached run starts one provider
     // after another; treating "some provider was submitted" as "every queued
     // provider may have been submitted" locked a provider that never ran.

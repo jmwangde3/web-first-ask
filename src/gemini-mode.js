@@ -76,6 +76,7 @@ export function startGeminiTaskMode({
   port = DEFAULT_PORT,
   waitForBrowserMs = 20000,
   clickWindowMs = 20000,
+  retryDelayMs = RETRY_DELAY_MS,
   log = () => {},
 } = {}) {
   const state = { requested: "task", applied: false, clickedAt: null, pageUrl: null, error: null, clicks: 0, typedBeforeClick: null };
@@ -85,6 +86,8 @@ export function startGeminiTaskMode({
   const retryAt = new Map();
   let stopped = false;
   let socket = null;
+  let lastPageUrl = null;
+  let lastFailure = null;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -195,6 +198,9 @@ export function startGeminiTaskMode({
       }
       await sleep(80);
     }
+    if (!stopped) {
+      lastFailure = `Task switch not found or not clickable within ${clickWindowMs} ms on ${url}`;
+    }
     return false;
   };
 
@@ -231,7 +237,11 @@ export function startGeminiTaskMode({
       }
       for (const target of pages) {
         if (stopped || handled.has(target.id) || inFlight.has(target.id)) continue;
-        if ((attempts.get(target.id) ?? 0) >= MAX_ATTEMPTS_PER_PAGE) continue;
+        lastPageUrl = target.url;
+        if ((attempts.get(target.id) ?? 0) >= MAX_ATTEMPTS_PER_PAGE) {
+          state.error ??= `Task switch not confirmed after ${MAX_ATTEMPTS_PER_PAGE} attempts on ${target.url}${lastFailure ? `; last failure: ${lastFailure}` : ""}`;
+          continue;
+        }
         if ((retryAt.get(target.id) ?? 0) > Date.now()) continue;
         inFlight.add(target.id);
         attempts.set(target.id, (attempts.get(target.id) ?? 0) + 1);
@@ -241,11 +251,11 @@ export function startGeminiTaskMode({
             handled.add(target.id);
             retryAt.delete(target.id);
           } else {
-            retryAt.set(target.id, Date.now() + RETRY_DELAY_MS);
+            retryAt.set(target.id, Date.now() + retryDelayMs);
           }
         } catch (error) {
           state.error ??= error.message;
-          retryAt.set(target.id, Date.now() + RETRY_DELAY_MS);
+          retryAt.set(target.id, Date.now() + retryDelayMs);
         } finally {
           inFlight.delete(target.id);
         }
@@ -255,7 +265,7 @@ export function startGeminiTaskMode({
   };
 
   const done = run().catch((error) => {
-    state.error = error.message;
+    state.error ??= error.message;
   });
 
   return {
@@ -264,6 +274,10 @@ export function startGeminiTaskMode({
       stopped = true;
       await Promise.race([done, sleep(2000)]);
       socket?.close();
+      if (!state.applied) {
+        state.error ??= lastFailure
+          ?? `Task mode not confirmed when task ended; last Gemini page: ${lastPageUrl ?? "none seen"}`;
+      }
       return { ...state };
     },
   };

@@ -133,11 +133,15 @@ function printTask(task, json = false, replayed = false) {
     geminiMode: task.geminiMode ?? null, geminiModeReport: task.geminiModeReport ?? null,
     sessionPolicy: task.sessionPolicy ?? (task.fresh ? "fresh" : "continue"),
     executionPending: Boolean(task.executionPending), replayed,
-    retryWarnings: task.retryWarnings ?? [], providers: children };
+    retryWarnings: task.retryWarnings ?? [], killedStalledPids: task.killedStalledPids ?? [],
+    providers: children };
   if (json) { process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`); return; }
   process.stdout.write(`Task: ${task.taskId}${replayed ? " (existing request; not resent)" : ""}\n`);
   process.stdout.write(`Workspace: ${task.workspace}\nState: ${task.state}\nSession: ${summary.sessionPolicy}\n`);
   if (task.executionPending) process.stdout.write("Execution cleanup: pending; completed results are readable but the workspace/provider lock remains active.\n");
+  if (summary.killedStalledPids.length) {
+    process.stdout.write(`Stall termination: SIGTERM sent to detached PID(s) ${summary.killedStalledPids.join(", ")} during refresh (process exit not confirmed).\n`);
+  }
   if (task.geminiModeReport) {
     const report = task.geminiModeReport;
     // The switch is page state: pressing it after text was typed does not
@@ -426,8 +430,11 @@ export async function main(argv = process.argv.slice(2)) {
     return result.removed || result.reason === "no lock file" ? 0 : 1;
   }
   if (command === "list") {
-    const tasks = await listTasks({ home, store });
     const limit = Number(options.limit ?? 20);
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new WfaError("ARGUMENT_ERROR", `Invalid --limit "${options.limit}". Expected a positive integer. Hint: use --limit 20.`);
+    }
+    const tasks = await listTasks({ home, store });
     const selected = tasks.slice(0, limit);
     // --no-refresh was parsed but never honoured, so a read-only listing still
     // ran up to `limit` write transactions -- each of them contending for the
@@ -446,9 +453,13 @@ export async function main(argv = process.argv.slice(2)) {
       taskId: task.taskId, workspace: task.workspace, kind: task.kind, state: task.state,
       providers: Object.fromEntries(Object.entries(task.children).map(([key, value]) => [key, value.state])),
       createdAt: task.createdAt,
+      killedStalledPids: task.killedStalledPids ?? [],
     }));
     process.stdout.write(`${options.json ? JSON.stringify(result, null, 2)
-      : result.map((item) => `${item.taskId}  ${item.state.padEnd(16)} ${item.workspace}  ${Object.entries(item.providers).map(([p, s]) => `${p}:${s}`).join(" ")}`).join("\n")}\n`);
+      : result.flatMap((item) => [
+        `${item.taskId}  ${item.state.padEnd(16)} ${item.workspace}  ${Object.entries(item.providers).map(([p, s]) => `${p}:${s}`).join(" ")}`,
+        ...(item.killedStalledPids.length ? [`  Stall termination: SIGTERM sent to detached PID(s) ${item.killedStalledPids.join(", ")} during refresh (process exit not confirmed).`] : []),
+      ]).join("\n")}\n`);
     return;
   }
   if (command === "wait" || command === "attach") {
