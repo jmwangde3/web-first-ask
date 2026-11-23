@@ -12,6 +12,7 @@ export const stopSelector = [
   'conversation-container button[aria-label*="停止"]',
   '.stop-button',
 ].join(', ');
+export const sendSelector = 'button[aria-label="Send message"], button[aria-label="发送消息"], button[aria-label="Send"], button[aria-label="发送"], button.send-button, .send-button';
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证|sign in|log in|登录/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
@@ -106,6 +107,28 @@ export function buildReadStateJs() {
   const signedOut = Boolean(signedOutEl);
   const loggedOut = userTurns === 0 && !signedIn && signedOut;
 
+  const alertEls = document.querySelectorAll('[role="alert"], [data-testid*="error"], div[class*="text-red-"]');
+  let pageError = null;
+  for (const el of alertEls) {
+    let visible = false;
+    if (typeof el.getBoundingClientRect === "function") {
+      const r = el.getBoundingClientRect();
+      visible = r.width > 0 && r.height > 0;
+    } else {
+      visible = true;
+    }
+    if (!visible) continue;
+    const txt = (el.innerText || el.textContent || "").trim();
+    if (txt.length > 0) {
+      const isRateLimit = /limit|too many requests|rate limit|try again later|429|达到限制|请求过于频繁|请稍后重试|次数过多/i.test(txt);
+      pageError = {
+        reason: isRateLimit ? "provider_rate_limited" : "provider_error",
+        message: txt.slice(0, 300),
+      };
+      break;
+    }
+  }
+
   return JSON.stringify({
     userTurns,
     answerTurns,
@@ -117,6 +140,7 @@ export function buildReadStateJs() {
     loggedOut,
     signedIn,
     signedOut,
+    pageError,
   });
 })()`;
 }

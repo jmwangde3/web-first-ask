@@ -77,6 +77,7 @@ test("runCdpTurn: full successful flow with SAFE_START, verifies driver.submitTu
     provider: "chatgpt",
     prompt: "Write a fibonacci function",
     mode: "background",
+    minIntervalMs: 0,
     deps: {
       recoverBrowser: mockRecoverBrowser,
       connectCdp: async (port) => {
@@ -116,6 +117,7 @@ test("runCdpTurn: recoverBrowser returns RECOVERY_REQUIRED -> returns status nee
   const result = await runCdpTurn({
     provider: "chatgpt",
     prompt: "Hello",
+    minIntervalMs: 0,
     deps: {
       recoverBrowser: mockRecoverBrowser,
       connectCdp: async () => {
@@ -154,6 +156,7 @@ test("runCdpTurn: waitForCompletion returns stalled -> correctly passes through 
   const result = await runCdpTurn({
     provider: "gemini",
     prompt: "Explain relativity",
+    minIntervalMs: 0,
     deps: {
       recoverBrowser: async () => ({
         action: "ADOPT",
@@ -189,6 +192,7 @@ test("runCdpTurn: driver throws EDITOR_NOT_FOUND -> returns status failed and re
   const result = await runCdpTurn({
     provider: "chatgpt",
     prompt: "Hello",
+    minIntervalMs: 0,
     deps: {
       recoverBrowser: async () => ({
         action: "SAFE_START",
@@ -203,6 +207,171 @@ test("runCdpTurn: driver throws EDITOR_NOT_FOUND -> returns status failed and re
   assert.equal(result.status, "failed");
   assert.equal(result.reason, "editor_not_found");
 });
+
+test("T1: onSendIntent throws -> journal_unwritable, countsForCooldown false", async () => {
+  let recordedCountsForCooldown = null;
+
+  const mockCdp = {
+    send: async () => ({}),
+    close: () => {},
+  };
+
+  const mockDriver = {
+    openTab: async () => ({ targetId: "target-1", sessionId: "session-1" }),
+    waitForEditor: async () => true,
+    readTurnState: async () => ({ userTurns: 0, answerTurns: 0 }),
+  };
+
+  const result = await runCdpTurn({
+    provider: "chatgpt",
+    prompt: "Hello",
+    minIntervalMs: 0,
+    deps: {
+      recoverBrowser: async () => ({
+        action: "SAFE_START",
+        reason: "no_lock_profile_free",
+        chrome: { pid: 1234, port: 9222 },
+      }),
+      connectCdp: async () => mockCdp,
+      driver: mockDriver,
+      onSendIntent: async () => {
+        throw new Error("Journal disk full");
+      },
+      recordLastTurn: async (_home, _provider, opts) => {
+        recordedCountsForCooldown = opts.countsForCooldown;
+      },
+    },
+  });
+
+  assert.equal(result.status, "needs_human");
+  assert.equal(result.reason, "journal_unwritable");
+  assert.equal(recordedCountsForCooldown, false, "countsForCooldown must be false when onSendIntent fails");
+});
+
+test("T6: draft replaced then submit fails -> error evidence includes replacedChars", async () => {
+  const mockCdp = {
+    send: async () => ({}),
+    close: () => {},
+  };
+
+  const mockDriver = {
+    openTab: async () => ({ targetId: "target-1", sessionId: "session-1" }),
+    waitForEditor: async () => true,
+    readTurnState: async () => ({ userTurns: 0, answerTurns: 0 }),
+    typePrompt: async () => ({ typedChars: 15, replacedChars: 8 }),
+    submitTurn: async () => {
+      const err = new WfaError("SEND_BUTTON_MISSING", "Send button missing");
+      err.code = "SEND_BUTTON_MISSING";
+      throw err;
+    },
+  };
+
+  const result = await runCdpTurn({
+    provider: "chatgpt",
+    prompt: "Hello",
+    minIntervalMs: 0,
+    deps: {
+      recoverBrowser: async () => ({
+        action: "SAFE_START",
+        reason: "no_lock_profile_free",
+        chrome: { pid: 1234, port: 9222 },
+      }),
+      connectCdp: async () => mockCdp,
+      driver: mockDriver,
+    },
+  });
+
+  assert.equal(result.status, "needs_human");
+  assert.equal(result.reason, "send_button_missing");
+  assert.equal(result.evidence.replacedChars, 8, "evidence must include replacedChars from completed typePrompt");
+});
+
+test("runCdpTurn: cancellation after typePrompt preserves typedChars and replacedChars in evidence", async () => {
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Target.createTarget") return { targetId: "target-1" };
+      if (method === "Target.attachToTarget") return { sessionId: "session-1" };
+      return {};
+    },
+    close: () => {},
+  };
+
+  const mockDriver = {
+    openTab: async () => ({ targetId: "target-1", sessionId: "session-1" }),
+    waitForEditor: async () => true,
+    readTurnState: async () => ({ userTurns: 0, answerTurns: 0 }),
+    typePrompt: async () => ({ typedChars: 25, replacedChars: 12 }),
+    submitTurn: async () => {},
+    waitForCompletion: async () => {
+      const err = new Error("Generation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    },
+  };
+
+  const result = await runCdpTurn({
+    provider: "chatgpt",
+    prompt: "Hello",
+    minIntervalMs: 0,
+    deps: {
+      recoverBrowser: async () => ({
+        action: "SAFE_START",
+        reason: "no_lock_profile_free",
+        chrome: { pid: 1234, port: 9222 },
+      }),
+      connectCdp: async () => mockCdp,
+      driver: mockDriver,
+    },
+  });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "cancelled");
+  assert.deepEqual(result.evidence, { typedChars: 25, replacedChars: 12 });
+  assert.ok(typeof result.sendCommittedAt === "number" && result.sendCommittedAt > 0);
+});
+
+test("runCdpTurn: cancellation before typePrompt leaves evidence as null", async () => {
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Target.createTarget") return { targetId: "target-1" };
+      if (method === "Target.attachToTarget") return { sessionId: "session-1" };
+      return {};
+    },
+    close: () => {},
+  };
+
+  const mockDriver = {
+    openTab: async () => ({ targetId: "target-1", sessionId: "session-1" }),
+    waitForEditor: async () => {
+      const err = new Error("Editor wait cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    },
+    readTurnState: async () => ({ userTurns: 0, answerTurns: 0 }),
+    typePrompt: async () => ({ typedChars: 25, replacedChars: 12 }),
+  };
+
+  const result = await runCdpTurn({
+    provider: "chatgpt",
+    prompt: "Hello",
+    minIntervalMs: 0,
+    deps: {
+      recoverBrowser: async () => ({
+        action: "SAFE_START",
+        reason: "no_lock_profile_free",
+        chrome: { pid: 1234, port: 9222 },
+      }),
+      connectCdp: async () => mockCdp,
+      driver: mockDriver,
+    },
+  });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "cancelled");
+  assert.equal(result.evidence, null);
+  assert.equal(result.sendCommittedAt, undefined);
+});
+
 
 test("runCdpCommand ask --json: normal output can be parsed by JSON.parse", async () => {
   const stdout = createMockStream();
@@ -1268,6 +1437,55 @@ test("wfa cdp login: dead broker record - Browser.close sent", async () => {
   assert.equal(browserCloseSent, true, "Browser.close must be sent when broker is dead");
   assert.match(stdout.output, /logged in as a@b\.c/);
 });
+
+test("wfa cdp ask: passes --min-interval to runCdpTurn", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let passedOptions = null;
+
+  const res = await runCdpCommand(["ask", "--provider", "chatgpt", "--prompt", "Hello", "--min-interval", "3500"], {
+    stdout,
+    stderr,
+    runCdpTurn: async (opts) => {
+      passedOptions = opts;
+      if (typeof opts.onWait === "function") {
+        opts.onWait(2500);
+      }
+      return { status: "completed", text: "Answer text", elapsedMs: 100 };
+    },
+  });
+
+  assert.equal(res.code, 0);
+  assert.equal(passedOptions.minIntervalMs, 3500);
+  assert.match(stderr.output, /\[cdp\] waiting 2\.5s for the provider interval/);
+});
+
+test("wfa cdp ask: rejects negative --min-interval with INVALID_ARGUMENT", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+
+  const res = await runCdpCommand(["ask", "--provider", "chatgpt", "--prompt", "Hello", "--min-interval", "-10"], {
+    stdout,
+    stderr,
+  });
+
+  assert.equal(res.code, 1);
+  assert.match(stderr.output, /INVALID_ARGUMENT/);
+});
+
+test("wfa cdp ask: rejects decimal, hex, and scientific notation in --min-interval with INVALID_ARGUMENT", async () => {
+  for (const badValue of ["1.5", "0x10", "1e3", "abc"]) {
+    const stdout = createMockStream();
+    const stderr = createMockStream();
+    const res = await runCdpCommand(["ask", "--provider", "chatgpt", "--prompt", "Hello", "--min-interval", badValue], {
+      stdout,
+      stderr,
+    });
+    assert.equal(res.code, 1, `Expected ${badValue} to be rejected`);
+    assert.match(stderr.output, /INVALID_ARGUMENT/);
+  }
+});
+
 
 
 

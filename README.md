@@ -274,7 +274,7 @@ The `ANCHOR` must match exactly once, including surrounding lines. Missing and a
 | `wfa gemini-mode [chat\|task]` | Show or save the Gemini landing mode, and whether it was pressed |
 | `wfa install-skill [--target …]` | Install the Skill to Codex, WorkBuddy or a chosen directory |
 | `wfa upstream update` | Run ask-bridge's official update command |
-| `wfa cdp ask --provider <p> --prompt <text>` | Native CDP turn; `background` (default), `visible`, `headless`; `--json`, `--timeout`, `--settle` |
+| `wfa cdp ask --provider <p> --prompt <text>` | Native CDP turn; `background` (default), `visible`, `headless`; `--json`, `--timeout`, `--settle`, `--min-interval` |
 | `wfa cdp login [--provider <p>]` | Log in once on our own profile, verify it on the product origin, close Chrome cleanly |
 | `wfa cdp status [--json]` | Show the browser this home owns and whether a turn could start now |
 | `wfa broker start [--detach]` | Run the turn queue in the foreground, or detach it with a log file |
@@ -311,6 +311,7 @@ DevTools Protocol by a zero-dependency client, and keep all of their state insid
 <home>/broker.json       running broker: pid, loopback port, token, startedAt
 <home>/broker.lock       single-broker instance lock
 <home>/turns/            commit journal: prompts that were typed but not yet answered
+<home>/last-turn.json    inter-turn cooldown state per provider: { finishedAt, status }
 <home>/logs/             detached broker logs
 ```
 
@@ -333,8 +334,13 @@ Failure reasons are explicit and never retried:
 |---|---|
 | `login_required` | The profile reached a logged-out composer (`textarea#mobile-composer-prompt`). Nothing was typed. Run `wfa cdp login`. |
 | `human_verification_required` | Cloudflare interstitial: the page title matches the adapter's challenge pattern (ChatGPT ships `/请稍候|just a moment|verifying|security check|cloudflare|人机验证/i`) or a password input is present, on two consecutive polls. Detected in about 2 s, not at the timeout. |
+| `provider_rate_limited` | Provider displayed a rate limit / 429 banner (`[role="alert"]`, `[data-testid*="error"]`). Failed fast instead of stalling. |
+| `provider_error` | Provider displayed an unrecoverable error banner on the page without generating an answer. |
+| `send_button_missing` | Send button not found or not visible after typing prompt. Failed fast before waiting for ACK. |
+| `send_button_disabled` | Send button remained disabled after prompt input. Failed fast before waiting for ACK. |
+| `send_button_ambiguous` | Multiple eligible send buttons matched in DOM; no click performed. |
 | `editor_not_found` | The page loaded but no composer appeared; evidence carries `title`, `adapter` and `bodyLength`. |
-| `send_unconfirmed` | Nothing acknowledged the send within 30 s. Treated as uncertain; never resent. |
+| `send_unconfirmed` | Nothing acknowledged the send within 30 s, or CDP click evaluation failed with an uncertain outcome. Treated as uncertain; never resent. |
 | `no_progress` | The answer stopped growing for `--stall-timeout`. The partial text is returned. |
 | `hard_timeout` / `cancelled` | The overall timeout expired, or the caller aborted. A cancel after submit carries `sendCommittedAt`. |
 | recovery reasons (`lock_corrupt`, `identity_mismatch_profile_held`, …) | `browser.lock` could not be reconciled safely; the turn becomes `needs_human` and `evidence` names the failing check (see `src/browser/recovery.js`). |

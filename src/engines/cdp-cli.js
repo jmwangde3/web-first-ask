@@ -24,6 +24,7 @@ const VALUE_FLAGS = new Set([
   "timeout",
   "settle",
   "chrome-path",
+  "min-interval",
 ]);
 
 function parseArgs(argv) {
@@ -79,6 +80,7 @@ function printCdpHelp(stdout = process.stdout) {
 Commands:
   wfa cdp ask    --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
                  [--mode background|visible|headless] [--json] [--timeout <s>] [--settle <ms>]
+                 [--min-interval <ms>]
   wfa cdp status [--json]
   wfa cdp login  [--provider <chatgpt|gemini>] [--mode visible|background]
                  [--timeout <seconds>] [--json]
@@ -91,6 +93,7 @@ Options:
   --json                  Output machine-readable JSON
   --timeout <seconds>     Overall / stall timeout in seconds
   --settle <ms>           Answer stabilization window in milliseconds (default: 4000)
+  --min-interval <ms>     Minimum interval between provider turns in milliseconds
   --help, -h              Show this help message
 `);
 }
@@ -456,6 +459,22 @@ async function handleAsk(argv, deps) {
     }
   }
 
+  let minIntervalMs;
+  if (options["min-interval"] !== undefined) {
+    const raw = String(options["min-interval"]).trim();
+    if (!/^\d+$/.test(raw)) {
+      throw new WfaError("INVALID_ARGUMENT", `Invalid --min-interval: ${options["min-interval"]}. Must be a non-negative integer in milliseconds.`);
+    }
+    minIntervalMs = Number(raw);
+    if (!Number.isSafeInteger(minIntervalMs)) {
+      throw new WfaError("INVALID_ARGUMENT", `Invalid --min-interval: ${options["min-interval"]}. Value exceeds the safe integer range.`);
+    }
+  }
+
+  const onWait = (remainingMs) => {
+    stderr.write(`[cdp] waiting ${(remainingMs / 1000).toFixed(1)}s for the provider interval\n`);
+  };
+
   const turnFn = deps.runCdpTurn || runCdpTurn;
   const result = await turnFn({
     provider,
@@ -466,6 +485,8 @@ async function handleAsk(argv, deps) {
     settleMs,
     stallTimeoutMs,
     hardTimeoutMs,
+    minIntervalMs,
+    onWait,
     keepBrowser: Boolean(options["keep-browser"]),
     deps,
   });

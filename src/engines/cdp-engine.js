@@ -7,6 +7,7 @@ import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
 import { WfaError } from "../errors.js";
 import { sleep as defaultSleep } from "../util.js";
+import { DEFAULT_MIN_INTERVAL_MS, enforceCooldown, recordLastTurn } from "../browser/cooldown.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -22,6 +23,8 @@ export async function runCdpTurn({
   settleMs = 4000,
   stallTimeoutMs = 180000,
   hardTimeoutMs = 900000,
+  minIntervalMs,
+  onWait,
   keepBrowser = false,
   signal,
   deps = {},
@@ -43,25 +46,14 @@ export async function runCdpTurn({
     throw new WfaError("EMPTY_PROMPT", "Prompt text is empty or missing.");
   }
 
-  let recoveryMode;
-  if (mode === "background" || mode === "visible" || mode === "headless") {
-    // launchChrome now understands all three modes, so pass them through
-    // instead of collapsing background and visible into the same window state.
-    recoveryMode = mode;
-  } else {
-    throw new WfaError("INVALID_ARGUMENT", `Invalid mode: ${mode}. Must be background, visible, or headless.`);
-  }
-
-  const recover = deps.recoverBrowser || recoverBrowser;
-  const connect = deps.connectCdp || connectCdp;
-  const driver = deps.driver || defaultDriver;
+  const effectiveHome = home || getHomeDir();
   const sleepFn = deps.sleep || defaultSleep;
-
-  const recovery = await recover({
-    home: home || getHomeDir(),
-    mode: recoveryMode,
-    chromePath,
-    probes: deps.probes,
+  const enforce = deps.enforceCooldown || enforceCooldown;
+  await enforce(effectiveHome, normalizedProvider, {
+    minIntervalMs,
+    now: deps.now || Date.now,
+    sleep: sleepFn,
+    onWait,
   });
 
   if (signal?.aborted) {
@@ -76,142 +68,161 @@ export async function runCdpTurn({
     };
   }
 
-  if (recovery.action === "RECOVERY_REQUIRED") {
-    return {
-      status: "needs_human",
-      text: "",
-      reason: recovery.reason,
-      evidence: recovery.evidence,
-      conversationUrl: "",
-      browser: null,
-      elapsedMs: Date.now() - startTime,
-    };
+  let recoveryMode;
+  if (mode === "background" || mode === "visible" || mode === "headless") {
+    // launchChrome now understands all three modes, so pass them through
+    // instead of collapsing background and visible into the same window state.
+    recoveryMode = mode;
+  } else {
+    throw new WfaError("INVALID_ARGUMENT", `Invalid mode: ${mode}. Must be background, visible, or headless.`);
   }
 
-  if (!recovery.chrome?.port) {
-    return {
-      status: "failed",
-      text: "",
-      reason: String(recovery.reason || "chrome_port_missing").toLowerCase(),
-      evidence: recovery.evidence || null,
-      conversationUrl: "",
-      browser: null,
-      elapsedMs: Date.now() - startTime,
-    };
-  }
+  const recover = deps.recoverBrowser || recoverBrowser;
+  const connect = deps.connectCdp || connectCdp;
+  const driver = deps.driver || defaultDriver;
 
-  let cdp = null;
-  let targetId = null;
-  let sessionId = null;
-  let conversationUrl = adapter.url || "";
+  let terminalStatus = "failed";
   let submitted = false;
   let submittedAt = null;
+  let typeRes = null;
 
-  const tryCancelActiveGeneration = async () => {
-    if (submitted && cdp && sessionId) {
-      try {
-        await Promise.race([
-          (async () => {
-            await cdp.send("Input.dispatchKeyEvent", {
-              type: "rawKeyDown",
-              windowsVirtualKeyCode: 27,
-              key: "Escape",
-              code: "Escape",
-            }, sessionId);
-            await cdp.send("Input.dispatchKeyEvent", {
-              type: "keyUp",
-              windowsVirtualKeyCode: 27,
-              key: "Escape",
-              code: "Escape",
-            }, sessionId);
-          })(),
-          new Promise((r) => setTimeout(r, 450)),
-        ]);
-      } catch {}
+  const withTerminalStatus = (result) => {
+    if (result && typeof result.status === "string") {
+      terminalStatus = result.status;
     }
+    return result;
   };
 
   try {
-    cdp = await connect(recovery.chrome.port);
-    if (signal?.aborted) {
-      const err = new Error("Operation cancelled");
-      err.code = "CANCELLED";
-      throw err;
-    }
-
-    const tab = await driver.openTab(cdp, adapter.url, { timeoutMs: hardTimeoutMs });
-    targetId = tab.targetId;
-    sessionId = tab.sessionId;
-    if (signal?.aborted) {
-      const err = new Error("Operation cancelled");
-      err.code = "CANCELLED";
-      throw err;
-    }
-
-    if (mode === "background") {
-      try {
-        const windowInfo = await cdp.send("Browser.getWindowForTarget", { targetId }).catch(() => null);
-        if (windowInfo && typeof windowInfo.windowId !== "undefined") {
-          await cdp.send("Browser.setWindowBounds", {
-            windowId: windowInfo.windowId,
-            bounds: { left: -2000, top: -2000, windowState: "normal" },
-          }).catch(() => {});
-        }
-      } catch {}
-    } else if (mode === "visible") {
-      try {
-        const windowInfo = await cdp.send("Browser.getWindowForTarget", { targetId }).catch(() => null);
-        if (windowInfo && typeof windowInfo.windowId !== "undefined") {
-          await cdp.send("Browser.setWindowBounds", {
-            windowId: windowInfo.windowId,
-            bounds: { left: 100, top: 100, windowState: "normal" },
-          }).catch(() => {});
-        }
-      } catch {}
-    }
-
-    await driver.waitForEditor(cdp, sessionId, adapter, {
-      timeoutMs: hardTimeoutMs,
-      sleep: sleepFn,
-      signal,
+    const recovery = await recover({
+      home: effectiveHome,
+      mode: recoveryMode,
+      chromePath,
+      probes: deps.probes,
     });
+
     if (signal?.aborted) {
-      const err = new Error("Operation cancelled");
-      err.code = "CANCELLED";
-      throw err;
+      return withTerminalStatus({
+        status: "failed",
+        text: "",
+        reason: "cancelled",
+        evidence: null,
+        conversationUrl: "",
+        browser: null,
+        elapsedMs: Date.now() - startTime,
+      });
     }
 
-    const initialState = await driver.readTurnState(cdp, sessionId, adapter);
-    if (initialState?.loggedOut) {
-      return {
+    if (recovery.action === "RECOVERY_REQUIRED") {
+      return withTerminalStatus({
         status: "needs_human",
         text: "",
-        reason: "login_required",
-        evidence: { title: initialState.title || "", adapter: adapter.id, loggedOut: true },
-        conversationUrl,
-        browser: {
-          pid: recovery.chrome?.pid ?? null,
-          port: recovery.chrome?.port ?? null,
-          mode,
-          reused: recovery.action === "ADOPT",
-        },
+        reason: recovery.reason,
+        evidence: recovery.evidence,
+        conversationUrl: "",
+        browser: null,
         elapsedMs: Date.now() - startTime,
-      };
+      });
     }
 
-    const baselineUserTurns = initialState?.userTurns ?? 0;
-    const baselineAnswerTurns = initialState?.answerTurns ?? 0;
+    if (!recovery.chrome?.port) {
+      return withTerminalStatus({
+        status: "failed",
+        text: "",
+        reason: String(recovery.reason || "chrome_port_missing").toLowerCase(),
+        evidence: recovery.evidence || null,
+        conversationUrl: "",
+        browser: null,
+        elapsedMs: Date.now() - startTime,
+      });
+    }
 
-    if (typeof deps.onSendIntent === "function") {
-      submittedAt = Date.now();
-      try {
-        await deps.onSendIntent({ provider: normalizedProvider, prompt, submittedAt });
-      } catch (intentErr) {
-        return {
+    let cdp = null;
+    let targetId = null;
+    let sessionId = null;
+    let conversationUrl = adapter.url || "";
+
+    const tryCancelActiveGeneration = async () => {
+      if (submitted && cdp && sessionId) {
+        try {
+          await Promise.race([
+            (async () => {
+              await cdp.send("Input.dispatchKeyEvent", {
+                type: "rawKeyDown",
+                windowsVirtualKeyCode: 27,
+                key: "Escape",
+                code: "Escape",
+              }, sessionId);
+              await cdp.send("Input.dispatchKeyEvent", {
+                type: "keyUp",
+                windowsVirtualKeyCode: 27,
+                key: "Escape",
+                code: "Escape",
+              }, sessionId);
+            })(),
+            new Promise((r) => setTimeout(r, 450)),
+          ]);
+        } catch {}
+      }
+    };
+
+    try {
+      cdp = await connect(recovery.chrome.port);
+      if (signal?.aborted) {
+        const err = new Error("Operation cancelled");
+        err.code = "CANCELLED";
+        throw err;
+      }
+
+      const tab = await driver.openTab(cdp, adapter.url, { timeoutMs: hardTimeoutMs });
+      targetId = tab.targetId;
+      sessionId = tab.sessionId;
+      if (signal?.aborted) {
+        const err = new Error("Operation cancelled");
+        err.code = "CANCELLED";
+        throw err;
+      }
+
+      if (mode === "background") {
+        try {
+          const windowInfo = await cdp.send("Browser.getWindowForTarget", { targetId }).catch(() => null);
+          if (windowInfo && typeof windowInfo.windowId !== "undefined") {
+            await cdp.send("Browser.setWindowBounds", {
+              windowId: windowInfo.windowId,
+              bounds: { left: -2000, top: -2000, windowState: "normal" },
+            }).catch(() => {});
+          }
+        } catch {}
+      } else if (mode === "visible") {
+        try {
+          const windowInfo = await cdp.send("Browser.getWindowForTarget", { targetId }).catch(() => null);
+          if (windowInfo && typeof windowInfo.windowId !== "undefined") {
+            await cdp.send("Browser.setWindowBounds", {
+              windowId: windowInfo.windowId,
+              bounds: { left: 100, top: 100, windowState: "normal" },
+            }).catch(() => {});
+          }
+        } catch {}
+      }
+
+      await driver.waitForEditor(cdp, sessionId, adapter, {
+        timeoutMs: hardTimeoutMs,
+        sleep: sleepFn,
+        signal,
+      });
+      if (signal?.aborted) {
+        const err = new Error("Operation cancelled");
+        err.code = "CANCELLED";
+        throw err;
+      }
+
+      const initialState = await driver.readTurnState(cdp, sessionId, adapter);
+      if (initialState?.loggedOut) {
+        return withTerminalStatus({
           status: "needs_human",
           text: "",
-          reason: "journal_unwritable",
-          evidence: { message: intentErr?.message || String(intentErr) },
+          reason: "login_required",
+          evidence: { title: initialState.title || "", adapter: adapter.id, loggedOut: true },
           conversationUrl,
           browser: {
             pid: recovery.chrome?.pid ?? null,
@@ -220,86 +231,175 @@ export async function runCdpTurn({
             reused: recovery.action === "ADOPT",
           },
           elapsedMs: Date.now() - startTime,
-        };
+        });
       }
-    }
 
-    await driver.typePrompt(cdp, sessionId, adapter, prompt);
-    if (signal?.aborted) {
-      const err = new Error("Operation cancelled");
-      err.code = "CANCELLED";
-      throw err;
-    }
+      const baselineUserTurns = initialState?.userTurns ?? 0;
+      const baselineAnswerTurns = initialState?.answerTurns ?? 0;
 
-    if (!submittedAt) {
-      submittedAt = Date.now();
-    }
-    try {
-      await driver.submitTurn(cdp, sessionId, adapter);
-    } catch (submitErr) {
-      if (typeof deps.onSendAborted === "function") {
-        await deps.onSendAborted({ provider: normalizedProvider }).catch(() => {});
+      if (typeof deps.onSendIntent === "function") {
+        const intentTime = Date.now();
+        try {
+          await deps.onSendIntent({ provider: normalizedProvider, prompt, submittedAt: intentTime });
+          submittedAt = intentTime;
+        } catch (intentErr) {
+          return withTerminalStatus({
+            status: "needs_human",
+            text: "",
+            reason: "journal_unwritable",
+            evidence: { message: intentErr?.message || String(intentErr) },
+            conversationUrl,
+            browser: {
+              pid: recovery.chrome?.pid ?? null,
+              port: recovery.chrome?.port ?? null,
+              mode,
+              reused: recovery.action === "ADOPT",
+            },
+            elapsedMs: Date.now() - startTime,
+          });
+        }
       }
-      throw submitErr;
-    }
-    submitted = true;
-    if (signal?.aborted) {
-      const err = new Error("Operation cancelled");
-      err.code = "CANCELLED";
-      err.sendCommittedAt = submittedAt;
-      throw err;
-    }
 
-    const completion = await driver.waitForCompletion(cdp, sessionId, adapter, {
-      baselineUserTurns,
-      baselineAnswerTurns,
-      settleMs,
-      stallTimeoutMs,
-      hardTimeoutMs,
-      sleep: sleepFn,
-      signal,
-    });
-    if (signal?.aborted) {
-      const err = new Error("Operation cancelled");
-      err.code = "CANCELLED";
-      err.sendCommittedAt = submittedAt;
-      throw err;
-    }
-
-    try {
-      const urlRes = await cdp.send("Runtime.evaluate", {
-        expression: "window.location.href",
-        returnByValue: true,
-      }, sessionId);
-      if (urlRes?.result?.value && typeof urlRes.result.value === "string") {
-        conversationUrl = urlRes.result.value;
+      typeRes = await driver.typePrompt(cdp, sessionId, adapter, prompt);
+      if (signal?.aborted) {
+        const err = new Error("Operation cancelled");
+        err.code = "CANCELLED";
+        throw err;
       }
-    } catch {}
 
-    return {
-      status: completion.status,
-      text: completion.text || "",
-      reason: completion.reason ? String(completion.reason).toLowerCase() : "",
-      evidence: completion.evidence || null,
-      conversationUrl,
-      ...(submittedAt != null ? { sendCommittedAt: submittedAt } : {}),
-      browser: {
-        pid: recovery.chrome?.pid ?? null,
-        port: recovery.chrome?.port ?? null,
-        mode,
-        reused: recovery.action === "ADOPT",
-      },
-      elapsedMs: Date.now() - startTime,
-    };
-  } catch (error) {
-    if (signal?.aborted || error?.code === "CANCELLED") {
-      await tryCancelActiveGeneration();
+      if (!submittedAt) {
+        submittedAt = Date.now();
+      }
+      try {
+        await driver.submitTurn(cdp, sessionId, adapter);
+      } catch (submitErr) {
+        if (submitErr?.code !== "SEND_UNCONFIRMED") {
+          if (typeof deps.onSendAborted === "function") {
+            await deps.onSendAborted({ provider: normalizedProvider }).catch(() => {});
+          }
+        }
+        throw submitErr;
+      }
+      submitted = true;
+      if (signal?.aborted) {
+        const err = new Error("Operation cancelled");
+        err.code = "CANCELLED";
+        err.sendCommittedAt = submittedAt;
+        throw err;
+      }
+
+      const completion = await driver.waitForCompletion(cdp, sessionId, adapter, {
+        baselineUserTurns,
+        baselineAnswerTurns,
+        settleMs,
+        stallTimeoutMs,
+        hardTimeoutMs,
+        sleep: sleepFn,
+        signal,
+      });
+      if (signal?.aborted) {
+        const err = new Error("Operation cancelled");
+        err.code = "CANCELLED";
+        err.sendCommittedAt = submittedAt;
+        throw err;
+      }
+
+      try {
+        const urlRes = await cdp.send("Runtime.evaluate", {
+          expression: "window.location.href",
+          returnByValue: true,
+        }, sessionId);
+        if (urlRes?.result?.value && typeof urlRes.result.value === "string") {
+          conversationUrl = urlRes.result.value;
+        }
+      } catch {}
+
+      return withTerminalStatus({
+        status: completion.status,
+        text: completion.text || "",
+        reason: completion.reason ? String(completion.reason).toLowerCase() : "",
+        evidence: {
+          ...(completion.evidence || {}),
+          replacedChars: typeRes?.replacedChars ?? 0,
+        },
+        conversationUrl,
+        ...(submittedAt != null ? { sendCommittedAt: submittedAt } : {}),
+        browser: {
+          pid: recovery.chrome?.pid ?? null,
+          port: recovery.chrome?.port ?? null,
+          mode,
+          reused: recovery.action === "ADOPT",
+        },
+        elapsedMs: Date.now() - startTime,
+      });
+    } catch (error) {
+      if (signal?.aborted || error?.code === "CANCELLED") {
+        await tryCancelActiveGeneration();
+        const committedAt = submittedAt != null ? submittedAt : (error?.sendCommittedAt != null ? error.sendCommittedAt : null);
+        return withTerminalStatus({
+          status: "failed",
+          text: "",
+          reason: "cancelled",
+          evidence: typeRes
+            ? {
+                typedChars: typeRes.typedChars,
+                replacedChars: typeRes.replacedChars,
+              }
+            : null,
+          conversationUrl,
+          ...(committedAt != null ? { sendCommittedAt: committedAt } : {}),
+          browser: {
+            pid: recovery?.chrome?.pid ?? null,
+            port: recovery?.chrome?.port ?? null,
+            mode,
+            reused: recovery?.action === "ADOPT",
+          },
+          elapsedMs: Date.now() - startTime,
+        });
+      }
+
+      if (error?.code === "SEND_UNCONFIRMED") {
+        return withTerminalStatus({
+          status: "needs_human",
+          reason: "send_unconfirmed",
+          text: "",
+          elapsedMs: Date.now() - startTime,
+          evidence: {
+            sendOutcome: "unknown",
+            method: "click",
+            ...(typeRes ? { typedChars: typeRes.typedChars, replacedChars: typeRes.replacedChars } : {}),
+          },
+          conversationUrl,
+          browser: {
+            pid: recovery?.chrome?.pid ?? null,
+            port: recovery?.chrome?.port ?? null,
+            mode,
+            reused: recovery?.action === "ADOPT",
+          },
+          ...(submittedAt != null ? { sendCommittedAt: submittedAt } : {}),
+        });
+      }
+
+      const classifier = driver.classifyRunError || classifyRunError;
+      const classified = typeof classifier === "function"
+        ? classifier(error)
+        : { state: "failed", code: error?.code || "UNKNOWN_ERROR", detail: error?.message || String(error) };
+
       const committedAt = submittedAt != null ? submittedAt : (error?.sendCommittedAt != null ? error.sendCommittedAt : null);
-      return {
-        status: "failed",
+      const reasonCode = error?.code || classified.code || "unknown_error";
+      const baseEvidence = (error?.details && typeof error.details === "object")
+        ? error.details
+        : { message: error?.message || String(error) };
+      const evidence = {
+        ...baseEvidence,
+        ...(typeRes ? { typedChars: typeRes.typedChars, replacedChars: typeRes.replacedChars } : {}),
+      };
+
+      return withTerminalStatus({
+        status: classified.state,
         text: "",
-        reason: "cancelled",
-        evidence: null,
+        reason: String(reasonCode).toLowerCase(),
+        evidence,
         conversationUrl,
         ...(committedAt != null ? { sendCommittedAt: committedAt } : {}),
         browser: {
@@ -309,41 +409,27 @@ export async function runCdpTurn({
           reused: recovery?.action === "ADOPT",
         },
         elapsedMs: Date.now() - startTime,
-      };
+      });
+    } finally {
+      if (cdp && targetId) {
+        try {
+          await cdp.send("Target.closeTarget", { targetId });
+        } catch {}
+      }
+      if (cdp) {
+        try {
+          cdp.close();
+        } catch {}
+      }
     }
-
-    const classifier = driver.classifyRunError || classifyRunError;
-    const classified = typeof classifier === "function"
-      ? classifier(error)
-      : { state: "failed", code: error?.code || "UNKNOWN_ERROR", detail: error?.message || String(error) };
-
-    const committedAt = submittedAt != null ? submittedAt : (error?.sendCommittedAt != null ? error.sendCommittedAt : null);
-    const reasonCode = error?.code || classified.code || "unknown_error";
-    return {
-      status: classified.state,
-      text: "",
-      reason: String(reasonCode).toLowerCase(),
-      evidence: error?.details || { message: error?.message || String(error) },
-      conversationUrl,
-      ...(committedAt != null ? { sendCommittedAt: committedAt } : {}),
-      browser: {
-        pid: recovery?.chrome?.pid ?? null,
-        port: recovery?.chrome?.port ?? null,
-        mode,
-        reused: recovery?.action === "ADOPT",
-      },
-      elapsedMs: Date.now() - startTime,
-    };
   } finally {
-    if (cdp && targetId) {
-      try {
-        await cdp.send("Target.closeTarget", { targetId });
-      } catch {}
-    }
-    if (cdp) {
-      try {
-        cdp.close();
-      } catch {}
-    }
+    try {
+      const recorder = deps.recordLastTurn || recordLastTurn;
+      await recorder(effectiveHome, normalizedProvider, {
+        finishedAt: Date.now(),
+        status: terminalStatus,
+        countsForCooldown: Boolean(submitted || submittedAt != null),
+      });
+    } catch {}
   }
 }

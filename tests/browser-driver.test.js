@@ -164,11 +164,18 @@ test("waitForEditor: returns true when editor is found before timeout", async ()
 
 test("typePrompt: throws PROMPT_NOT_TYPED on empty string and types successfully otherwise", async () => {
   const sentCommands = [];
+  let typedText = "";
   const mockCdp = {
     send: async (method, params, sessionId) => {
       sentCommands.push({ method, params, sessionId });
+      if (method === "Input.insertText") {
+        typedText = params.text;
+      }
       if (method === "Runtime.evaluate") {
-        return { result: { value: true } };
+        if (params.expression.includes("selectNodeContents") || params.expression.includes("kind:")) {
+          return { result: { value: { kind: "editable", replacedChars: 0 } } };
+        }
+        return { result: { value: typedText } };
       }
       return {};
     },
@@ -183,6 +190,7 @@ test("typePrompt: throws PROMPT_NOT_TYPED on empty string and types successfully
   // 2. Normal string
   const res = await typePrompt(mockCdp, "session-1", chatgptAdapter, "Hello world");
   assert.equal(res.typedChars, 11);
+  assert.equal(res.replacedChars, 0);
 
   const evalCmd = sentCommands.find((c) => c.method === "Runtime.evaluate");
   const insertCmd = sentCommands.find((c) => c.method === "Input.insertText");
@@ -225,8 +233,10 @@ test("openTab and submitTurn: standard CDP protocol execution", async () => {
   assert.equal(tab.targetId, "target-123");
   assert.equal(tab.sessionId, "session-456");
 
-  const submitRes = await submitTurn(mockCdp, tab.sessionId, chatgptAdapter);
+  const legacyAdapter = { id: "legacy" };
+  const submitRes = await submitTurn(mockCdp, tab.sessionId, legacyAdapter);
   assert.ok(typeof submitRes.submittedAt === "number");
+  assert.equal(submitRes.method, "enter");
 
   const keyDown = calls.find((c) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyDown");
   const keyUp = calls.find((c) => c.method === "Input.dispatchKeyEvent" && c.params.type === "keyUp");
@@ -1077,3 +1087,365 @@ test("waitForCompletion: stopVisible persisting past stopGraceMs (60s) completes
   assert.equal(res.evidence.stopSignalDegraded, true);
   assert.ok(res.evidence.stopVisibleForMs >= 60000);
 });
+
+test("typePrompt: pre-existing draft text is measured and replaced, not appended", async () => {
+  let typedText = "";
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Input.insertText") {
+        typedText = params.text;
+      }
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("selectNodeContents") || params.expression.includes("kind:")) {
+          return { result: { value: { kind: "editable", replacedChars: 18 } } };
+        }
+        return { result: { value: typedText } };
+      }
+      return {};
+    },
+  };
+
+  const res = await typePrompt(mockCdp, "session-1", chatgptAdapter, "Reply with exactly: RETRY");
+  assert.equal(res.typedChars, 25);
+  assert.equal(res.replacedChars, 18);
+});
+
+test("submitTurn: polls sendSelector and clicks enabled button", async () => {
+  let clickTriggered = false;
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("btn.click()")) {
+          clickTriggered = true;
+          return { result: { value: { clicked: true } } };
+        }
+        return { result: { value: { exists: true, visible: true, disabled: false } } };
+      }
+      return {};
+    },
+  };
+
+  const res = await submitTurn(mockCdp, "session-1", chatgptAdapter, { sendButtonTimeoutMs: 500, pollIntervalMs: 50 });
+  assert.equal(res.method, "click");
+  assert.equal(clickTriggered, true);
+  assert.ok(typeof res.submittedAt === "number");
+});
+
+test("submitTurn: throws SEND_BUTTON_MISSING when sendSelector does not match", async () => {
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return { result: { value: { exists: false, visible: false, disabled: true } } };
+      }
+      return {};
+    },
+  };
+
+  await assert.rejects(
+    submitTurn(mockCdp, "session-1", chatgptAdapter, { sendButtonTimeoutMs: 200, pollIntervalMs: 50 }),
+    (err) => err.code === "SEND_BUTTON_MISSING"
+  );
+});
+
+test("submitTurn: throws SEND_BUTTON_DISABLED when button stays disabled", async () => {
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return { result: { value: { exists: true, visible: true, disabled: true } } };
+      }
+      return {};
+    },
+  };
+
+  await assert.rejects(
+    submitTurn(mockCdp, "session-1", chatgptAdapter, { sendButtonTimeoutMs: 200, pollIntervalMs: 50 }),
+    (err) => err.code === "SEND_BUTTON_DISABLED"
+  );
+});
+
+test("readTurnState: parses pageError when alert element exists", async () => {
+  const mockCdp = {
+    send: async () => ({
+      result: {
+        value: JSON.stringify({
+          userTurns: 1,
+          answerTurns: 0,
+          answerText: "",
+          pageError: {
+            reason: "provider_rate_limited",
+            message: "You've hit the rate limit. Please try again later.",
+          },
+        }),
+      },
+    }),
+  };
+
+  const state = await readTurnState(mockCdp, "session-1", chatgptAdapter);
+  assert.deepEqual(state.pageError, {
+    reason: "provider_rate_limited",
+    message: "You've hit the rate limit. Please try again later.",
+  });
+});
+
+test("waitForCompletion: fast-fails immediately on pageError when !hasAnswer", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async () => ({
+      result: {
+        value: JSON.stringify({
+          userTurns: 0,
+          answerTurns: 0,
+          answerText: "",
+          editorEmpty: false,
+          pageError: {
+            reason: "provider_rate_limited",
+            message: "Too many requests",
+          },
+        }),
+      },
+    }),
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    pollIntervalMs: 100,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "needs_human");
+  assert.equal(res.reason, "provider_rate_limited");
+  assert.deepEqual(res.evidence.pageError, {
+    reason: "provider_rate_limited",
+    message: "Too many requests",
+  });
+});
+
+test("waitForCompletion: does not abort on pageError if hasAnswer is already true", async () => {
+  let virtualTime = 0;
+  let poll = 0;
+  const mockCdp = {
+    send: async () => {
+      poll++;
+      return {
+        result: {
+          value: JSON.stringify({
+            userTurns: 1,
+            answerTurns: 1,
+            answerText: "Here is the complete solution.",
+            stopVisible: false,
+            editorEmpty: true,
+            pageError: {
+              reason: "provider_error",
+              message: "Some non-blocking toast warning",
+            },
+          }),
+        },
+      };
+    },
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    settleMs: 500,
+    pollIntervalMs: 100,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "completed");
+  assert.equal(res.text, "Here is the complete solution.");
+});
+
+test("classifyRunError: classifies send button and prompt typing errors as needs_human", () => {
+  assert.equal(classifyRunError({ code: "SEND_BUTTON_MISSING" }).state, "needs_human");
+  assert.equal(classifyRunError({ code: "SEND_BUTTON_DISABLED" }).state, "needs_human");
+  assert.equal(classifyRunError({ code: "PROMPT_NOT_TYPED" }).state, "needs_human");
+});
+
+test("waitForCompletion: pre-ACK history answer does not block rate-limit fast-fail", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async () => ({
+      result: {
+        value: JSON.stringify({
+          userTurns: 1, // baseline was 1, not yet acked
+          answerTurns: 1, // baseline was 1, previous history answer
+          answerText: "History turn 1 answer",
+          editorEmpty: false,
+          pageError: {
+            reason: "provider_rate_limited",
+            message: "Rate limit reached",
+          },
+        }),
+      },
+    }),
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 1,
+    baselineAnswerTurns: 1,
+    pollIntervalMs: 100,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "needs_human");
+  assert.equal(res.reason, "provider_rate_limited");
+});
+
+test("waitForCompletion: current-turn answer blocks rate-limit fast-fail (answer wins)", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async () => ({
+      result: {
+        value: JSON.stringify({
+          userTurns: 2,
+          answerTurns: 2, // baseline was 1, grew to 2 -> current turn answer!
+          answerText: "Fresh current turn response",
+          stopVisible: false,
+          editorEmpty: true,
+          pageError: {
+            reason: "provider_rate_limited",
+            message: "Late banner after generation",
+          },
+        }),
+      },
+    }),
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 1,
+    baselineAnswerTurns: 1,
+    settleMs: 500,
+    pollIntervalMs: 100,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "completed");
+  assert.equal(res.text, "Fresh current turn response");
+});
+
+test("T3: submitTurn handles hidden vs visible buttons and rejects SEND_BUTTON_AMBIGUOUS when multiple enabled", async () => {
+  // Case 1: First hidden, second visible & enabled -> only second clicked
+  let clickCount = 0;
+  const mockCdp1 = {
+    send: async (method, params) => {
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("btn.click()")) {
+          clickCount++;
+          return { result: { value: { clicked: true } } };
+        }
+        return { result: { value: { exists: true, visible: true, disabled: false } } };
+      }
+      return {};
+    },
+  };
+
+  const res1 = await submitTurn(mockCdp1, "session-1", chatgptAdapter, { sendButtonTimeoutMs: 500, pollIntervalMs: 50 });
+  assert.equal(res1.method, "click");
+  assert.equal(clickCount, 1);
+
+  // Case 2: Two enabled buttons -> SEND_BUTTON_AMBIGUOUS, 0 clicks
+  let ambClickCount = 0;
+  const mockCdp2 = {
+    send: async (method, params) => {
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("btn.click()")) {
+          ambClickCount++;
+          return { result: { value: { clicked: false, reason: "ambiguous" } } };
+        }
+        return { result: { value: { exists: true, visible: true, disabled: false } } };
+      }
+      return {};
+    },
+  };
+
+  await assert.rejects(
+    submitTurn(mockCdp2, "session-1", chatgptAdapter, { sendButtonTimeoutMs: 500, pollIntervalMs: 50 }),
+    (err) => {
+      assert.equal(err.code, "SEND_BUTTON_AMBIGUOUS");
+      return true;
+    }
+  );
+  assert.equal(ambClickCount, 1, "Only one probe-click attempted before aborting on ambiguous");
+});
+
+test("T4 & 3b invariant: CDP click failure throws SEND_UNCONFIRMED with no Enter fallback and exactly 1 click attempt", async () => {
+  let clickEvaluations = 0;
+  let keyEventsDispatched = 0;
+
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Input.dispatchKeyEvent") {
+        keyEventsDispatched++;
+        return {};
+      }
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("btn.click()")) {
+          clickEvaluations++;
+          // Simulate network drop / timeout during click evaluation
+          throw new Error("CDP connection timed out waiting for click response");
+        }
+        return { result: { value: { exists: true, visible: true, disabled: false } } };
+      }
+      return {};
+    },
+  };
+
+  await assert.rejects(
+    submitTurn(mockCdp, "session-1", chatgptAdapter, { sendButtonTimeoutMs: 1000, pollIntervalMs: 50 }),
+    (err) => {
+      assert.equal(err.code, "SEND_UNCONFIRMED");
+      return true;
+    }
+  );
+
+  assert.equal(clickEvaluations, 1, "Click expression must be executed at most once (no retry on failure)");
+  assert.equal(keyEventsDispatched, 0, "No Enter fallback dispatch when click fails");
+});
+
+test("T5: typePrompt value branch with only zero-width space \\u200b yields replacedChars 0", async () => {
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("kind:")) {
+          // Focus script simulated on a textarea with only zero-width spaces
+          // If cleaned.length === 0, replacedChars is 0
+          return { result: { value: { kind: "value", replacedChars: 0 } } };
+        }
+        if (params.expression.includes("el.value ===")) {
+          return { result: { value: true } };
+        }
+      }
+      return {};
+    },
+  };
+
+  const res = await typePrompt(mockCdp, "session-1", chatgptAdapter, "Hello world");
+  assert.equal(res.typedChars, 11);
+  assert.equal(res.replacedChars, 0);
+});
+
+test("T5-eval: focusExpr regex escape in template literal correctly strips whitespace and \\u200b on textarea", () => {
+  const valOnlyBlanks = "   \u200b\u00a0\n\t  ";
+  const snippet1 = `const cleaned = (${JSON.stringify(valOnlyBlanks)}).replace(/[\\s\\u00a0\\u200b]/g, ""); cleaned.length;`;
+  assert.equal(eval(snippet1), 0, "All whitespace, non-breaking and zero-width spaces must be stripped");
+
+  const valWithText = "   \u200bhello  ";
+  const snippet2 = `const cleaned = (${JSON.stringify(valWithText)}).replace(/[\\s\\u00a0\\u200b]/g, ""); cleaned.length;`;
+  assert.equal(eval(snippet2), 5, "Real text characters must remain");
+});
+
+

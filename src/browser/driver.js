@@ -9,6 +9,7 @@ function buildEvidence(state, lastProgressAgoMs) {
     stopVisible: Boolean(state?.stopVisible),
     editorEmpty: Boolean(state?.editorEmpty),
     title: state?.title ?? "",
+    pageError: state?.pageError ?? null,
     lastProgressAgoMs: Math.max(0, lastProgressAgoMs ?? 0),
   };
 }
@@ -140,6 +141,14 @@ export async function waitForEditor(cdp, sessionId, adapter, {
   throw err;
 }
 
+export function normalizePromptText(str) {
+  return String(str ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\u00a0/g, " ")
+    .replace(/\u200b/g, "")
+    .trim();
+}
+
 export async function typePrompt(cdp, sessionId, adapter, text) {
   if (typeof text !== "string" || text.length === 0) {
     const err = new WfaError("PROMPT_NOT_TYPED", "Prompt text is empty or invalid");
@@ -151,11 +160,26 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
     if (!el) return { kind: "none" };
     el.focus();
     const kind = ("value" in el) ? "value" : "editable";
+    let replacedChars = 0;
     if (kind === "editable") {
-      const r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
-      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+      const rawText = el.innerText || el.textContent || "";
+      const cleaned = rawText.replace(/[\\s\\u00a0\\u200b]/g, "");
+      if (cleaned.length > 0) {
+        replacedChars = rawText.length;
+      }
+      const r = document.createRange();
+      r.selectNodeContents(el);
+      const s = getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+    } else if (kind === "value") {
+      const val = el.value || "";
+      const cleaned = val.replace(/[\\s\\u00a0\\u200b]/g, "");
+      if (cleaned.length > 0) {
+        replacedChars = val.length;
+      }
     }
-    return { kind };
+    return { kind, replacedChars };
   })()`;
 
   const focusRes = await cdp.send("Runtime.evaluate", {
@@ -165,10 +189,12 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
 
   const val = focusRes?.result?.value;
   let kind = "none";
+  let replacedChars = 0;
   if (val === true) {
     kind = "editable";
   } else if (val && typeof val === "object" && typeof val.kind === "string") {
     kind = val.kind;
+    replacedChars = Number.isInteger(val.replacedChars) && val.replacedChars >= 0 ? val.replacedChars : 0;
   }
 
   if (!kind || kind === "none") {
@@ -178,7 +204,31 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
 
   if (kind === "editable") {
     await cdp.send("Input.insertText", { text }, sessionId);
-    return { typedChars: text.length };
+
+    // Read back and compare normalized text
+    const readBackExpr = `(() => {
+      const el = document.querySelector(${JSON.stringify(adapter.editorSelector)});
+      if (!el) return null;
+      return el.innerText || el.textContent || "";
+    })()`;
+
+    const readRes = await cdp.send("Runtime.evaluate", {
+      expression: readBackExpr,
+      returnByValue: true,
+    }, sessionId);
+
+    const observedText = readRes?.result?.value;
+    const normObserved = normalizePromptText(observedText);
+    const normExpected = normalizePromptText(text);
+
+    if (normObserved !== normExpected) {
+      throw new WfaError(
+        "PROMPT_NOT_TYPED",
+        `Prompt text mismatch in editor for ${adapter.id} (observed length ${normObserved.length}, expected ${normExpected.length})`
+      );
+    }
+
+    return { typedChars: text.length, replacedChars };
   }
 
   if (kind === "value") {
@@ -197,16 +247,140 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
       returnByValue: true,
     }, sessionId);
 
-    if (valRes?.result?.value) {
-      return { typedChars: text.length };
+    if (!valRes?.result?.value) {
+      throw new WfaError("PROMPT_NOT_TYPED", `Failed to set value on editor for ${adapter.id}`);
     }
-    throw new WfaError("PROMPT_NOT_TYPED", `Failed to set value on editor for ${adapter.id}`);
+
+    return { typedChars: text.length, replacedChars };
   }
 
   throw new WfaError("PROMPT_NOT_TYPED", `Unknown editor kind "${kind}" for ${adapter.id}`);
 }
 
-export async function submitTurn(cdp, sessionId, adapter) {
+export async function submitTurn(cdp, sessionId, adapter, {
+  sendButtonTimeoutMs = 2000,
+  pollIntervalMs = 100,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  if (adapter.sendSelector) {
+    const startTime = now();
+    let lastProbe = null;
+
+    while (now() - startTime < sendButtonTimeoutMs) {
+      const probeExpr = `(() => {
+        const all = [...document.querySelectorAll(${JSON.stringify(adapter.sendSelector)})];
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          if (style && (style.display === "none" || style.visibility === "hidden")) return false;
+          if (typeof el.getBoundingClientRect === "function") {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          }
+          return true;
+        };
+        const isEnabled = (el) => Boolean(el && !el.disabled && el.getAttribute("aria-disabled") !== "true");
+
+        const visible = all.filter(isVisible);
+        const enabled = visible.filter(isEnabled);
+
+        return {
+          exists: all.length > 0,
+          visibleCount: visible.length,
+          enabledCount: enabled.length,
+          visible: visible.length > 0,
+          disabled: visible.length > 0 && enabled.length === 0,
+        };
+      })()`;
+
+      const probeRes = await cdp.send("Runtime.evaluate", {
+        expression: probeExpr,
+        returnByValue: true,
+      }, sessionId).catch(() => null);
+
+      const val = probeRes?.result?.value;
+      lastProbe = val;
+
+      if (val?.exists && val.visible && !val.disabled) {
+        const clickExpr = `(() => {
+          const all = [...document.querySelectorAll(${JSON.stringify(adapter.sendSelector)})];
+          const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+            if (style && (style.display === "none" || style.visibility === "hidden")) return false;
+            if (typeof el.getBoundingClientRect === "function") {
+              const r = el.getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            }
+            return true;
+          };
+          const isEnabled = (el) => Boolean(el && !el.disabled && el.getAttribute("aria-disabled") !== "true");
+
+          const visible = all.filter(isVisible);
+          const enabled = visible.filter(isEnabled);
+
+          if (enabled.length === 1) {
+            const btn = enabled[0];
+            btn.click();
+            return { clicked: true };
+          }
+          if (enabled.length === 0) {
+            return { clicked: false, reason: visible.length ? "disabled" : "missing" };
+          }
+          return { clicked: false, reason: "ambiguous" };
+        })()`;
+
+        let clickRes;
+        try {
+          clickRes = await cdp.send("Runtime.evaluate", {
+            expression: clickExpr,
+            returnByValue: true,
+          }, sessionId);
+        } catch (cause) {
+          const err = new WfaError("SEND_UNCONFIRMED", "CDP click outcome unknown; automatic retry forbidden");
+          err.cause = cause;
+          throw err;
+        }
+
+        if (!clickRes || clickRes.exceptionDetails) {
+          const err = new WfaError("SEND_UNCONFIRMED", "Click evaluation raised an exception or returned empty; outcome unknown");
+          throw err;
+        }
+
+        const outcome = clickRes.result?.value;
+        if (outcome?.clicked === true) {
+          return { submittedAt: now(), method: "click" };
+        }
+
+        if (outcome?.clicked === false) {
+          if (outcome.reason === "ambiguous") {
+            const err = new WfaError("SEND_BUTTON_AMBIGUOUS", "Multiple eligible send buttons; no click performed");
+            throw err;
+          }
+          if (outcome.reason === "missing" || outcome.reason === "disabled") {
+            await sleep(pollIntervalMs);
+            continue; // proven no click happened
+          }
+        }
+
+        const err = new WfaError("SEND_UNCONFIRMED", "Invalid CDP click result; automatic retry forbidden");
+        throw err;
+      }
+
+      await sleep(pollIntervalMs);
+    }
+
+    if (!lastProbe?.exists || !lastProbe.visible) {
+      throw new WfaError("SEND_BUTTON_MISSING", `Send button not found or not visible for ${adapter.id}`);
+    }
+    if (lastProbe?.disabled) {
+      throw new WfaError("SEND_BUTTON_DISABLED", `Send button remained disabled after prompt input for ${adapter.id}`);
+    }
+    throw new WfaError("SEND_BUTTON_MISSING", `Send button could not be clicked for ${adapter.id}`);
+  }
+
+  // Fallback path ONLY for adapters lacking sendSelector
   await cdp.send("Input.dispatchKeyEvent", {
     type: "keyDown",
     windowsVirtualKeyCode: 13,
@@ -222,7 +396,7 @@ export async function submitTurn(cdp, sessionId, adapter) {
     code: "Enter",
   }, sessionId);
 
-  return { submittedAt: Date.now() };
+  return { submittedAt: now(), method: "enter" };
 }
 
 export async function readTurnState(cdp, sessionId, adapter) {
@@ -243,11 +417,24 @@ export async function readTurnState(cdp, sessionId, adapter) {
       title: "",
       hasChallenge: false,
       loggedOut: false,
+      hasProseMirror: false,
+      hasMobileComposer: false,
+      signedIn: false,
+      signedOut: false,
+      pageError: null,
     };
   }
 
   try {
     const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    let pageError = null;
+    if (parsed.pageError && typeof parsed.pageError === "object") {
+      pageError = {
+        reason: parsed.pageError.reason === "provider_rate_limited" ? "provider_rate_limited" : "provider_error",
+        message: typeof parsed.pageError.message === "string" ? parsed.pageError.message : "",
+      };
+    }
+
     return {
       userTurns: Number(parsed.userTurns) || 0,
       answerTurns: Number(parsed.answerTurns) || 0,
@@ -261,6 +448,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       hasMobileComposer: Boolean(parsed.hasMobileComposer),
       signedIn: Boolean(parsed.signedIn),
       signedOut: Boolean(parsed.signedOut),
+      pageError,
     };
   } catch {
     return {
@@ -276,6 +464,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       hasMobileComposer: false,
       signedIn: false,
       signedOut: false,
+      pageError: null,
     };
   }
 }
@@ -296,6 +485,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   const startTime = now();
   let lastProgressAt = startTime;
   let hasAcked = false;
+  let sawCurrentAnswer = false;
   let lastAnswerChars = 0;
   let lastAnswerText = "";
   let lastState = null;
@@ -342,6 +532,21 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       };
     }
 
+    const currentAnswerText = (state.answerText || "").trim();
+    if (currentAnswerText && state.answerTurns > baselineAnswerTurns) {
+      sawCurrentAnswer = true;
+    }
+    // Tier 1 (pre-ACK): only fatal rate-limit fast-fails, to avoid 30s send_unconfirmed dead-wait
+    if (state.pageError?.reason === "provider_rate_limited" && !sawCurrentAnswer) {
+      return {
+        status: "needs_human",
+        reason: "provider_rate_limited",
+        text: state.answerText || "",
+        elapsedMs: now() - startTime,
+        evidence: buildEvidence(state, now() - lastProgressAt),
+      };
+    }
+
     if (!hasAcked) {
       const ackConfirmed = (state.userTurns > baselineUserTurns) || (state.editorEmpty === true);
       if (ackConfirmed) {
@@ -362,6 +567,17 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
         await sleep(pollIntervalMs);
         continue;
       }
+    }
+
+    // Tier 2 (post-ACK): all page errors, still protecting a current-turn answer
+    if (state.pageError && !sawCurrentAnswer) {
+      return {
+        status: "needs_human",
+        reason: state.pageError.reason,
+        text: state.answerText || "",
+        elapsedMs: now() - startTime,
+        evidence: buildEvidence(state, now() - lastProgressAt),
+      };
     }
 
     const currentText = state.answerText || "";
@@ -422,6 +638,10 @@ export function classifyRunError(error) {
 
   if (
     code === "HUMAN_VERIFICATION_REQUIRED" ||
+    code === "SEND_BUTTON_MISSING" ||
+    code === "SEND_BUTTON_DISABLED" ||
+    code === "SEND_BUTTON_AMBIGUOUS" ||
+    code === "PROMPT_NOT_TYPED" ||
     /cloudflare|human_verification|challenges\.cloudflare|captcha|just a moment|security check|sign in|log in/i.test(message) ||
     /cloudflare|human_verification|challenges\.cloudflare|captcha|just a moment|security check|sign in|log in/i.test(code)
   ) {
