@@ -149,6 +149,19 @@ export function normalizePromptText(str) {
     .trim();
 }
 
+export function foldEditorLines(str) {
+  return String(str ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n{2,}/g, "\n")
+    .replace(/^\n+|\n+$/g, "");
+}
+
+export function isPromptTextMatch(expected, observed) {
+  const a = foldEditorLines(normalizePromptText(expected));
+  const b = foldEditorLines(normalizePromptText(observed));
+  return a === b;
+}
+
 export async function typePrompt(cdp, sessionId, adapter, text) {
   if (typeof text !== "string" || text.length === 0) {
     const err = new WfaError("PROMPT_NOT_TYPED", "Prompt text is empty or invalid");
@@ -218,10 +231,9 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
     }, sessionId);
 
     const observedText = readRes?.result?.value;
-    const normObserved = normalizePromptText(observedText);
-    const normExpected = normalizePromptText(text);
-
-    if (normObserved !== normExpected) {
+    if (!isPromptTextMatch(text, observedText)) {
+      const normObserved = normalizePromptText(observedText);
+      const normExpected = normalizePromptText(text);
       throw new WfaError(
         "PROMPT_NOT_TYPED",
         `Prompt text mismatch in editor for ${adapter.id} (observed length ${normObserved.length}, expected ${normExpected.length})`

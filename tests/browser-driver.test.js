@@ -9,6 +9,8 @@ import * as geminiAdapter from "../src/browser/adapters/gemini.js";
 import { cdpVersion, connectCdp, findDevToolsPort } from "../src/browser/cdp.js";
 import {
   classifyRunError,
+  foldEditorLines,
+  isPromptTextMatch,
   openTab,
   readTurnState,
   submitTurn,
@@ -1630,6 +1632,101 @@ test("Gemini adapter: sendSelector matches single native button inside gem-icon-
   assert.equal(res.method, "click");
   assert.equal(clickTriggered, true);
   assert.ok(typeof res.submittedAt === "number");
+});
+
+test("isPromptTextMatch: collapses ProseMirror multi-newline expansion while preserving exact line content", () => {
+  // 1. Real markdown with innerText expansion (\n\n expanded to \n\n\n\n\n) -> true
+  const expectedMd = "# Heading\n\nFirst paragraph...\n\n- item one\n- item two\n\n```js\n  const y = 2;\n```";
+  const observedMd = "# Heading\n\n\n\n\nFirst paragraph...\n\n\n\n\n- item one\n\n- item two\n\n\n\n```js\n  const y = 2;\n```";
+  assert.equal(isPromptTextMatch(expectedMd, observedMd), true);
+
+  // 2. Short prompt exact match -> true
+  assert.equal(isPromptTextMatch("Reply with exactly: PING", "Reply with exactly: PING"), true);
+  assert.equal(isPromptTextMatch("Say OK5", "Say OK5"), true);
+
+  // 3. Code indentation fully preserved -> true
+  const codePrompt = "function test() {\n  const y = 2;\n    const z = 3;\n}";
+  const codeObserved = "function test() {\n\n  const y = 2;\n\n    const z = 3;\n\n}";
+  assert.equal(isPromptTextMatch(codePrompt, codeObserved), true);
+
+  // 4. Truncated tail / missing last lines -> false
+  const truncatedTail = "# Heading\n\nFirst paragraph...";
+  assert.equal(isPromptTextMatch(expectedMd, truncatedTail), false);
+
+  // 5. Missing head / missing initial line -> false
+  const truncatedHead = "First paragraph...\n\n- item one\n- item two";
+  assert.equal(isPromptTextMatch(expectedMd, truncatedHead), false);
+
+  // 6. Missing words / 20 chars missing inside -> false
+  const missingWords = "# Heading\n\nFirst...\n\n- item one\n- item two";
+  assert.equal(isPromptTextMatch(expectedMd, missingWords), false);
+
+  // 7. Lines merged (missing newline, e.g. 'const x = 1;\nconst y = 2;' merged to 'const x = 1; const y = 2;') -> false
+  const twoLines = "const x = 1;\nconst y = 2;";
+  const mergedLine = "const x = 1; const y = 2;";
+  assert.equal(isPromptTextMatch(twoLines, mergedLine), false);
+
+  // 8. Word spaces stripped ('const x = 1;' -> 'constx=1;') -> false
+  assert.equal(isPromptTextMatch("const x = 1;", "constx=1;"), false);
+
+  // 9. Indentation altered in code block ('{\n    const x\n}' -> '{\n const x\n}') -> false
+  assert.equal(isPromptTextMatch("{\n    const x\n}", "{\n const x\n}"), false);
+
+  // 10. Code indentation fully preserved ('{\n  const y = 2;\n}') -> true
+  assert.equal(isPromptTextMatch("{\n  const y = 2;\n}", "{\n\n  const y = 2;\n\n}"), true);
+});
+
+test("typePrompt: multi-line markdown with ProseMirror newline expansion passes validation in editable editor", async () => {
+  const prompt = "# Title\n\nParagraph one\n\n- list item 1\n- list item 2\n\n```js\n  const x = 1;\n```";
+  // Simulate DOM innerText expansion with 5 newlines between paragraphs
+  const domInnerText = "# Title\n\n\n\n\nParagraph one\n\n\n\n\n- list item 1\n\n- list item 2\n\n\n\n```js\n  const x = 1;\n```";
+
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Input.insertText") {
+        return {};
+      }
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("selectNodeContents") || params.expression.includes("kind:")) {
+          return { result: { value: { kind: "editable", replacedChars: 0 } } };
+        }
+        // Return expanded innerText
+        return { result: { value: domInnerText } };
+      }
+      return {};
+    },
+  };
+
+  const res = await typePrompt(mockCdp, "session-1", chatgptAdapter, prompt);
+  assert.equal(res.typedChars, prompt.length);
+  assert.equal(res.replacedChars, 0);
+});
+
+test("typePrompt: truncated text in editable editor throws PROMPT_NOT_TYPED", async () => {
+  const prompt = "# Title\n\nParagraph one\n\nImportant instructions that must not be lost";
+  const truncatedText = "# Title\n\nParagraph one";
+
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Input.insertText") return {};
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("selectNodeContents") || params.expression.includes("kind:")) {
+          return { result: { value: { kind: "editable", replacedChars: 0 } } };
+        }
+        return { result: { value: truncatedText } };
+      }
+      return {};
+    },
+  };
+
+  await assert.rejects(
+    typePrompt(mockCdp, "session-1", chatgptAdapter, prompt),
+    (err) => {
+      assert.equal(err.code, "PROMPT_NOT_TYPED");
+      assert.match(err.message, /Prompt text mismatch in editor/);
+      return true;
+    }
+  );
 });
 
 

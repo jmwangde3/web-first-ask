@@ -354,7 +354,10 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const { positional, options } = parseArgs(rest);
   if (options.help) { help(); return; }
   if (Object.prototype.hasOwnProperty.call(options, "engine")) {
-    throw new WfaError("UNSUPPORTED_ENGINE", "--engine is not supported. WFA uses ask-bridge only; no external engine is selected or invoked.");
+    throw new WfaError(
+      "UNSUPPORTED_ENGINE",
+      "--engine is not supported. WFA routes commands by command family: cdp uses the native CDP path, broker uses the native broker path, and legacy ask, code, and compare use ask-bridge. The --engine option does not select or invoke an external engine."
+    );
   }
   if (Object.prototype.hasOwnProperty.call(options, "reasoning")
     || Object.prototype.hasOwnProperty.call(options, "reasoning-map")) {
