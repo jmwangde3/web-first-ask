@@ -40,6 +40,7 @@ function createEngineDeps({
     pageError: null,
   },
   conversationStore: store = conversationStore,
+  adapters = null,
   openUrls = [],
   closedTargets = [],
   evalResults = [],
@@ -77,6 +78,7 @@ function createEngineDeps({
 
   return {
     conversationStore: store,
+    ...(adapters ? { adapters } : {}),
     enforceCooldown: async () => {},
     recordLastTurn: async () => {},
     recoverBrowser: async () => ({
@@ -275,6 +277,12 @@ test("context invalidation marks the session; the next turn starts from the prov
       "invalid-thread",
       createEngineDeps({
         actualUrls: [CHATGPT_NEW_URL],
+        adapters: {
+          chatgpt: {
+            ...chatgptAdapter,
+            buildDeleteConversationJs: () => "/* menuitem mock delete */",
+          },
+        },
         openUrls: nextOpenUrls,
       })
     );
@@ -483,6 +491,12 @@ test("when conversation is invalidated and new session starts, old cloud session
     const deps = createEngineDeps({
       actualUrls: [CHATGPT_NEW_URL],
       evalResults: [{ success: true }],
+      adapters: {
+        chatgpt: {
+          ...chatgptAdapter,
+          buildDeleteConversationJs: () => "/* menuitem mock delete */",
+        },
+      },
       openUrls,
       closedTargets,
     });
@@ -515,6 +529,12 @@ test("cleanup failure does not affect turn completion status", async () => {
     const deps = createEngineDeps({
       actualUrls: [chatgptAdapter.url, CHATGPT_NEW_URL],
       evalResults: [{ success: false, reason: "menu_button_not_found" }],
+      adapters: {
+        chatgpt: {
+          ...chatgptAdapter,
+          buildDeleteConversationJs: () => "/* menuitem mock delete */",
+        },
+      },
       openUrls,
     });
 
