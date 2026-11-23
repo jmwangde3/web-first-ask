@@ -15,7 +15,7 @@ function buildEvidence(state, lastProgressAgoMs) {
 }
 
 export async function openTab(cdp, url, { timeoutMs = 60000 } = {}) {
-  const targetResult = await cdp.send("Target.createTarget", { url: "about:blank" }, undefined, {
+  const targetResult = await cdp.send("Target.createTarget", { url: "about:blank", background: true }, undefined, {
     timeoutMs,
   });
   if (!targetResult || !targetResult.targetId) {

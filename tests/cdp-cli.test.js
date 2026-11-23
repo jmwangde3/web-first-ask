@@ -113,7 +113,6 @@ test("runCdpTurn: full successful flow with SAFE_START, verifies driver.submitTu
     mode: "background",
     reused: false,
   });
-  assert.ok(cdpSentMethods.includes("Browser.setWindowBounds"), "background mode sets window bounds");
   assert.ok(cdpSentMethods.includes("Target.closeTarget"), "tab must be closed in finally");
 });
 
@@ -1077,6 +1076,9 @@ test("launch.js: the argument list contains --restore-last-session for backgroun
     // 1. Direct argument builder check
     const args = buildChromeArgs({ userDataDir: "/tmp/profile", mode });
     assert.ok(args.includes("--restore-last-session"), `args for ${mode} must include --restore-last-session`);
+    assert.ok(args.includes("--disable-background-timer-throttling"), `args for ${mode} must include --disable-background-timer-throttling`);
+    assert.ok(args.includes("--disable-backgrounding-occluded-windows"), `args for ${mode} must include --disable-backgrounding-occluded-windows`);
+    assert.ok(args.includes("--disable-renderer-backgrounding"), `args for ${mode} must include --disable-renderer-backgrounding`);
     const noFirstRunIdx = args.indexOf("--no-first-run");
     const restoreIdx = args.indexOf("--restore-last-session");
     assert.equal(restoreIdx, noFirstRunIdx + 1, "--restore-last-session must be placed next to --no-first-run");

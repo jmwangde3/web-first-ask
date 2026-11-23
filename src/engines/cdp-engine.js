@@ -183,28 +183,6 @@ export async function runCdpTurn({
         throw err;
       }
 
-      if (mode === "background") {
-        try {
-          const windowInfo = await cdp.send("Browser.getWindowForTarget", { targetId }).catch(() => null);
-          if (windowInfo && typeof windowInfo.windowId !== "undefined") {
-            await cdp.send("Browser.setWindowBounds", {
-              windowId: windowInfo.windowId,
-              bounds: { left: -2000, top: -2000, windowState: "normal" },
-            }).catch(() => {});
-          }
-        } catch {}
-      } else if (mode === "visible") {
-        try {
-          const windowInfo = await cdp.send("Browser.getWindowForTarget", { targetId }).catch(() => null);
-          if (windowInfo && typeof windowInfo.windowId !== "undefined") {
-            await cdp.send("Browser.setWindowBounds", {
-              windowId: windowInfo.windowId,
-              bounds: { left: 100, top: 100, windowState: "normal" },
-            }).catch(() => {});
-          }
-        } catch {}
-      }
-
       await driver.waitForEditor(cdp, sessionId, adapter, {
         timeoutMs: hardTimeoutMs,
         sleep: sleepFn,

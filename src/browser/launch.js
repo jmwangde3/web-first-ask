@@ -66,6 +66,9 @@ export function buildChromeArgs({ userDataDir, mode = "headless" } = {}) {
     "--restore-last-session",
     "--no-default-browser-check",
     "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
     // Cloudflare fingerprints the automation switch itself: both headless and a
     // plain headful launch land on the interstitial. Keep it in every mode.
     "--disable-blink-features=AutomationControlled",

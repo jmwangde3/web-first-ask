@@ -235,6 +235,17 @@ test("openTab and submitTurn: standard CDP protocol execution", async () => {
   assert.equal(tab.targetId, "target-123");
   assert.equal(tab.sessionId, "session-456");
 
+  const createTargetCall = calls.find((call) => call.method === "Target.createTarget");
+  assert.deepEqual(createTargetCall.params, { url: "about:blank", background: true });
+  assert.equal(createTargetCall.sessionId, undefined);
+  assert.equal(calls.some((call) => call.method === "Target.activateTarget"), false);
+
+  for (const method of ["Page.enable", "Runtime.enable", "Page.navigate"]) {
+    const call = calls.find((entry) => entry.method === method);
+    assert.ok(call, `${method} must be sent for the new target`);
+    assert.equal(call.sessionId, tab.sessionId, `${method} must be scoped to the target session`);
+  }
+
   const legacyAdapter = { id: "legacy" };
   const submitRes = await submitTurn(mockCdp, tab.sessionId, legacyAdapter);
   assert.ok(typeof submitRes.submittedAt === "number");
