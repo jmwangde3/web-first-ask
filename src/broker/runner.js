@@ -235,10 +235,6 @@ export function createCdpRunner({
         ...(err?.sendCommittedAt != null ? { sendCommittedAt: err.sendCommittedAt } : {}),
       };
     } finally {
-      if (turnId) {
-        const journal = deps.journal || defaultJournal;
-        await journal.clearCommit(runnerHome, turnId).catch(() => {});
-      }
       if (signal) {
         try {
           signal.removeEventListener("abort", onAbort);

@@ -11,6 +11,8 @@ import {
   listOrphans,
   findCommitted,
 } from "../src/broker/journal.js";
+import { getResultsDir, readResult, recordResult } from "../src/broker/result-store.js";
+import { getRequestsDir, recordRequest } from "../src/broker/request-store.js";
 import { startBroker } from "../src/broker/server.js";
 import { createCdpRunner } from "../src/broker/runner.js";
 import { runCdpTurn } from "../src/engines/cdp-engine.js";
@@ -62,16 +64,13 @@ test("2. recordCommit then findCommitted matches; different provider or differen
     assert.equal(record.provider, "chatgpt");
     assert.equal(record.promptSha256, sha);
 
-    // Matching lookup
     const match = await findCommitted(tmp, { provider: "chatgpt", promptSha256: sha });
     assert.ok(match);
     assert.equal(match.turnId, "turn-123");
 
-    // Different provider -> null
     const diffProvider = await findCommitted(tmp, { provider: "gemini", promptSha256: sha });
     assert.equal(diffProvider, null);
 
-    // Different prompt -> null
     const diffPrompt = await findCommitted(tmp, { provider: "chatgpt", promptSha256: hashPrompt("other prompt") });
     assert.equal(diffPrompt, null);
   } finally {
@@ -114,10 +113,8 @@ test("4. Truncated JSON file in journal dir is skipped, not thrown", async () =>
     const journalDir = getJournalDir(tmp);
     await mkdir(journalDir, { recursive: true });
 
-    // Write a corrupted/truncated JSON file
     await writeFile(path.join(journalDir, "truncated.json"), '{"schema": 1, "turnId": "bad", ');
 
-    // Write a valid record
     await recordCommit(tmp, {
       turnId: "turn-valid",
       provider: "gemini",
@@ -132,16 +129,16 @@ test("4. Truncated JSON file in journal dir is skipped, not thrown", async () =>
   }
 });
 
-test("5. POST /turns with matching orphan -> 409 previously_submitted_uncertain and no runner call", async () => {
+test("5. POST /turns with same prompt and no requestId succeeds twice with distinct turnIds even if an orphan exists", async () => {
   const tmp = await tempHome();
   let runnerCalls = 0;
   let broker;
   try {
-    const orphanPrompt = "orphan prompt to test";
+    const promptText = "same prompt without requestId";
     await recordCommit(tmp, {
-      turnId: "turn-orphan-409",
+      turnId: "turn-orphan-legacy",
       provider: "chatgpt",
-      promptSha256: hashPrompt(orphanPrompt),
+      promptSha256: hashPrompt(promptText),
       submittedAt: "2026-11-23T09:00:00.000Z",
     });
 
@@ -149,7 +146,7 @@ test("5. POST /turns with matching orphan -> 409 previously_submitted_uncertain 
       chrome: { pid: process.pid, port: 9222 },
       run: async () => {
         runnerCalls++;
-        return { status: "completed", text: "ok" };
+        return { status: "completed", text: `ok-${runnerCalls}` };
       },
     };
 
@@ -158,25 +155,24 @@ test("5. POST /turns with matching orphan -> 409 previously_submitted_uncertain 
       runner: mockRunner,
     });
 
-    const res = await fetch(`http://127.0.0.1:${broker.port}/turns`, {
+    const res1 = await fetch(`http://127.0.0.1:${broker.port}/turns`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-wfa-token": broker.token,
-      },
-      body: JSON.stringify({
-        provider: "chatgpt",
-        prompt: orphanPrompt,
-      }),
+      headers: { "content-type": "application/json", "x-wfa-token": broker.token },
+      body: JSON.stringify({ provider: "chatgpt", prompt: promptText }),
+    });
+    const res2 = await fetch(`http://127.0.0.1:${broker.port}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-wfa-token": broker.token },
+      body: JSON.stringify({ provider: "chatgpt", prompt: promptText }),
     });
 
-    assert.equal(res.status, 409);
-    const body = await res.json();
-    assert.equal(body.error, "previously_submitted_uncertain");
-    assert.equal(body.orphan?.turnId, "turn-orphan-409");
-    assert.equal(body.orphan?.submittedAt, "2026-11-23T09:00:00.000Z");
-    assert.match(body.hint, /Inspect the provider tab before resending/);
-    assert.equal(runnerCalls, 0, "runner.run must not be called when an orphan matches");
+    assert.equal(res1.status, 202);
+    assert.equal(res2.status, 202);
+    const body1 = await res1.json();
+    const body2 = await res2.json();
+    assert.ok(body1.id);
+    assert.ok(body2.id);
+    assert.notEqual(body1.id, body2.id);
   } finally {
     if (broker) await broker.close();
     await rm(tmp, { recursive: true, force: true });
@@ -185,15 +181,11 @@ test("5. POST /turns with matching orphan -> 409 previously_submitted_uncertain 
 
 test("6. POST /turns with clean journal -> 202", async () => {
   const tmp = await tempHome();
-  let runnerCalls = 0;
   let broker;
   try {
     const mockRunner = {
       chrome: { pid: process.pid, port: 9222 },
-      run: async () => {
-        runnerCalls++;
-        return { status: "completed", text: "ok" };
-      },
+      run: async () => ({ status: "completed", text: "ok" }),
     };
 
     broker = await startBroker({
@@ -223,8 +215,9 @@ test("6. POST /turns with clean journal -> 202", async () => {
   }
 });
 
-test("7. Completed turn leaves no journal file", async () => {
+test("7. Completed turn persists result before clearing journal; failed result write preserves orphan journal", async () => {
   const tmp = await tempHome();
+  let broker;
   try {
     const runner = createCdpRunner({
       home: tmp,
@@ -235,21 +228,99 @@ test("7. Completed turn leaves no journal file", async () => {
           if (deps?.onSendIntent) {
             await deps.onSendIntent({ provider: "chatgpt", prompt: "complete me" });
           }
-          const orphansMidTurn = await listOrphans(tmp);
-          assert.equal(orphansMidTurn.length, 1);
-          assert.equal(orphansMidTurn[0].turnId, "turn-complete-1");
           return { status: "completed", text: "all done" };
         },
       },
     });
 
-    const res = await runner.run({ id: "turn-complete-1", provider: "chatgpt", prompt: "complete me" });
-    assert.equal(res.status, "completed");
+    broker = await startBroker({
+      home: tmp,
+      mode: "tray",
+      runner,
+    });
 
-    const orphansAfter = await listOrphans(tmp);
-    assert.equal(orphansAfter.length, 0);
+    const created = await fetch(`http://127.0.0.1:${broker.port}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-wfa-token": broker.token },
+      body: JSON.stringify({ provider: "chatgpt", prompt: "complete me" }),
+    }).then((r) => r.json());
+
+    let done = null;
+    for (let i = 0; i < 100; i++) {
+      const turn = await fetch(`http://127.0.0.1:${broker.port}/turns/${created.id}`, {
+        headers: { "x-wfa-token": broker.token },
+      }).then((r) => r.json());
+      if (turn.state === "completed") {
+        done = turn;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(done);
+    assert.equal(done.text, "all done");
+
+    const stored = await readResult(tmp, created.id);
+    assert.ok(stored);
+    assert.equal(stored.text, "all done");
+    assert.equal((await listOrphans(tmp)).length, 0);
   } finally {
+    if (broker) await broker.close();
     await rm(tmp, { recursive: true, force: true });
+  }
+
+  // Verify journal is preserved if resultStore.recordResult fails
+  const tmpFail = await tempHome();
+  let brokerFail;
+  try {
+    const runnerFail = createCdpRunner({
+      home: tmpFail,
+      deps: {
+        recoverBrowser: async () => ({ action: "SAFE_START", chrome: { pid: process.pid, port: 9222 } }),
+        fetch: async () => ({ ok: true, status: 200 }),
+        runCdpTurn: async ({ deps }) => {
+          if (deps?.onSendIntent) {
+            await deps.onSendIntent({ provider: "chatgpt", prompt: "persist fail" });
+          }
+          return { status: "completed", text: "finished" };
+        },
+      },
+    });
+
+    brokerFail = await startBroker({
+      home: tmpFail,
+      mode: "tray",
+      runner: runnerFail,
+      deps: {
+        resultStore: {
+          readResults: async () => [],
+          recordResult: async () => {
+            throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+          },
+          pruneResults: async () => 0,
+        },
+      },
+    });
+
+    const created = await fetch(`http://127.0.0.1:${brokerFail.port}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-wfa-token": brokerFail.token },
+      body: JSON.stringify({ provider: "chatgpt", prompt: "persist fail" }),
+    }).then((r) => r.json());
+
+    for (let i = 0; i < 100; i++) {
+      const turn = await fetch(`http://127.0.0.1:${brokerFail.port}/turns/${created.id}`, {
+        headers: { "x-wfa-token": brokerFail.token },
+      }).then((r) => r.json());
+      if (turn.state === "completed") break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const orphansAfter = await listOrphans(tmpFail);
+    assert.equal(orphansAfter.length, 1);
+    assert.equal(orphansAfter[0].turnId, created.id);
+  } finally {
+    if (brokerFail) await brokerFail.close();
+    await rm(tmpFail, { recursive: true, force: true });
   }
 });
 
@@ -350,6 +421,38 @@ test("10. wfa broker clear-orphan <turnId> clears entry and prints what it remov
     });
     assert.equal(res2.code, 1);
     assert.match(stderr2.output, /NOT_FOUND/);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("11. listOrphans ignores results/ and requests/ subdirectories", async () => {
+  const tmp = await tempHome();
+  try {
+    await recordResult(tmp, {
+      id: "turn-res-1",
+      provider: "chatgpt",
+      prompt: "secret full prompt should not be stored",
+      state: "completed",
+      text: "done",
+      createdAt: "2026-11-23T00:00:00.000Z",
+      finishedAt: "2026-11-23T00:00:05.000Z",
+    });
+    await recordRequest(tmp, {
+      requestId: "req-1",
+      requestHash: "hash-1",
+      turnId: "turn-res-1",
+    });
+
+    assert.ok(getResultsDir(tmp).endsWith(path.join("turns", "results")));
+    assert.ok(getRequestsDir(tmp).endsWith(path.join("turns", "requests")));
+
+    const orphans = await listOrphans(tmp);
+    assert.deepEqual(orphans, []);
+
+    const stored = await readResult(tmp, "turn-res-1");
+    assert.ok(stored);
+    assert.equal(Object.hasOwn(stored, "prompt"), false);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

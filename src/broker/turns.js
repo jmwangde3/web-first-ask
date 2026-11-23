@@ -27,6 +27,7 @@ export function createTurn({
   prompt,
   conversationId = null,
   mode = "background",
+  requestId = null,
   settleMs = null,
   stallTimeoutMs = null,
   hardTimeoutMs = null,
@@ -39,6 +40,7 @@ export function createTurn({
       typeof prompt !== "string" || !prompt.trim() ||
       (conversationId !== null && (typeof conversationId !== "string" || !conversationId.trim())) ||
       typeof mode !== "string" || !mode.trim() ||
+      (requestId !== null && (typeof requestId !== "string" || !requestId.trim())) ||
       (settleMs !== null && (!Number.isFinite(settleMs) || settleMs < 0)) ||
       (stallTimeoutMs !== null && (!Number.isFinite(stallTimeoutMs) || stallTimeoutMs <= 0)) ||
       (hardTimeoutMs !== null && (!Number.isFinite(hardTimeoutMs) || hardTimeoutMs <= 0)) ||
@@ -48,7 +50,7 @@ export function createTurn({
     throw invalid("Invalid turn arguments");
   }
   return {
-    id, provider, prompt, conversationId, mode,
+    id, provider, prompt, conversationId, mode, requestId,
     settleMs, stallTimeoutMs, hardTimeoutMs, minIntervalMs, chromePath,
     createdAt,
     state: "queued", startedAt: null, finishedAt: null,
@@ -69,7 +71,7 @@ export function transition(turn, to, patch = {}) {
     throw invalid("Invalid transition patch");
   }
   const { id: _id, state: _state, provider: _provider, prompt: _prompt,
-    conversationId: _conversationId, ...fields } = patch;
+    conversationId: _conversationId, requestId: _requestId, ...fields } = patch;
   return { ...turn, ...fields, state: to };
 }
 
@@ -79,5 +81,8 @@ export function isSendCommitted(turn) {
 
 export function publicView(turn) {
   const { prompt, ...rest } = turn;
-  return { ...rest, promptPreview: Array.from(prompt).slice(0, 120).join("") };
+  const promptPreview = typeof prompt === "string"
+    ? Array.from(prompt).slice(0, 120).join("")
+    : (typeof turn.promptPreview === "string" ? turn.promptPreview : "");
+  return { ...rest, promptPreview };
 }

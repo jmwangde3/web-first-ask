@@ -67,7 +67,6 @@ test("3. stop success -> prints broker stopping; unreachable -> code 1 and no br
 
   const mockRecord = { host: "127.0.0.1", port: 5050, token: "test-token" };
 
-  // Success path
   let shutdownCalled = false;
   const resSuccess = await runBrokerCommand(["stop"], {
     stdout,
@@ -84,7 +83,6 @@ test("3. stop success -> prints broker stopping; unreachable -> code 1 and no br
   assert.equal(shutdownCalled, true);
   assert.equal(stdout.output, "broker stopping\n");
 
-  // Unreachable path
   stdout.clear();
   stderr.clear();
   let clearBrokerCalled = false;
@@ -124,7 +122,6 @@ test("5. wait returns the terminal text, and needs_human exits 1", async () => {
   const stderr = createMockStream();
   const mockRecord = { host: "127.0.0.1", port: 5050, token: "test-token" };
 
-  // Success path: completed
   const resCompleted = await runBrokerCommand(["wait", "turn-1"], {
     stdout,
     stderr,
@@ -137,7 +134,6 @@ test("5. wait returns the terminal text, and needs_human exits 1", async () => {
   assert.equal(resCompleted.code, 0);
   assert.equal(stdout.output, "Answer text\n");
 
-  // Failure path: needs_human
   stdout.clear();
   stderr.clear();
   const resNeedsHuman = await runBrokerCommand(["wait", "turn-2"], {
@@ -252,6 +248,8 @@ test("9. ask without --wait returns turn ID and exit 0", async () => {
   assert.equal(stdout.output, "turn turn-abc\n");
   assert.equal(createdPayload.provider, "chatgpt");
   assert.equal(createdPayload.prompt, "Hello world");
+  assert.equal(typeof createdPayload.requestId, "string");
+  assert.ok(createdPayload.requestId.length > 0);
 });
 
 test("10. ask without --wait and --json returns json object and exit 0", async () => {
@@ -326,19 +324,16 @@ test("13. ask missing provider or prompt returns exit 2 with INVALID_ARGUMENT", 
   const stdout = createMockStream();
   const stderr = createMockStream();
 
-  // Missing provider
   const res1 = await runBrokerCommand(["ask", "--prompt", "Hello"], { stdout, stderr });
   assert.equal(res1.code, 2);
   assert.match(stderr.output, /INVALID_ARGUMENT/);
 
-  // Invalid provider
   stdout.clear();
   stderr.clear();
   const res2 = await runBrokerCommand(["ask", "--provider", "invalid", "--prompt", "Hello"], { stdout, stderr });
   assert.equal(res2.code, 2);
   assert.match(stderr.output, /INVALID_ARGUMENT/);
 
-  // Missing prompt
   stdout.clear();
   stderr.clear();
   const res3 = await runBrokerCommand(["ask", "--provider", "chatgpt"], {
@@ -349,7 +344,6 @@ test("13. ask missing provider or prompt returns exit 2 with INVALID_ARGUMENT", 
   assert.equal(res3.code, 2);
   assert.match(stderr.output, /INVALID_ARGUMENT/);
 
-  // Invalid mode
   stdout.clear();
   stderr.clear();
   const res4 = await runBrokerCommand(["ask", "--provider", "chatgpt", "--prompt", "Hi", "--mode", "bad"], { stdout, stderr });
@@ -519,4 +513,51 @@ test("20. ask with HTTP 409 and --json prints structured JSON to stdout and exit
   assert.equal(parsed.orphan?.turnId, "turn-orphan-409");
   assert.match(parsed.hint, /Inspect the provider tab before resending/);
   assert.equal(stderr.output, "");
+});
+
+test("21. ask forwards explicit --request-id and wait recovers after broker port change", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  const oldRecord = { host: "127.0.0.1", port: 5050, token: "old-tok" };
+  const newRecord = { host: "127.0.0.1", port: 5051, token: "new-tok" };
+
+  let capturedPayload = null;
+  const resAsk = await runBrokerCommand(
+    ["ask", "--provider", "chatgpt", "--prompt", "Hi", "--request-id", "explicit-req-42"],
+    {
+      stdout,
+      stderr,
+      ensureBroker: async () => oldRecord,
+      createTurn: async (_rec, payload) => {
+        capturedPayload = payload;
+        return { status: 202, json: { id: "turn-req-42", state: "accepted" } };
+      },
+    },
+  );
+  assert.equal(resAsk.code, 0);
+  assert.equal(capturedPayload.requestId, "explicit-req-42");
+
+  stdout.clear();
+  stderr.clear();
+  let discoverCount = 0;
+  let getCalls = 0;
+  const resWait = await runBrokerCommand(["wait", "turn-req-42"], {
+    stdout,
+    stderr,
+    discoverBroker: async () => {
+      discoverCount++;
+      return discoverCount === 1 ? oldRecord : newRecord;
+    },
+    getTurn: async (rec, id) => {
+      getCalls++;
+      if (getCalls === 1) {
+        throw Object.assign(new Error("conn refused"), { code: "BROKER_UNREACHABLE" });
+      }
+      assert.equal(rec.port, 5051);
+      return { status: 200, json: { id, state: "completed", text: "recovered text" } };
+    },
+    sleep: async () => {},
+  });
+  assert.equal(resWait.code, 0);
+  assert.equal(stdout.output, "recovered text\n");
 });

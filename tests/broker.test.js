@@ -9,7 +9,7 @@ import { createScheduler, schedule, release, snapshot } from "../src/broker/queu
 import { acquireInstanceLock, clearBrokerRecord, getBrokerPaths, isInstanceAlive,
   readBrokerRecord, writeBrokerRecord } from "../src/broker/lifecycle.js";
 import { startBroker } from "../src/broker/server.js";
-import { discoverBroker, ensureBroker, request, createTurn as remoteCreateTurn, getTurn } from "../src/broker/client.js";
+import { discoverBroker, ensureBroker, request, createTurn as remoteCreateTurn, getTurn, waitForTurn } from "../src/broker/client.js";
 
 const tempHome = () => mkdtemp(path.join(os.tmpdir(), "wfa-broker-test-"));
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -36,6 +36,7 @@ test("createTurn defaults and publicView do not expose the full prompt", () => {
   assert.equal(turn.state, "queued");
   assert.equal(turn.mode, "background");
   assert.equal(turn.conversationId, null);
+  assert.equal(turn.requestId, null);
   assert.ok(turn.id);
   const publicTurn = publicView(turn);
   assert.equal(Object.hasOwn(publicTurn, "prompt"), false);
@@ -45,6 +46,8 @@ test("createTurn defaults and publicView do not expose the full prompt", () => {
   assert.equal(isSendCommitted({ sendCommittedAt: "now" }), true);
   assert.deepEqual(TERMINAL_STATES, ["completed", "failed", "stalled"]);
   assert.throws(() => createTurn({ provider: "chatgpt", prompt: " " }), { code: "INVALID_ARGUMENT" });
+  assert.throws(() => createTurn({ provider: "chatgpt", prompt: "ok", requestId: "  " }), { code: "INVALID_ARGUMENT" });
+  assert.throws(() => createTurn({ provider: "chatgpt", prompt: "ok", requestId: 123 }), { code: "INVALID_ARGUMENT" });
 });
 
 test("strict transition table and immutability", () => {
@@ -411,4 +414,199 @@ test("isInstanceAlive retries once after single fetch timeout and returns true",
   };
   assert.equal(await isInstanceAlive(record), true);
   assert.equal(hits, 2);
+});
+
+test("requestId idempotency: same fingerprint replays same turnId; different fingerprint returns 409", async t => {
+  const home = await tempHome();
+  let runs = 0;
+  const server = await startBroker({
+    home,
+    mode: "tray",
+    runner: {
+      run: async (turn) => {
+        runs++;
+        return { status: "completed", text: `ok:${turn.prompt}` };
+      },
+      cancel() {},
+    },
+  });
+  t.after(async () => { await server.close(); await rm(home, { recursive: true, force: true }); });
+
+  const record = await discoverBroker(home);
+  const first = await remoteCreateTurn(record, { provider: "chatgpt", prompt: "idempotent", requestId: "req-idem-1" });
+  assert.equal(first.status, 202);
+
+  await eventually(async () => (await getTurn(record, first.json.id)).json.state === "completed");
+
+  const replay = await remoteCreateTurn(record, { provider: "chatgpt", prompt: "idempotent", requestId: "req-idem-1" });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.json.id, first.json.id);
+  assert.equal(replay.json.state, "completed");
+  assert.equal(runs, 1);
+
+  const conflict = await remoteCreateTurn(record, { provider: "chatgpt", prompt: "different prompt", requestId: "req-idem-1" });
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.json.code, "REQUEST_ID_CONFLICT");
+  assert.equal(runs, 1);
+});
+
+test("completed turn survives broker restart via GET /turns/:id and requestId replay", async t => {
+  const home = await tempHome();
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const server1 = await startBroker({
+    home,
+    mode: "tray",
+    runner: {
+      run: async () => ({ status: "completed", text: "persisted answer" }),
+      cancel() {},
+    },
+  });
+  const record1 = await discoverBroker(home);
+  const created = await remoteCreateTurn(record1, {
+    provider: "gemini",
+    prompt: "persist across restart",
+    requestId: "req-persist-1",
+  });
+  assert.equal(created.status, 202);
+  await eventually(async () => (await getTurn(record1, created.json.id)).json.state === "completed");
+  await server1.close();
+
+  let runsAfterRestart = 0;
+  const server2 = await startBroker({
+    home,
+    mode: "tray",
+    runner: {
+      run: async () => {
+        runsAfterRestart++;
+        return { status: "completed", text: "should not re-run" };
+      },
+      cancel() {},
+    },
+  });
+  t.after(() => server2.close());
+  const record2 = await discoverBroker(home);
+
+  const fetched = await getTurn(record2, created.json.id);
+  assert.equal(fetched.status, 200);
+  assert.equal(fetched.json.state, "completed");
+  assert.equal(fetched.json.text, "persisted answer");
+  assert.equal(Object.hasOwn(fetched.json, "prompt"), false);
+
+  const replay = await remoteCreateTurn(record2, {
+    provider: "gemini",
+    prompt: "persist across restart",
+    requestId: "req-persist-1",
+  });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.json.id, created.json.id);
+  assert.equal(runsAfterRestart, 0);
+});
+
+test("client waitForTurn backs off on transient errors and re-discovers broker port without resending", async () => {
+  const record1 = { host: "127.0.0.1", port: 41001, token: "t1" };
+  const record2 = { host: "127.0.0.1", port: 41002, token: "t2" };
+  const calls = [];
+  const sleeps = [];
+  let nowMs = 0;
+  let discoverCalls = 0;
+
+  const turn = await waitForTurn({
+    record: record1,
+    turnId: "turn-reconnect-1",
+    home: "/tmp/fake-home",
+    timeoutMs: 30000,
+    deps: {
+      now: () => nowMs,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        nowMs += ms;
+      },
+      discoverBroker: async () => {
+        discoverCalls++;
+        return discoverCalls >= 2 ? record2 : null;
+      },
+      getTurn: async (rec, id) => {
+        calls.push({ port: rec.port, id });
+        if (calls.length === 1) {
+          throw Object.assign(new Error("timeout"), { code: "BROKER_TIMEOUT" });
+        }
+        if (calls.length === 2) {
+          throw Object.assign(new Error("unreachable"), { code: "BROKER_UNREACHABLE" });
+        }
+        if (rec.port === 41002) {
+          return { status: 200, json: { id, state: "completed", text: "reconnected!" } };
+        }
+        return { status: 200, json: { id, state: "running" } };
+      },
+    },
+  });
+
+  assert.equal(turn.state, "completed");
+  assert.equal(turn.text, "reconnected!");
+  assert.deepEqual(calls, [
+    { port: 41001, id: "turn-reconnect-1" },
+    { port: 41001, id: "turn-reconnect-1" },
+    { port: 41002, id: "turn-reconnect-1" },
+  ]);
+  assert.deepEqual(sleeps, [500, 1000]);
+
+  // Exceeding reconnect window throws BROKER_UNREACHABLE with turnId
+  let now2 = 0;
+  await assert.rejects(
+    () => waitForTurn({
+      record: record1,
+      turnId: "turn-lost-99",
+      timeoutMs: 2000,
+      deps: {
+        now: () => now2,
+        sleep: async (ms) => { now2 += ms; },
+        discoverBroker: async () => null,
+        getTurn: async () => {
+          throw Object.assign(new Error("unreachable"), { code: "BROKER_UNREACHABLE" });
+        },
+      },
+    }),
+    (err) => err?.code === "BROKER_UNREACHABLE" && err.message.includes("turn-lost-99"),
+  );
+});
+
+test("8 concurrent different turns complete without cross-talk", async t => {
+  const home = await tempHome();
+  const server = await startBroker({
+    home,
+    mode: "tray",
+    runner: {
+      run: async (turn) => {
+        await delay(20);
+        return { status: "completed", text: `reply:${turn.provider}:${turn.prompt}` };
+      },
+      cancel() {},
+    },
+  });
+  t.after(async () => { await server.close(); await rm(home, { recursive: true, force: true }); });
+  const record = await discoverBroker(home);
+
+  const specs = Array.from({ length: 8 }, (_, idx) => ({
+    provider: idx % 2 === 0 ? "chatgpt" : "gemini",
+    prompt: `concurrent-prompt-${idx}`,
+    conversationId: `conv-${idx}`,
+    requestId: `req-conc-${idx}`,
+  }));
+
+  const createdList = await Promise.all(specs.map((s) => remoteCreateTurn(record, s)));
+  for (const res of createdList) {
+    assert.equal(res.status, 202);
+  }
+  const ids = createdList.map((r) => r.json.id);
+  assert.equal(new Set(ids).size, 8);
+
+  const results = await Promise.all(
+    ids.map((id) => waitForTurn({ record, turnId: id, home, timeoutMs: 10000, pollIntervalMs: 20 }))
+  );
+
+  for (let i = 0; i < specs.length; i++) {
+    assert.equal(results[i].state, "completed");
+    assert.equal(results[i].text, `reply:${specs[i].provider}:${specs[i].prompt}`);
+  }
 });

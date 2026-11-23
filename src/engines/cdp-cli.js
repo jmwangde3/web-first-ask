@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { getHomeDir } from "../paths.js";
@@ -27,6 +28,7 @@ const VALUE_FLAGS = new Set([
   "chrome-path",
   "min-interval",
   "conversation-id",
+  "request-id",
 ]);
 
 function parseArgs(argv) {
@@ -81,7 +83,7 @@ function printCdpHelp(stdout = process.stdout) {
 
 Commands:
   wfa cdp ask    --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
-                 [--mode background|visible|headless] [--conversation-id <id>] [--json]
+                 [--mode background|visible|headless] [--conversation-id <id>] [--request-id <id>] [--json]
                  [--timeout <s>] [--settle <ms>] [--min-interval <ms>]
   wfa cdp status [--json]
   wfa cdp login  [--provider <chatgpt|gemini>] [--mode visible|background]
@@ -93,6 +95,7 @@ Options:
   --prompt-file <path>       Path to prompt file
   --mode <mode>              background (default for ask, visible for login), visible, or headless
   --conversation-id <id>     Optional conversation ID to serialize same-session turns
+  --request-id <id>          Optional idempotency key (auto-generated UUID if omitted)
   --json                     Output machine-readable JSON
   --timeout <seconds>        Overall / stall timeout in seconds
   --settle <ms>              Answer stabilization window in milliseconds (default: 4000)
@@ -483,6 +486,16 @@ async function handleAsk(argv, deps) {
     }
   }
 
+  let requestId;
+  if (options["request-id"] !== undefined) {
+    requestId = String(options["request-id"]).trim();
+    if (!requestId) {
+      throw new WfaError("INVALID_ARGUMENT", "Option --request-id must be a non-empty string.");
+    }
+  } else {
+    requestId = deps.requestId || randomUUID();
+  }
+
   const startTime = Date.now();
   const ensureFn = deps.ensureBroker || ensureBroker;
   const spawnFn = deps.spawnBroker || (() => spawnDetachedBroker({ home, mode, deps, stdout }));
@@ -493,6 +506,7 @@ async function handleAsk(argv, deps) {
     provider,
     prompt,
     mode,
+    requestId,
     settleMs,
     stallTimeoutMs,
     hardTimeoutMs,
@@ -505,13 +519,15 @@ async function handleAsk(argv, deps) {
   if (turnRes?.status >= 400) {
     if (options.json) {
       stdout.write(`${JSON.stringify({
-        error: created?.error || "BROKER_ERROR",
+        error: created?.error || created?.code || "BROKER_ERROR",
         status: turnRes.status,
         ...(created?.orphan ? { orphan: created.orphan } : {}),
         ...(created?.hint ? { hint: created.hint } : {}),
+        ...(created?.requestId ? { requestId: created.requestId } : {}),
+        ...(created?.turnId ? { turnId: created.turnId } : {}),
       }, null, 2)}\n`);
     } else {
-      const code = String(created?.error || "BROKER_ERROR").toUpperCase();
+      const code = String(created?.error || created?.code || "BROKER_ERROR").toUpperCase();
       const hint = typeof created?.hint === "string" ? created.hint.trim() : "";
       const detail = [`HTTP ${turnRes.status}`, hint].filter(Boolean).join("; ");
       stderr.write(`wfa: ${code}: ${detail}\n`);
@@ -538,6 +554,7 @@ async function handleAsk(argv, deps) {
   const turn = await waitFn({
     record,
     turnId,
+    home,
     timeoutMs: hardTimeoutMs,
     onProgress,
     deps,

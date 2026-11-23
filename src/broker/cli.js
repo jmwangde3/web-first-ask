@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { openSync, closeSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -6,11 +7,18 @@ import { getHomeDir } from "../paths.js";
 import { WfaError } from "../errors.js";
 import { startBroker } from "./server.js";
 import { createCdpRunner } from "./runner.js";
-import { discoverBroker, ensureBroker, createTurn, getStatus, getTurn, request } from "./client.js";
+import {
+  discoverBroker,
+  ensureBroker,
+  createTurn,
+  getStatus,
+  request,
+  waitForTurn as clientWaitForTurn,
+} from "./client.js";
 import { TURN_STATES } from "./turns.js";
 import * as defaultJournal from "./journal.js";
 
-const VALUE_FLAGS = new Set(["mode", "state", "timeout", "provider", "prompt", "prompt-file"]);
+const VALUE_FLAGS = new Set(["mode", "state", "timeout", "provider", "prompt", "prompt-file", "request-id"]);
 
 function parseArgs(argv) {
   const positional = [];
@@ -51,7 +59,7 @@ Commands:
   wfa broker stop [--json]
   wfa broker wait <id> [--timeout <s>] [--json]
   wfa broker ask --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
-                 [--mode <background|visible|headless>] [--wait] [--timeout <s>] [--json]
+                 [--mode <background|visible|headless>] [--request-id <id>] [--wait] [--timeout <s>] [--json]
 
 Options:
   --mode <mode>           Runner browser mode: background (default), visible, or headless
@@ -62,6 +70,7 @@ Options:
   --provider <provider>   Provider: chatgpt or gemini
   --prompt <text>         Prompt text to submit
   --prompt-file <path>    Path to prompt file
+  --request-id <id>       Optional idempotency key (auto-generated UUID if omitted)
   --wait                  Wait for turn completion
   --help, -h              Show this help message
 `);
@@ -392,50 +401,52 @@ async function resolvePrompt(options, positional = [], deps = {}) {
   return "";
 }
 
-async function waitForTurn({ record, turnId, timeoutSec = 600, json = false, stdout = process.stdout, stderr = process.stderr, deps = {} }) {
-  const getTurnFn = deps.getTurn || getTurn;
-  const sleepFn = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
-  const nowFn = deps.now || (() => Date.now());
-  const deadline = nowFn() + timeoutSec * 1000;
-
-  while (nowFn() < deadline) {
-    try {
-      const res = await getTurnFn(record, turnId);
-      const turn = res?.json;
-      if (turn) {
-        const state = turn.state;
-        const isTerminal = ["completed", "failed", "stalled"].includes(state);
-        const isActionRequired = ["needs_human", "takeover"].includes(state);
-
-        if (isTerminal || isActionRequired) {
-          if (state === "completed") {
-            if (json) {
-              stdout.write(`${JSON.stringify(turn, null, 2)}\n`);
-            } else {
-              const text = turn.text || "";
-              stdout.write(`${text}${text.endsWith("\n") ? "" : "\n"}`);
-            }
-            return { code: 0, turn };
-          }
-          if (json) {
-            stdout.write(`${JSON.stringify(turn, null, 2)}\n`);
-          } else {
-            const warning = turn.sendCommittedAt ? " (prompt was already sent; do not resend)" : "";
-            stderr.write(`[broker] turn ${turnId} ended with state=${state} reason=${turn.reason || ""}${warning}\n`);
-          }
-          return { code: 1, turn };
-        }
-      }
-    } catch (err) {
-      if (err?.code === "BROKER_TIMEOUT" || err?.code === "BROKER_UNREACHABLE") {
-        throw err;
-      }
+async function waitForTurn({
+  record,
+  turnId,
+  home,
+  timeoutSec = 600,
+  json = false,
+  stdout = process.stdout,
+  stderr = process.stderr,
+  deps = {},
+}) {
+  const waitFn = deps.waitForTurn || clientWaitForTurn;
+  let turn;
+  try {
+    turn = await waitFn({
+      record,
+      turnId,
+      home,
+      timeoutMs: timeoutSec * 1000,
+      deps,
+    });
+  } catch (err) {
+    if (err?.code === "TIMEOUT") {
+      stderr.write(`wfa: TIMEOUT: Turn ${turnId} did not finish within ${timeoutSec}s\n`);
+      return { code: 1 };
     }
-    await sleepFn(1000);
+    throw err;
   }
 
-  stderr.write(`wfa: TIMEOUT: Turn ${turnId} did not finish within ${timeoutSec}s\n`);
-  return { code: 1 };
+  const state = turn.state;
+  if (state === "completed") {
+    if (json) {
+      stdout.write(`${JSON.stringify(turn, null, 2)}\n`);
+    } else {
+      const text = turn.text || "";
+      stdout.write(`${text}${text.endsWith("\n") ? "" : "\n"}`);
+    }
+    return { code: 0, turn };
+  }
+
+  if (json) {
+    stdout.write(`${JSON.stringify(turn, null, 2)}\n`);
+  } else {
+    const warning = turn.sendCommittedAt ? " (prompt was already sent; do not resend)" : "";
+    stderr.write(`[broker] turn ${turnId} ended with state=${state} reason=${turn.reason || ""}${warning}\n`);
+  }
+  return { code: 1, turn };
 }
 
 async function handleWait(argv, deps) {
@@ -475,6 +486,7 @@ async function handleWait(argv, deps) {
   return await waitForTurn({
     record,
     turnId,
+    home,
     timeoutSec,
     json: Boolean(options.json),
     stdout,
@@ -518,6 +530,17 @@ async function handleBrokerAsk(argv, deps) {
     }
   }
 
+  let requestId;
+  if (options["request-id"] !== undefined) {
+    requestId = String(options["request-id"]).trim();
+    if (!requestId) {
+      stderr.write("wfa: INVALID_ARGUMENT: Option --request-id must be a non-empty string.\n");
+      return { code: 2 };
+    }
+  } else {
+    requestId = deps.requestId || randomUUID();
+  }
+
   let prompt;
   try {
     prompt = await resolvePrompt(options, positional, deps);
@@ -559,6 +582,7 @@ async function handleBrokerAsk(argv, deps) {
     turnRes = await createTurnFn(record, {
       provider,
       prompt,
+      requestId,
       ...(mode ? { mode } : {}),
     });
   } catch (err) {
@@ -571,13 +595,15 @@ async function handleBrokerAsk(argv, deps) {
   if (turnRes?.status >= 400) {
     if (options.json) {
       stdout.write(`${JSON.stringify({
-        error: created?.error || "BROKER_ERROR",
+        error: created?.error || created?.code || "BROKER_ERROR",
         status: turnRes.status,
         ...(created?.orphan ? { orphan: created.orphan } : {}),
         ...(created?.hint ? { hint: created.hint } : {}),
+        ...(created?.requestId ? { requestId: created.requestId } : {}),
+        ...(created?.turnId ? { turnId: created.turnId } : {}),
       }, null, 2)}\n`);
     } else {
-      const code = String(created?.error || "BROKER_ERROR").toUpperCase();
+      const code = String(created?.error || created?.code || "BROKER_ERROR").toUpperCase();
       const hint = typeof created?.hint === "string" ? created.hint.trim() : "";
       const detail = [`HTTP ${turnRes.status}`, hint].filter(Boolean).join("; ");
       stderr.write(`wfa: ${code}: ${detail}\n`);
@@ -603,6 +629,7 @@ async function handleBrokerAsk(argv, deps) {
   return await waitForTurn({
     record,
     turnId,
+    home,
     timeoutSec,
     json: Boolean(options.json),
     stdout,

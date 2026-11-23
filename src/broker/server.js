@@ -1,9 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import http from "node:http";
 import { acquireInstanceLock, clearBrokerRecord, writeBrokerRecord } from "./lifecycle.js";
 import { createScheduler, release, schedule, snapshot } from "./queue.js";
 import { createTurn, publicView, TERMINAL_STATES, transition, TURN_STATES } from "./turns.js";
 import * as defaultJournal from "./journal.js";
+import * as defaultResultStore from "./result-store.js";
+import * as defaultRequestStore from "./request-store.js";
 
 function coded(code, message = code) {
   const error = new Error(message);
@@ -14,6 +16,49 @@ function coded(code, message = code) {
 function send(res, status, body) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   res.end(JSON.stringify(body));
+}
+
+function computeRequestHash(turn, promptSha256) {
+  return createHash("sha256")
+    .update(JSON.stringify([
+      turn.provider ?? null,
+      promptSha256,
+      turn.conversationId ?? null,
+      turn.mode ?? "background",
+      turn.settleMs ?? null,
+      turn.stallTimeoutMs ?? null,
+      turn.hardTimeoutMs ?? null,
+      turn.minIntervalMs ?? null,
+    ]))
+    .digest("hex");
+}
+
+function restoreTurnFromResult(record, fallbackCreatedAt) {
+  return {
+    id: record.turnId,
+    requestId: record.requestId ?? null,
+    provider: record.provider ?? null,
+    conversationId: record.conversationId ?? null,
+    conversationUrl: record.conversationUrl ?? null,
+    mode: "background",
+    settleMs: null,
+    stallTimeoutMs: null,
+    hardTimeoutMs: null,
+    minIntervalMs: null,
+    chromePath: null,
+    createdAt: record.createdAt ?? record.finishedAt ?? fallbackCreatedAt,
+    state: record.state,
+    startedAt: record.startedAt ?? null,
+    finishedAt: record.finishedAt ?? null,
+    cooldownWaitMs: null,
+    cooldownWaitAt: null,
+    sendCommittedAt: record.sendCommittedAt ?? null,
+    text: record.text ?? null,
+    reason: record.reason ?? null,
+    evidence: record.evidence ?? null,
+    promptPreview: record.promptPreview ?? "",
+    downloads: record.downloads ?? null,
+  };
 }
 
 async function parseBody(req) {
@@ -44,11 +89,14 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   if (!lock) throw coded("BROKER_LOCKED", "Another broker owns the instance lock");
 
   const journal = deps?.journal || defaultJournal;
+  const resultStore = deps?.resultStore || defaultResultStore;
+  const requestStore = deps?.requestStore || defaultRequestStore;
   const instanceId = lock.instanceId;
   const token = randomUUID();
   const startedAt = new Date().toISOString();
   const scheduler = createScheduler({ maxPerProvider: 4, maxTotal: 8 });
   const turns = new Map();
+  const requests = new Map();
   const controllers = new Map();
   const active = new Map();
   let server;
@@ -75,7 +123,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     const current = turns.get(id);
     if (current?.state !== "running" || !patch || typeof patch !== "object" || Array.isArray(patch)) return;
     const { id: _id, state: _state, provider: _provider, prompt: _prompt,
-      conversationId: _conversationId, ...fields } = patch;
+      conversationId: _conversationId, requestId: _requestId, ...fields } = patch;
     turns.set(id, { ...current, ...fields });
   }
 
@@ -88,6 +136,22 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
       ...patch,
       ...((TERMINAL_STATES.includes(state)) ? { finishedAt: new Date().toISOString() } : {}),
     }));
+  }
+
+  async function persistTurnResult(turn) {
+    if (!turn || (!TERMINAL_STATES.includes(turn.state) &&
+        turn.state !== "needs_human" && turn.state !== "takeover")) {
+      return;
+    }
+    try {
+      await resultStore.recordResult(home, turn);
+    } catch (error) {
+      log("result_persist_failed", { turnId: turn.id, code: String(error?.code ?? "RESULT_WRITE_FAILED") });
+      return;
+    }
+    await journal.clearCommit(home, turn.id).catch((error) => {
+      log("journal_clear_failed", { turnId: turn.id, code: String(error?.code ?? "JOURNAL_CLEAR_FAILED") });
+    });
   }
 
   function runTurn(turn) {
@@ -110,13 +174,21 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
           evidence: result?.evidence ?? null,
           ...(result?.sendCommittedAt != null ? { sendCommittedAt: result.sendCommittedAt } : {}),
         });
+        const current = turns.get(turn.id);
+        if (current && current.state === "failed" && current.sendCommittedAt == null &&
+            result?.sendCommittedAt != null) {
+          turns.set(turn.id, { ...current, sendCommittedAt: result.sendCommittedAt });
+        }
       } catch (error) {
         finish(turn.id, "failed", { reason: String(error?.code ?? "runner_error") });
         log("runner_failed", { turnId: turn.id, code: String(error?.code ?? "runner_error") });
       } finally {
+        // Release the scheduler slot as soon as the runner settles, before the
+        // async result persistence, so /status never reports a stale runningTotal.
         release(scheduler, turn);
         controllers.delete(turn.id);
         active.delete(turn.id);
+        await persistTurnResult(turns.get(turn.id));
         if (!closing) drain();
         trackIdle();
       }
@@ -163,32 +235,61 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     }
     if (req.method === "POST" && pathname === "/turns") {
       const body = await parseBody(req);
-      const promptSha256 = journal.hashPrompt(body.prompt);
-      const orphan = await journal.findCommitted(home, { provider: body.provider, promptSha256 });
-      if (orphan) {
-        send(res, 409, {
-          error: "previously_submitted_uncertain",
-          orphan: { turnId: orphan.turnId, submittedAt: orphan.submittedAt },
-          hint: "This prompt was submitted by a broker that died before reporting a result. Inspect the provider tab before resending.",
-        });
-        return;
-      }
       const turn = createTurn({
         provider: body.provider,
         prompt: body.prompt,
         conversationId: body.conversationId,
         mode: body.mode,
+        ...(body.requestId !== undefined ? { requestId: body.requestId } : {}),
         ...(body.settleMs !== undefined ? { settleMs: body.settleMs } : {}),
         ...(body.stallTimeoutMs !== undefined ? { stallTimeoutMs: body.stallTimeoutMs } : {}),
         ...(body.hardTimeoutMs !== undefined ? { hardTimeoutMs: body.hardTimeoutMs } : {}),
         ...(body.minIntervalMs !== undefined ? { minIntervalMs: body.minIntervalMs } : {}),
         ...(body.chromePath !== undefined ? { chromePath: body.chromePath } : {}),
       });
+      if (turn.requestId !== null) {
+        const requestHash = computeRequestHash(turn, journal.hashPrompt(turn.prompt));
+        const existingReq = requests.get(turn.requestId);
+        if (existingReq) {
+          if (existingReq.requestHash !== requestHash) {
+            send(res, 409, {
+              code: "REQUEST_ID_CONFLICT",
+              error: "REQUEST_ID_CONFLICT",
+              requestId: turn.requestId,
+              turnId: existingReq.turnId,
+            });
+            return;
+          }
+          const existingTurn = turns.get(existingReq.turnId);
+          if (existingTurn) {
+            send(res, 200, publicView(existingTurn));
+            return;
+          }
+          send(res, 200, {
+            id: existingReq.turnId,
+            requestId: turn.requestId,
+            state: "failed",
+            reason: "turn_result_unavailable",
+          });
+          return;
+        }
+        const reqRecord = {
+          schema: 1,
+          requestId: turn.requestId,
+          requestHash,
+          turnId: turn.id,
+          createdAt: turn.createdAt,
+        };
+        requests.set(turn.requestId, reqRecord);
+        await requestStore.recordRequest(home, reqRecord).catch((error) => {
+          log("request_persist_failed", { requestId: turn.requestId, code: String(error?.code ?? "REQUEST_WRITE_FAILED") });
+        });
+      }
       turns.set(turn.id, turn);
       const decision = schedule(scheduler, turn);
       if (decision.accepted) runTurn(turn);
       trackIdle();
-      send(res, 202, { id: turn.id, state: turns.get(turn.id).state });
+      send(res, 202, { id: turn.id, state: turns.get(turn.id).state, ...(turn.requestId !== null ? { requestId: turn.requestId } : {}) });
       return;
     }
     if (req.method === "GET" && pathname === "/turns") {
@@ -220,6 +321,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
           }
           // Keep the lease until runner.run settles; otherwise Chrome could overlap.
         } else {
+          await persistTurnResult(cancelled);
           release(scheduler, turn);
           drain();
         }
@@ -281,10 +383,30 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   }
 
   try {
-    // The injected runner owns CDP. It may reuse recoverBrowser before executing turns.
+    const persistedResults = await resultStore.readResults(home).catch((error) => {
+      log("result_load_failed", { code: String(error?.code ?? "RESULT_LOAD_FAILED") });
+      return [];
+    });
+    for (const record of persistedResults) {
+      if (!record?.turnId || !TURN_STATES.includes(record.state)) continue;
+      turns.set(record.turnId, restoreTurnFromResult(record, startedAt));
+    }
+
+    const persistedRequests = await requestStore.readRequests(home).catch((error) => {
+      log("request_load_failed", { code: String(error?.code ?? "REQUEST_LOAD_FAILED") });
+      return [];
+    });
+    for (const reqRecord of persistedRequests) {
+      if (reqRecord?.requestId && reqRecord?.requestHash && reqRecord?.turnId) {
+        requests.set(reqRecord.requestId, reqRecord);
+      }
+    }
+
+    // The injected runner owns CDP recovery. Do NOT inject a real recoverBrowser
+    // here: that would override a runner's mocked recoverBrowser in tests and
+    // could launch a real Chrome against a temp profile (file locks / EBUSY).
     if (typeof runner.recover === "function") {
-      const { recoverBrowser } = await import("../browser/recovery.js");
-      await runner.recover({ home, recoverBrowser });
+      await runner.recover({ home });
     }
     server = http.createServer((req, res) => {
       void handle(req, res).catch(error => {
@@ -303,6 +425,10 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
       schema: 1, instanceId, pid: process.pid, host: "127.0.0.1", port,
       token, startedAt, mode, chrome: runner.chrome ?? null,
     });
+    void Promise.all([
+      typeof resultStore.pruneResults === "function" ? resultStore.pruneResults(home).catch(() => {}) : Promise.resolve(),
+      typeof requestStore.pruneRequests === "function" ? requestStore.pruneRequests(home).catch(() => {}) : Promise.resolve(),
+    ]);
     idleTimer = setInterval(() => {
       if (mode === "off" && !closing && !idleTriggered && idleSince !== null &&
           Date.now() - idleSince >= idleTimeoutMs) {

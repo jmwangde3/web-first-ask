@@ -195,6 +195,7 @@ export const cancelTurn = (record, id) => request(record, "POST", `/turns/${enco
 export async function waitForTurn({
   record,
   turnId,
+  home,
   timeoutMs = 900000,
   pollIntervalMs = 1000,
   onProgress,
@@ -206,24 +207,73 @@ export async function waitForTurn({
     throw coded("INVALID_ARGUMENT");
   }
   const getTurnFn = deps.getTurn || getTurn;
+  const discoverBrokerFn = deps.discoverBroker || discoverBroker;
   const sleepFn = deps.sleep || sleep;
   const nowFn = deps.now || (() => Date.now());
   const onProgressFn = onProgress || deps.onProgress;
+  const effectiveHome = home ?? deps.home;
   const deadline = nowFn() + timeoutMs;
 
+  let currentRecord = record;
+  let consecutiveFailures = 0;
+  let backoffMs = 500;
+  let lastConnError = null;
+
   while (nowFn() < deadline) {
-    const res = await getTurnFn(record, turnId);
-    const turn = res?.json;
-    if (turn && WAIT_DONE_STATES.has(turn.state)) {
-      return turn;
+    // After an UNREACHABLE error, re-discover before polling again: the old
+    // record's port is likely dead. Never re-submit the turn, only re-discover.
+    if (lastConnError?.code === "BROKER_UNREACHABLE") {
+      const reconnected = await discoverBrokerFn(effectiveHome).catch(() => null);
+      if (reconnected) currentRecord = reconnected;
     }
-    if (turn && typeof onProgressFn === "function") {
-      onProgressFn(turn);
+    try {
+      const res = await getTurnFn(currentRecord, turnId);
+      if (res?.status === 401) {
+        const refreshed = await discoverBrokerFn(effectiveHome).catch(() => null);
+        if (refreshed) {
+          currentRecord = refreshed;
+          continue;
+        }
+      }
+      consecutiveFailures = 0;
+      backoffMs = 500;
+      lastConnError = null;
+
+      const turn = res?.json;
+      if (turn && WAIT_DONE_STATES.has(turn.state)) {
+        return turn;
+      }
+      if (turn && typeof onProgressFn === "function") {
+        onProgressFn(turn);
+      }
+      const remaining = deadline - nowFn();
+      if (remaining <= 0) break;
+      await sleepFn(Math.min(pollIntervalMs, remaining));
+    } catch (error) {
+      if (error?.code !== "BROKER_TIMEOUT" && error?.code !== "BROKER_UNREACHABLE") {
+        throw error;
+      }
+      consecutiveFailures += 1;
+      lastConnError = error;
+
+      if (error.code === "BROKER_UNREACHABLE" || consecutiveFailures >= 2) {
+        const discovered = await discoverBrokerFn(effectiveHome).catch(() => null);
+        if (discovered) {
+          currentRecord = discovered;
+        }
+      }
+
+      const remaining = deadline - nowFn();
+      if (remaining <= 0) break;
+      await sleepFn(Math.min(backoffMs, remaining));
+      backoffMs = Math.min(5000, backoffMs * 2);
     }
-    const remaining = deadline - nowFn();
-    if (remaining <= 0) break;
-    await sleepFn(Math.min(pollIntervalMs, remaining));
   }
 
+  if (lastConnError) {
+    const err = coded("BROKER_UNREACHABLE", lastConnError);
+    err.message = `BROKER_UNREACHABLE: lost connection while waiting for turn ${turnId}`;
+    throw err;
+  }
   throw coded("TIMEOUT");
 }
