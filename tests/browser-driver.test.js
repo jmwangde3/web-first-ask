@@ -1099,17 +1099,19 @@ test("Login probe still treats 'sign in' / '登录' titles as not logged in yet"
 });
 
 test("Gemini adapter stopSelector and buildReadStateJs scoping contracts", () => {
-  assert.ok(geminiAdapter.stopSelector.includes('main button[aria-label="Stop response"]'));
+  // 真机核实（2026-11-24）：停止按钮在 <main> 之外，main 前缀会让 stopVisible 恒为 false。
+  assert.ok(geminiAdapter.stopSelector.includes('button[aria-label="Stop response"]'));
+  assert.equal(geminiAdapter.stopSelector.includes('main button[aria-label="Stop response"]'), false);
   assert.equal(/(^|,)\s*button\[aria-label\*="停止"\]/.test(geminiAdapter.stopSelector), false);
 
   const readStateCode = geminiAdapter.buildReadStateJs();
-  assert.ok(readStateCode.includes('main button[aria-label=\\"Stop response\\"]') || readStateCode.includes('main button[aria-label="Stop response"]'));
+  assert.ok(readStateCode.includes('button[aria-label=\\"Stop response\\"]') || readStateCode.includes('button[aria-label="Stop response"]'));
   assert.equal(/(^|,|["'`\s])button\[aria-label\*="停止"\]/.test(readStateCode), false);
 
-  assert.ok(chatgptAdapter.stopSelector.includes('main button[aria-label="Stop generating"]'));
-  assert.ok(chatgptAdapter.stopSelector.includes('main button[aria-label="停止生成"]'));
+  assert.ok(chatgptAdapter.stopSelector.includes('button[aria-label="停止"]'));
+  assert.equal(chatgptAdapter.stopSelector.includes('main button[aria-label="停止生成"]'), false);
   const chatgptReadCode = chatgptAdapter.buildReadStateJs();
-  assert.ok(chatgptReadCode.includes('main button[aria-label=\\"Stop generating\\"]') || chatgptReadCode.includes('main button[aria-label="Stop generating"]'));
+  assert.ok(chatgptReadCode.includes('button[aria-label=\\"停止\\"]') || chatgptReadCode.includes('button[aria-label="停止"]'));
 });
 
 function createMockGeminiDocForStop(elements = []) {
@@ -1145,6 +1147,12 @@ function createMockGeminiDocForStop(elements = []) {
               if (subLabel && el.ariaLabel?.includes(subLabel)) return el;
             }
           }
+          if (sel.startsWith("button[aria-label=") && !sel.includes("*=")) {
+            if (el.tagName === "BUTTON") {
+              const exactLabel = sel.match(/aria-label="([^"]+)"/)?.[1];
+              if (exactLabel && el.ariaLabel === exactLabel) return el;
+            }
+          }
           if (sel.startsWith("button[aria-label*=")) {
             if (el.tagName === "BUTTON") {
               const subLabel = sel.match(/aria-label\*="([^"]+)"/)?.[1];
@@ -1174,7 +1182,7 @@ test("Gemini state with sidebar button with 'More options for 停止生成测试
   assert.equal(state.stopVisible, false);
 });
 
-test("Gemini state with 'main button[aria-label=\"Stop response\"]' present: stopVisible true", () => {
+test("Gemini state with stop button present (真机：按钮不在 main 内): stopVisible true", () => {
   const mainStopBtn = {
     tagName: "BUTTON",
     parentTag: "main",
@@ -1636,8 +1644,11 @@ test("ChatGPT adapter: sendSelector matches single submit button in composer for
   assert.ok(typeof res.submittedAt === "number");
 });
 
-test("Gemini adapter: sendSelector matches single native button inside gem-icon-button", async () => {
-  assert.equal(geminiAdapter.sendSelector, "gem-icon-button.send-button.submit button");
+test("Gemini adapter: sendSelector targets the aria-labelled send button", async () => {
+  // 真机核实（2026-11-24）：改版后发送按钮为 aria-label="Send message"，旧的 gem-icon-button 已失效。
+  assert.ok(geminiAdapter.sendSelector.includes('button[aria-label="Send message"]'));
+  assert.ok(geminiAdapter.sendSelector.includes('button[aria-label="发送消息"]'));
+  assert.equal(geminiAdapter.sendSelector.includes("gem-icon-button"), false);
 
   let clickTriggered = false;
   const mockCdp = {

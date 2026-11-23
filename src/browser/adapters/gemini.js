@@ -2,17 +2,21 @@ export const id = "gemini";
 export const url = "https://gemini.google.com/app";
 export const editorSelector = 'rich-textarea div[contenteditable="true"], div.ql-editor[contenteditable="true"]';
 export const stopSelector = [
-  'main button[aria-label="Stop response"]',
-  'main button[aria-label="停止回答"]',
-  'main button[aria-label="Stop generating"]',
-  'main button[aria-label="停止生成"]',
-  'main button[aria-label="Stop"]',
-  'main button[aria-label="停止"]',
+  // 真机核实（2026-11-24）：生成中的停止按钮不在 <main> 内，
+  // 旧选择器的 main 前缀导致 stopVisible 恒为 false，长回答被提前判定完成。
+  'button[aria-label="Stop response"]',
+  'button[aria-label="停止回答"]',
+  'button[aria-label="Stop generating"]',
+  'button[aria-label="停止生成"]',
+  'button[aria-label="Stop"]',
+  'button[aria-label="停止"]',
   'conversation-container button[aria-label*="Stop"]',
   'conversation-container button[aria-label*="停止"]',
   '.stop-button',
 ].join(', ');
-export const sendSelector = 'gem-icon-button.send-button.submit button';
+// 真机核实（2026-11-24）：Gemini 改版后发送按钮为 aria-label="Send message"（中文 UI 为「发送消息」），
+// 旧的 gem-icon-button.send-button.submit 已不存在，导致点击不生效、send_unconfirmed。
+export const sendSelector = 'button[aria-label="Send message"], button[aria-label="发送消息"]';
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证|sign in|log in|登录/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
@@ -146,8 +150,91 @@ export function buildReadStateJs() {
 })()`;
 }
 
-export function buildDeleteConversationJs() {
-  // 真机未验证：当前选择器可能命中侧边栏其它会话的菜单，存在误删风险。
-  // 在逐家真机确认菜单/确认流程前，一律拒绝执行删除。
-  return `(() => ({ success: false, reason: "delete_flow_unverified" }))()`;
+export function buildDeleteConversationJs(targetUrl) {
+  // 三方审核加固（2026-11-24）：
+  // 1) 目标绑定：脚本入参 targetUrl，location.pathname 不匹配则拒绝执行。
+  // 2) 入口唯一性：精确 aria 且必须恰好一个可见；模糊回退排除导航容器且必须唯一。
+  // 3) 菜单项限定在打开的菜单容器内并过滤可见性。
+  // 4) 确认框必须归属 Delete chat（aria-label 或标题文案），按钮在框内精确匹配。
+  // 5) 验证组合：路由变化 / 标题变化 / 侧边栏条目消失 / 不存在提示。
+  return `(async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const waitFor = async (fn, timeoutMs, intervalMs) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try { const v = fn(); if (v) return v; } catch (e) {}
+      await sleep(intervalMs || 150);
+    }
+    return null;
+  };
+  const label = (el) => String((el && (el.innerText || el.textContent)) || "").trim();
+  try {
+    const expectedPath = new URL(${JSON.stringify(targetUrl)}).pathname;
+    if (location.pathname.indexOf(expectedPath) !== 0) {
+      return { success: false, reason: "target_url_mismatch", expected: expectedPath, actual: location.pathname };
+    }
+    const beforePath = location.pathname;
+    const beforeTitle = document.title;
+    const convId = expectedPath.split("/").pop();
+    const findEntry = () => {
+      const links = [...document.querySelectorAll('a[href*="/app/"]')];
+      return links.find((a) => (a.getAttribute("href") || "").indexOf(convId) !== -1 && isVisible(a)) || null;
+    };
+    const hadEntry = Boolean(findEntry());
+    const menuBtn = await waitFor(() => {
+      const exact = [...document.querySelectorAll('button[aria-label="Open menu for conversation actions."]')].filter(isVisible);
+      if (exact.length === 1) return exact[0];
+      if (exact.length > 1) return null;
+      const loose = [...document.querySelectorAll('button[aria-label*="conversation actions"], button[aria-label*="会话操作"], button[aria-label*="对话操作"]')]
+        .filter((el) => isVisible(el) && !el.closest("nav, aside, [role=navigation]"));
+      return loose.length === 1 ? loose[0] : null;
+    }, 10000);
+    if (!menuBtn) return { success: false, reason: "menu_button_not_found" };
+    menuBtn.click();
+    const deleteItem = await waitFor(() => {
+      const menus = [...document.querySelectorAll('gem-menu, [role="menu"], .mat-mdc-menu-panel')].filter(isVisible);
+      const pool = [];
+      for (const m of menus) {
+        for (const it of m.querySelectorAll('[role="menuitem"]')) {
+          if (isVisible(it)) pool.push(it);
+        }
+      }
+      const all = pool.length ? pool : [...document.querySelectorAll('[role="menuitem"]')].filter(isVisible);
+      return all.find((el) => { const t = label(el); return t === "Delete" || t === "删除"; }) || null;
+    }, 4000);
+    if (!deleteItem) return { success: false, reason: "delete_menu_item_not_found" };
+    deleteItem.click();
+    const confirmBtn = await waitFor(() => {
+      const dialogs = [...document.querySelectorAll('mat-dialog-container[role="dialog"], [role="dialog"]')].filter(isVisible);
+      const dlg = dialogs.find((d) => {
+        const aria = String(d.getAttribute("aria-label") || "").trim().toLowerCase();
+        const text = String(d.innerText || "");
+        return aria === "delete chat" || text.indexOf("Delete chat") !== -1 || text.indexOf("删除聊天") !== -1 || text.indexOf("删除对话") !== -1;
+      });
+      if (!dlg) return null;
+      return [...dlg.querySelectorAll("button")].find((b) => { const t = label(b); return isVisible(b) && (t === "Delete" || t === "删除"); }) || null;
+    }, 4000);
+    if (!confirmBtn) return { success: false, reason: "confirm_button_not_found" };
+    confirmBtn.click();
+    const verified = await waitFor(() => {
+      if (location.pathname !== beforePath) return "route_changed";
+      if (document.title !== beforeTitle) return "title_changed";
+      if (hadEntry && !findEntry()) return "sidebar_entry_removed";
+      const body = String(document.body.innerText || "");
+      if (body.indexOf("not found") !== -1 || body.indexOf("找不到") !== -1 || body.indexOf("不存在") !== -1) return "state_changed";
+      return null;
+    }, 8000);
+    if (!verified) return { success: false, reason: "delete_unverified" };
+    return { success: true, verified };
+  } catch (err) {
+    return { success: false, reason: "eval_error:" + (err && err.message ? err.message : String(err)) };
+  }
+})()`;
 }

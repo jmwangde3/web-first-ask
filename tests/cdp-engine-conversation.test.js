@@ -6,7 +6,7 @@ import test from "node:test";
 import { createCdpRunner } from "../src/broker/runner.js";
 import * as chatgptAdapter from "../src/browser/adapters/chatgpt.js";
 import * as conversationStore from "../src/browser/conversation-store.js";
-import { runCdpTurn } from "../src/engines/cdp-engine.js";
+import { runCdpTurn, isSameProviderConversationUrl } from "../src/engines/cdp-engine.js";
 import { runCdpCommand } from "../src/engines/cdp-cli.js";
 import { classifyRunError } from "../src/browser/driver.js";
 
@@ -581,4 +581,13 @@ test("no conversationId does not trigger cleanup", async () => {
     assert.deepEqual(openUrls, [chatgptAdapter.url]);
     assert.equal(result.evidence.sessionCleanup, undefined);
   });
+});
+
+test("isSameProviderConversationUrl: only same https host is accepted", () => {
+  assert.equal(isSameProviderConversationUrl("https://chatgpt.com/", "https://chatgpt.com/c/x"), true);
+  assert.equal(isSameProviderConversationUrl("https://gemini.google.com/app", "https://gemini.google.com/app/x"), true);
+  assert.equal(isSameProviderConversationUrl("https://chatgpt.com/", "https://evil.example.com/c/x"), false);
+  assert.equal(isSameProviderConversationUrl("https://chatgpt.com/", "http://chatgpt.com/c/x"), false);
+  assert.equal(isSameProviderConversationUrl("https://chatgpt.com/", "not-a-url"), false);
+  assert.equal(isSameProviderConversationUrl(undefined, "https://chatgpt.com/c/x"), false);
 });

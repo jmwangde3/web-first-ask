@@ -1,7 +1,9 @@
 export const id = "chatgpt";
 export const url = "https://chatgpt.com/";
 export const editorSelector = '#prompt-textarea, div.ProseMirror[contenteditable="true"], textarea#mobile-composer-prompt, [role="textbox"][contenteditable="true"]';
-export const stopSelector = 'button[data-testid="stop-button"], main button[aria-label="Stop generating"], main button[aria-label="停止生成"]';
+// 真机核实（2026-11-24）：生成中的停止按钮 aria-label 是「停止」（中文 UI），
+// 既没有 data-testid="stop-button" 也不在 <main> 内；旧选择器导致 stopVisible 恒为 false。
+export const stopSelector = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"], button[aria-label="Stop"], button[aria-label="停止"]';
 export const sendSelector = 'form:has([contenteditable="true"], textarea) button[type="submit"], button[data-testid="send-button"], button[type="submit"][aria-label="发送"], button[type="submit"][aria-label="Send"]';
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
@@ -135,8 +137,110 @@ export function buildReadStateJs() {
 })()`;
 }
 
-export function buildDeleteConversationJs() {
-  // 真机未验证：当前选择器可能命中侧边栏其它会话的菜单，存在误删风险。
-  // 在逐家真机确认菜单/确认流程前，一律拒绝执行删除。
-  return `(() => ({ success: false, reason: "delete_flow_unverified" }))()`;
+export function buildDeleteConversationJs(targetUrl) {
+  // 三方审核合并实现（Gemini + agy，2026-11-24）：
+  // 1) 目标绑定：location.pathname 必须匹配 targetUrl 的 path，否则拒绝。
+  // 2) 入口：侧边栏当前会话项（aria-current=page，唯一可见），回退精确 href。
+  // 3) 菜单项：限定在打开的菜单容器内，按首行文本匹配（菜单项带换行快捷键后缀）。
+  // 4) 确认框：aria-modal=true 且非 floating/quick-chat，文本含 删除聊天/Delete chat。
+  // 5) 验证：路由离开 / 侧边栏条目消失 / not found 文案。
+  return `(async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const waitFor = async (fn, timeoutMs, intervalMs) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try { const v = fn(); if (v) return v; } catch (e) {}
+      await sleep(intervalMs || 150);
+    }
+    return null;
+  };
+  const label = (el) => String((el && (el.innerText || el.textContent)) || "").trim();
+  const firstLine = (el) => label(el).split(String.fromCharCode(10))[0].trim();
+  try {
+    const expectedPath = new URL(${JSON.stringify(targetUrl)}).pathname;
+    if (location.pathname.indexOf(expectedPath) !== 0) {
+      return { success: false, reason: "target_url_mismatch", expected: expectedPath, actual: location.pathname };
+    }
+    const beforePath = location.pathname;
+    const beforeTitle = document.title;
+    const findSidebarLink = () => {
+      const links = [...document.querySelectorAll('a[href^="/c/"]')];
+      return links.find((a) => a.getAttribute("href") === beforePath && isVisible(a)) || null;
+    };
+    const link = await waitFor(() => {
+      const active = [...document.querySelectorAll('a[aria-current="page"][href^="/c/"]')].filter(isVisible);
+      if (active.length === 1) return active[0];
+      return findSidebarLink();
+    }, 10000);
+    if (!link) return { success: false, reason: "current_session_link_not_found" };
+    const menuBtn = await waitFor(() => {
+      let node = link.parentElement;
+      for (let depth = 0; depth < 6 && node; depth += 1) {
+        if (node.tagName === "NAV" || node.tagName === "BODY") break;
+        const btns = [...node.querySelectorAll('button[aria-label="聊天操作"], button[aria-label="Chat actions"]')].filter(isVisible);
+        if (btns.length === 1) return btns[0];
+        if (btns.length > 1) return null;
+        node = node.parentElement;
+      }
+      return null;
+    }, 4000);
+    if (!menuBtn) return { success: false, reason: "session_menu_button_not_found" };
+    menuBtn.click();
+    const deleteItem = await waitFor(() => {
+      const menus = [...document.querySelectorAll('[role="menu"], [data-radix-popper-content-wrapper], [data-state="open"]')].filter(isVisible);
+      const pool = [];
+      for (const m of menus) {
+        for (const it of m.querySelectorAll('[role="menuitem"]')) {
+          if (isVisible(it)) pool.push(it);
+        }
+      }
+      const all = pool.length ? pool : [...document.querySelectorAll('[role="menuitem"]')].filter(isVisible);
+      return all.find((el) => {
+        const t = firstLine(el);
+        return t === "删除" || t === "Delete" || t === "删除聊天" || t === "Delete chat";
+      }) || null;
+    }, 4000);
+    if (!deleteItem) return { success: false, reason: "delete_menu_item_not_found" };
+    deleteItem.click();
+    const confirmBtn = await waitFor(() => {
+      const dialogs = [...document.querySelectorAll('div[role="dialog"][aria-modal="true"]')].filter((d) => {
+        if (!isVisible(d)) return false;
+        const cls = typeof d.className === "string" ? d.className : "";
+        if (cls.indexOf("quick-chat") !== -1 || cls.indexOf("floatingSurface") !== -1) return false;
+        return true;
+      });
+      const dlg = dialogs.find((d) => {
+        const text = String(d.innerText || "");
+        return text.indexOf("删除聊天") !== -1 || text.indexOf("Delete chat") !== -1;
+      });
+      if (!dlg) return null;
+      const btns = [...dlg.querySelectorAll("button")].filter(isVisible);
+      return btns.find((b) => {
+        const t = label(b);
+        return t === "删除聊天" || t === "Delete chat" || t === "删除" || t === "Delete";
+      }) || null;
+    }, 5000);
+    if (!confirmBtn) return { success: false, reason: "confirm_button_not_found" };
+    confirmBtn.click();
+    const verified = await waitFor(() => {
+      if (location.pathname !== beforePath) return "route_changed";
+      if (!findSidebarLink()) return "sidebar_entry_removed";
+      if (document.title !== beforeTitle && document.title.indexOf("ChatGPT") !== -1) return "title_reset";
+      const body = String(document.body.innerText || "");
+      if (body.indexOf("找不到聊天") !== -1 || body.indexOf("Chat not found") !== -1 || body.indexOf("无法找到") !== -1) return "not_found_state";
+      return null;
+    }, 8000);
+    if (!verified) return { success: false, reason: "delete_unverified" };
+    return { success: true, verified };
+  } catch (err) {
+    return { success: false, reason: "eval_error:" + (err && err.message ? err.message : String(err)) };
+  }
+})()`;
 }

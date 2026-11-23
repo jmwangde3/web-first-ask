@@ -45,6 +45,16 @@ async function readCurrentUrl(cdp, sessionId) {
   }
 }
 
+export function isSameProviderConversationUrl(adapterUrl, targetUrl) {
+  try {
+    const provider = new URL(adapterUrl);
+    const target = new URL(targetUrl);
+    return provider.protocol === "https:" && target.protocol === "https:" && provider.hostname === target.hostname;
+  } catch {
+    return false;
+  }
+}
+
 async function performSessionCleanup({
   driver,
   cdp,
@@ -61,6 +71,10 @@ async function performSessionCleanup({
     return { status: "skipped", reason: signal?.aborted ? "aborted" : "no_target", url: cleanupTargetUrl || null };
   }
 
+  if (!isSameProviderConversationUrl(adapter?.url, cleanupTargetUrl)) {
+    return { status: "skipped", reason: "target_url_rejected", url: cleanupTargetUrl };
+  }
+
   let cleanupTab = null;
   try {
     cleanupTab = await driver.openTab(cdp, cleanupTargetUrl, { timeoutMs: 15000 });
@@ -69,7 +83,7 @@ async function performSessionCleanup({
     }
 
     const script = typeof adapter.buildDeleteConversationJs === "function"
-      ? adapter.buildDeleteConversationJs()
+      ? adapter.buildDeleteConversationJs(cleanupTargetUrl)
       : null;
 
     if (!script) {
@@ -98,7 +112,9 @@ async function performSessionCleanup({
       if (typeof conversationStore.markDeleted === "function") {
         await conversationStore.markDeleted(home, provider, conversationId, cleanupTargetUrl, "failed");
       }
-    } catch {}
+    } catch (err) {
+      await reportError("markDeleted", err);
+    }
 
     return {
       status: "failed",
@@ -106,6 +122,14 @@ async function performSessionCleanup({
       url: cleanupTargetUrl,
     };
   } catch (error) {
+    try {
+      if (typeof conversationStore.markDeleted === "function") {
+        await conversationStore.markDeleted(home, provider, conversationId, cleanupTargetUrl, "failed");
+      }
+    } catch (err) {
+      await reportError("markDeleted", err);
+    }
+    await reportError("sessionCleanup", error);
     return {
       status: "failed",
       reason: error?.message || String(error),
