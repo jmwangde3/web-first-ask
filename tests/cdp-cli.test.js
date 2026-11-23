@@ -434,6 +434,7 @@ test("wfa cdp login: success path returns marker on 2nd poll and never kills Chr
           result: {
             value: {
               loggedIn: pollCount >= 2,
+              user: pollCount >= 2 ? "Logged In - ChatGPT" : null,
               title: pollCount >= 2 ? "Logged In - ChatGPT" : "Login to ChatGPT",
             },
           },
@@ -533,10 +534,11 @@ test("wfa cdp login: --json shape on success and timeout", async () => {
     stderr: createMockStream(),
     recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
     connectCdp: async () => ({
-      send: async () => ({ result: { value: { loggedIn: true, title: "ChatGPT Pro" } } }),
+      send: async () => ({ result: { value: { loggedIn: true, user: "pro-user", title: "ChatGPT Pro" } } }),
       close: () => {},
     }),
     driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    sleep: async () => {},
   });
   assert.equal(resSuccess.code, 0);
   const successJson = JSON.parse(stdoutSuccess.output);
@@ -544,6 +546,7 @@ test("wfa cdp login: --json shape on success and timeout", async () => {
     status: "completed",
     provider: "chatgpt",
     title: "ChatGPT Pro",
+    user: "pro-user",
   });
 
   // JSON Timeout
@@ -653,6 +656,7 @@ test("wfa cdp login: rejection on setWindowBounds does not abort login", async (
           result: {
             value: {
               loggedIn: true,
+              user: "ChatGPT Logged In",
               title: "ChatGPT Logged In",
             },
           },
@@ -722,4 +726,548 @@ test("wfa cdp login: recovery failure (non-RECOVERY_REQUIRED) throws CHROME_STAR
   assert.match(res.error?.message, /Chrome port is missing from recovery: binary_missing/);
   assert.deepEqual(res.error?.details, evidenceObj);
 });
+
+test("wfa cdp login: probe returns false for two polls then true with user - exits 0, prints user, sends Browser.close once", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let pollCount = 0;
+  let browserCloseCount = 0;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        pollCount++;
+        if (pollCount <= 2) {
+          return { result: { value: { loggedIn: false, user: null, title: "Login" } } };
+        }
+        return { result: { value: { loggedIn: true, user: "a@b.c", title: "ChatGPT" } } };
+      }
+      if (method === "Browser.close") {
+        browserCloseCount++;
+        return {};
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.equal(pollCount, 3);
+  assert.equal(browserCloseCount, 1, "Browser.close was sent exactly once");
+  assert.match(stdout.output, /a@b\.c/);
+  assert.equal(res.result.user, "a@b.c");
+});
+
+test("wfa cdp login: probe returns false forever with tiny timeout - exits 1, no Browser.close", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let browserCloseSent = false;
+  let virtualTime = 0;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return { result: { value: { loggedIn: false, user: null, title: "Login" } } };
+      }
+      if (method === "Browser.close") {
+        browserCloseSent = true;
+        return {};
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt", "--timeout", "1"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms + 2000;
+    },
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 1);
+  assert.equal(browserCloseSent, false, "Browser.close was not sent");
+  assert.match(stdout.output, /login not detected within 1s/);
+});
+
+test("wfa cdp login: Browser.close rejects - still exits 0", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return { result: { value: { loggedIn: true, user: "a@b.c", title: "ChatGPT" } } };
+      }
+      if (method === "Browser.close") {
+        throw new Error("Connection reset by peer");
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.match(stdout.output, /logged in as a@b\.c/);
+  assert.match(stdout.output, /session persisted; later runs restore it with --restore-last-session/);
+});
+
+test("wfa cdp login: exits 0 even when Browser.close never resolves", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let browserCloseSent = 0;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return { result: { value: { loggedIn: true, user: "hang@b.c", title: "ChatGPT" } } };
+      }
+      if (method === "Browser.close") {
+        browserCloseSent++;
+        return new Promise(() => {}); // never resolves
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.equal(browserCloseSent, 1, "Browser.close was sent exactly once");
+  assert.match(stdout.output, /hang@b\.c/);
+  assert.match(stdout.output, /session persisted; later runs restore it with --restore-last-session/);
+});
+
+test("launch.js: the argument list contains --restore-last-session for background, visible, and headless", async () => {
+  const { buildChromeArgs, launchChrome } = await import("../src/browser/launch.js");
+  const { EventEmitter } = await import("node:events");
+
+  for (const mode of ["background", "visible", "headless"]) {
+    // 1. Direct argument builder check
+    const args = buildChromeArgs({ userDataDir: "/tmp/profile", mode });
+    assert.ok(args.includes("--restore-last-session"), `args for ${mode} must include --restore-last-session`);
+    const noFirstRunIdx = args.indexOf("--no-first-run");
+    const restoreIdx = args.indexOf("--restore-last-session");
+    assert.equal(restoreIdx, noFirstRunIdx + 1, "--restore-last-session must be placed next to --no-first-run");
+
+    // 2. Fake spawn via launchChrome check
+    let spawnedArgs = null;
+    const fakeSpawn = (_exe, spawnArgs) => {
+      spawnedArgs = spawnArgs;
+      const child = new EventEmitter();
+      child.pid = 9999;
+      child.unref = () => {};
+      setImmediate(() => child.emit("error", new Error("test abort")));
+      return child;
+    };
+
+    try {
+      await launchChrome({
+        profileDir: "/tmp/fake-profile",
+        mode,
+        deps: {
+          resolveChromeExecutable: async () => "/fake/chrome",
+          spawn: fakeSpawn,
+        },
+      });
+    } catch {}
+
+    assert.ok(spawnedArgs, `spawn must have been called for mode ${mode}`);
+    assert.ok(spawnedArgs.includes("--restore-last-session"), `spawned args for ${mode} must include --restore-last-session`);
+  }
+});
+
+test("wfa cdp login: Gemini login where only signed-in selector matches - exits 0", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let browserCloseSent = false;
+  let evaluateParams = null;
+
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Runtime.evaluate") {
+        evaluateParams = params;
+        return {
+          result: {
+            value: {
+              loggedIn: true,
+              user: null,
+              title: "Gemini",
+              signedIn: true,
+              signedOut: false,
+              matchedSignedIn: ['button[aria-label*="Google 账号"]'],
+              matchedSignedOut: [],
+            },
+          },
+        };
+      }
+      if (method === "Browser.close") {
+        browserCloseSent = true;
+        return {};
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "gemini"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.equal(browserCloseSent, true);
+  assert.equal(evaluateParams?.awaitPromise, true);
+  assert.match(stdout.output, /logged in \(gemini\)/);
+});
+
+test("wfa cdp login: Gemini login where both selectors match - exits 1 (signed-out signal wins)", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let virtualTime = 0;
+  let browserCloseSent = false;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        const signedIn = true;
+        const signedOut = true;
+        const loggedIn = signedIn && !signedOut; // false
+        return {
+          result: {
+            value: {
+              loggedIn,
+              user: null,
+              title: "Gemini Sign in",
+              signedIn,
+              signedOut,
+              matchedSignedIn: ['button[aria-label*="Google 账号"]'],
+              matchedSignedOut: ['a[href*="accounts.google.com/ServiceLogin"]'],
+            },
+          },
+        };
+      }
+      if (method === "Browser.close") {
+        browserCloseSent = true;
+        return {};
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "gemini", "--timeout", "1"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms + 2000;
+    },
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 1);
+  assert.equal(browserCloseSent, false, "Must not close browser on timeout");
+  assert.match(stdout.output, /login not detected within 1s/);
+});
+
+test("wfa cdp login: off-origin ticks for two polls then on-origin success - exits 0, Browser.close sent once, prints user", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let pollCount = 0;
+  let browserCloseCount = 0;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        pollCount++;
+        if (pollCount <= 2) {
+          return {
+            result: {
+              value: {
+                loggedIn: false,
+                user: null,
+                title: "Sign in to OpenAI",
+                origin: "https://auth.openai.com",
+                offOrigin: true,
+              },
+            },
+          };
+        }
+        return {
+          result: {
+            value: {
+              loggedIn: true,
+              user: "a@b.c",
+              title: "ChatGPT",
+              origin: "https://chatgpt.com",
+              offOrigin: false,
+            },
+          },
+        };
+      }
+      if (method === "Browser.close") {
+        browserCloseCount++;
+        return {};
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.equal(browserCloseCount, 1, "Browser.close sent once");
+  assert.match(stdout.output, /a@b\.c/);
+  assert.match(stdout.output, /waiting for the redirect to finish \(on auth\.openai\.com\)/);
+});
+
+test("wfa cdp login: 45s of off-origin ticks - Page.navigate sent once or twice, never more than twice", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let navigateCount = 0;
+  let virtualTime = 0;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              loggedIn: false,
+              user: null,
+              title: "Sign in to OpenAI",
+              origin: "https://auth.openai.com",
+              offOrigin: true,
+            },
+          },
+        };
+      }
+      if (method === "Page.navigate") {
+        navigateCount++;
+        return {};
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt", "--timeout", "150"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    now: () => virtualTime,
+    sleep: async () => {
+      virtualTime += 50000;
+    },
+    pollIntervalMs: 1,
+    offOriginThresholdMs: 45000,
+  });
+
+  assert.equal(res.code, 1);
+  assert.equal(navigateCount, 2, "Page.navigate attempted at most twice");
+});
+
+test("wfa cdp login: on-origin false forever with 1s timeout - exit 1, no Browser.close, no navigate", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let browserCloseSent = false;
+  let navigateSent = false;
+  let virtualTime = 0;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              loggedIn: false,
+              user: null,
+              title: "ChatGPT: Chat, Work, Create & Code with AI",
+              origin: "https://chatgpt.com",
+              offOrigin: false,
+            },
+          },
+        };
+      }
+      if (method === "Browser.close") {
+        browserCloseSent = true;
+        return {};
+      }
+      if (method === "Page.navigate") {
+        navigateSent = true;
+        return {};
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt", "--timeout", "1"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms + 2000;
+    },
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 1);
+  assert.equal(browserCloseSent, false, "Browser.close must not be sent on timeout");
+  assert.equal(navigateSent, false, "Page.navigate must not be sent on-origin");
+  assert.match(stdout.output, /login not detected within 1s/);
+});
+
+test("wfa cdp login: live broker record - exit 0, stderr mentions broker, Browser.close not sent", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let browserCloseSent = false;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              loggedIn: true,
+              user: "a@b.c",
+              title: "ChatGPT",
+              origin: "https://chatgpt.com",
+              offOrigin: false,
+            },
+          },
+        };
+      }
+      if (method === "Browser.close") {
+        browserCloseSent = true;
+        return {};
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    readBrokerRecord: async () => ({ schema: 1, instanceId: "inst-1", pid: 1234, port: 4444, token: "tok" }),
+    isInstanceAlive: async () => true,
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.equal(browserCloseSent, false, "Browser.close must NOT be sent when broker is live");
+  assert.match(stderr.output, /a broker is running; leaving the browser open/);
+  assert.match(stdout.output, /logged in as a@b\.c/);
+});
+
+test("wfa cdp login: dead broker record - Browser.close sent", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  let browserCloseSent = false;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              loggedIn: true,
+              user: "a@b.c",
+              title: "ChatGPT",
+              origin: "https://chatgpt.com",
+              offOrigin: false,
+            },
+          },
+        };
+      }
+      if (method === "Browser.close") {
+        browserCloseSent = true;
+        return {};
+      }
+      return {};
+    },
+    close: () => {},
+  };
+
+  const res = await runCdpCommand(["login", "--provider", "chatgpt"], {
+    stdout,
+    stderr,
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+    connectCdp: async () => mockCdp,
+    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+    readBrokerRecord: async () => ({ schema: 1, instanceId: "inst-stale", pid: 9999, port: 4444, token: "tok" }),
+    isInstanceAlive: async () => false,
+    sleep: async () => {},
+    pollIntervalMs: 1,
+  });
+
+  assert.equal(res.code, 0);
+  assert.equal(browserCloseSent, true, "Browser.close must be sent when broker is dead");
+  assert.match(stdout.output, /logged in as a@b\.c/);
+});
+
+
 

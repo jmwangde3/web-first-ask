@@ -9,6 +9,7 @@ import * as defaultDriver from "../browser/driver.js";
 import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
 import { sleep as defaultSleep } from "../util.js";
+import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -130,6 +131,7 @@ async function handleStatus(options, deps) {
 
 async function handleLogin(argv, deps) {
   const stdout = deps.stdout || process.stdout;
+  const stderr = deps.stderr || process.stderr;
   const { options } = parseArgs(argv);
 
   if (options.help) {
@@ -222,24 +224,69 @@ async function handleLogin(argv, deps) {
     }
 
     const pollIntervalMs = deps.pollIntervalMs || 2000;
+    const offOriginThresholdMs = deps.offOriginThresholdMs ?? deps.stallMs ?? 45000;
     const startTime = nowFn();
     const deadline = startTime + timeoutSec * 1000;
 
     let loggedIn = false;
     let finalTitle = "";
+    let finalUser = null;
+    let offOriginSince = null;
+    let redirectAttempts = 0;
+    let offOriginWarned = false;
 
-    const checkExpr = provider === "chatgpt"
-      ? `(() => {
-          const hasLoggedInEditor = Boolean(document.querySelector('div.ProseMirror[contenteditable="true"]')) && !document.querySelector('textarea#mobile-composer-prompt');
-          const title = document.title || "";
-          return { loggedIn: hasLoggedInEditor, title };
-        })()`
-      : `(() => {
-          const hasUserQuery = document.querySelectorAll("user-query").length > 0;
-          const hasAccountBtn = Boolean(document.querySelector('button[aria-label*="Google 账号"], img[aria-label*="个人资料"]'));
-          const title = document.title || "";
-          return { loggedIn: (hasUserQuery || hasAccountBtn), title };
-        })()`;
+    const checkExpr = typeof adapter.buildLoginProbeJs === "function"
+      ? adapter.buildLoginProbeJs()
+      : provider === "chatgpt"
+        ? `(() => (async () => {
+  const host = location.hostname;
+  const onProduct = host === "chatgpt.com" || host === "www.chatgpt.com";
+  if (!onProduct) {
+    return { loggedIn: false, user: null, title: document.title || "", origin: location.origin, offOrigin: true };
+  }
+  const title = document.title || "";
+  let user = null, apiError = null;
+  try {
+    const res = await fetch("/api/auth/session", { credentials: "include" });
+    const body = await res.json();
+    user = body && body.user ? (body.user.email || body.user.id || "user") : null;
+  } catch (error) { apiError = String(error); }
+  const editor = Boolean(document.querySelector('div.ProseMirror[contenteditable="true"]'))
+    && !document.querySelector('textarea#mobile-composer-prompt');
+  return { loggedIn: Boolean(user), user, title, origin: location.origin, editor, apiError };
+})())()`
+        : `(() => {
+  const host = location.hostname;
+  const onProduct = host === "gemini.google.com";
+  if (!onProduct) {
+    return { loggedIn: false, user: null, title: document.title || "", origin: location.origin, offOrigin: true };
+  }
+  const title = document.title || "";
+  const signedInSelectors = [
+    'button[aria-label*="Google 账号"]',
+    'img[aria-label*="个人资料"]',
+    'a[href*="accounts.google.com/SignOutOptions"]'
+  ];
+  const signedOutSelectors = [
+    'a[href*="accounts.google.com/ServiceLogin"]',
+    'a[href*="accounts.google.com/AccountChooser"]'
+  ];
+  const matchedSignedIn = signedInSelectors.filter(s => Boolean(document.querySelector(s)));
+  const matchedSignedOut = signedOutSelectors.filter(s => Boolean(document.querySelector(s)));
+  const signedIn = matchedSignedIn.length > 0;
+  const signedOut = matchedSignedOut.length > 0;
+  const loggedIn = signedIn && !signedOut;
+  return {
+    loggedIn,
+    user: null,
+    title,
+    origin: location.origin,
+    signedIn,
+    signedOut,
+    matchedSignedIn,
+    matchedSignedOut
+  };
+})()`;
 
     const challengePattern = adapter.challengeTitlePattern || /请稍候|just a moment|verifying|security check|cloudflare|人机验证/i;
 
@@ -247,6 +294,7 @@ async function handleLogin(argv, deps) {
       try {
         const evalRes = await cdp.send("Runtime.evaluate", {
           expression: checkExpr,
+          awaitPromise: true,
           returnByValue: true,
         }, sessionId);
 
@@ -254,9 +302,35 @@ async function handleLogin(argv, deps) {
         if (val) {
           finalTitle = val.title || "";
           const isChallenged = challengePattern.test(finalTitle);
-          if (val.loggedIn && !isChallenged) {
-            loggedIn = true;
-            break;
+
+          if (val.offOrigin) {
+            if (!offOriginWarned) {
+              offOriginWarned = true;
+              if (!options.json) {
+                let offOriginHost = "identity provider";
+                try {
+                  offOriginHost = val.origin ? new URL(val.origin).host : "identity provider";
+                } catch {}
+                stdout.write(`[cdp] waiting for the redirect to finish (on ${offOriginHost})\n`);
+              }
+            }
+
+            if (offOriginSince === null) {
+              offOriginSince = nowFn();
+            } else if (nowFn() - offOriginSince >= offOriginThresholdMs && redirectAttempts < 2) {
+              redirectAttempts++;
+              offOriginSince = nowFn();
+              try {
+                await cdp.send("Page.navigate", { url: targetUrl }, sessionId);
+              } catch {}
+            }
+          } else {
+            offOriginSince = null;
+            if (val.loggedIn && !isChallenged) {
+              loggedIn = true;
+              finalUser = val.user ?? null;
+              break;
+            }
           }
         }
       } catch (err) {
@@ -267,12 +341,37 @@ async function handleLogin(argv, deps) {
     }
 
     if (loggedIn) {
-      if (options.json) {
-        stdout.write(`${JSON.stringify({ status: "completed", provider, title: finalTitle }, null, 2)}\n`);
-      } else {
-        stdout.write(`[cdp] logged in as ${finalTitle}\n`);
+      await sleepFn(1500);
+
+      const readRecord = deps.readBrokerRecord || readBrokerRecord;
+      const checkInstanceAlive = deps.isInstanceAlive || isInstanceAlive;
+      let skipClose = false;
+      try {
+        const record = await readRecord(home);
+        if (record && await checkInstanceAlive(record)) {
+          stderr.write("[cdp] a broker is running; leaving the browser open. Run `wfa broker stop` to release it.\n");
+          skipClose = true;
+        }
+      } catch {}
+
+      if (!skipClose) {
+        await Promise.race([
+          cdp.send("Browser.close").catch(() => {}),
+          sleepFn(5000),
+        ]);
       }
-      return { code: 0, result: { status: "completed", provider, title: finalTitle } };
+
+      if (options.json) {
+        stdout.write(`${JSON.stringify({ status: "completed", provider, title: finalTitle, user: finalUser ?? null }, null, 2)}\n`);
+      } else {
+        if (finalUser) {
+          stdout.write(`[cdp] logged in as ${finalUser}\n`);
+        } else {
+          stdout.write(`[cdp] logged in (${provider})\n`);
+        }
+        stdout.write("[cdp] session persisted; later runs restore it with --restore-last-session\n");
+      }
+      return { code: 0, result: { status: "completed", provider, title: finalTitle, user: finalUser ?? null } };
     }
 
     if (options.json) {

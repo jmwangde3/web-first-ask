@@ -54,19 +54,16 @@ export async function cdpProbe(port, { timeoutMs = 1500, attempts = 3 } = {}) {
   return { ok: false, error };
 }
 
-export async function launchChrome({ profileDir, mode = "headless", chromePath, timeoutMs = 20000 } = {}) {
-  if (!profileDir) throw new Error("PROFILE_DIR_REQUIRED");
-  if (!["headless", "headful", "background", "visible"].includes(mode)) throw new Error("INVALID_BROWSER_MODE");
-  const executable = await resolveChromeExecutable(chromePath);
-  const userDataDir = path.resolve(profileDir);
-  await mkdir(userDataDir, { recursive: true });
-  // Avoid accepting an old port file from a previously terminated Chrome.
-  await rm(path.join(userDataDir, "DevToolsActivePort"), { force: true });
+export function buildChromeArgs({ userDataDir, mode = "headless" } = {}) {
   const args = [
     `--user-data-dir=${userDataDir}`,
     "--remote-debugging-port=0",
     "--remote-debugging-address=127.0.0.1",
     "--no-first-run",
+    // ChatGPT stores its session in a non-persistent cookie (oai-asli). Chrome only keeps
+    // such cookies across restarts when started with this switch; without it the profile
+    // looks logged out after any exit, including a crash.
+    "--restore-last-session",
     "--no-default-browser-check",
     "--disable-background-networking",
     // Cloudflare fingerprints the automation switch itself: both headless and a
@@ -76,11 +73,25 @@ export async function launchChrome({ profileDir, mode = "headless", chromePath, 
   if (mode === "headless") args.push("--headless=new");
   if (mode === "background" || mode === "headful") args.push("--window-size=1440,1200", "--window-position=-2000,-2000");
   if (mode === "visible") args.push("--window-size=1440,1200", "--window-position=100,100");
+  return args;
+}
+
+export async function launchChrome({ profileDir, mode = "headless", chromePath, timeoutMs = 20000, deps = {} } = {}) {
+  if (!profileDir) throw new Error("PROFILE_DIR_REQUIRED");
+  if (!["headless", "headful", "background", "visible"].includes(mode)) throw new Error("INVALID_BROWSER_MODE");
+  const resolveExecutable = deps.resolveChromeExecutable || resolveChromeExecutable;
+  const executable = await resolveExecutable(chromePath);
+  const userDataDir = path.resolve(profileDir);
+  await mkdir(userDataDir, { recursive: true });
+  // Avoid accepting an old port file from a previously terminated Chrome.
+  await rm(path.join(userDataDir, "DevToolsActivePort"), { force: true });
+  const args = buildChromeArgs({ userDataDir, mode });
 
   let child;
   let pid = null;
+  const spawnFn = deps.spawn || spawn;
   try {
-    child = spawn(executable, args, { detached: false, stdio: "ignore", windowsHide: mode === "headless" });
+    child = spawnFn(executable, args, { detached: false, stdio: "ignore", windowsHide: mode === "headless" });
     await new Promise((resolve, reject) => {
       child.once("spawn", resolve);
       child.once("error", reject);

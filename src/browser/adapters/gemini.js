@@ -2,6 +2,42 @@ export const id = "gemini";
 export const url = "https://gemini.google.com/app";
 export const editorSelector = 'rich-textarea div[contenteditable="true"], div.ql-editor[contenteditable="true"]';
 export const stopSelector = 'button[aria-label*="Stop response"], button[aria-label*="停止回答"], button[aria-label*="Stop"], button[aria-label*="停止"], .stop-button';
+export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证|sign in|log in|登录/i;
+
+export function buildLoginProbeJs() {
+  return `(() => {
+  const host = location.hostname;
+  const onProduct = host === "gemini.google.com";
+  if (!onProduct) {
+    return { loggedIn: false, user: null, title: document.title || "", origin: location.origin, offOrigin: true };
+  }
+  const title = document.title || "";
+  const signedInSelectors = [
+    'button[aria-label*="Google 账号"]',
+    'img[aria-label*="个人资料"]',
+    'a[href*="accounts.google.com/SignOutOptions"]'
+  ];
+  const signedOutSelectors = [
+    'a[href*="accounts.google.com/ServiceLogin"]',
+    'a[href*="accounts.google.com/AccountChooser"]'
+  ];
+  const matchedSignedIn = signedInSelectors.filter(s => Boolean(document.querySelector(s)));
+  const matchedSignedOut = signedOutSelectors.filter(s => Boolean(document.querySelector(s)));
+  const signedIn = matchedSignedIn.length > 0;
+  const signedOut = matchedSignedOut.length > 0;
+  const loggedIn = signedIn && !signedOut;
+  return {
+    loggedIn,
+    user: null,
+    title,
+    origin: location.origin,
+    signedIn,
+    signedOut,
+    matchedSignedIn,
+    matchedSignedOut
+  };
+})()`;
+}
 
 export function buildAnswerTextJs() {
   return `(() => {

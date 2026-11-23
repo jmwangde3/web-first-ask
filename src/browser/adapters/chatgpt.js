@@ -4,6 +4,26 @@ export const editorSelector = '#prompt-textarea, div.ProseMirror[contenteditable
 export const stopSelector = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"]';
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证/i;
 
+export function buildLoginProbeJs() {
+  return `(() => (async () => {
+  const host = location.hostname;
+  const onProduct = host === "chatgpt.com" || host === "www.chatgpt.com";
+  if (!onProduct) {
+    return { loggedIn: false, user: null, title: document.title || "", origin: location.origin, offOrigin: true };
+  }
+  const title = document.title || "";
+  let user = null, apiError = null;
+  try {
+    const res = await fetch("/api/auth/session", { credentials: "include" });
+    const body = await res.json();
+    user = body && body.user ? (body.user.email || body.user.id || "user") : null;
+  } catch (error) { apiError = String(error); }
+  const editor = Boolean(document.querySelector('div.ProseMirror[contenteditable="true"]'))
+    && !document.querySelector('textarea#mobile-composer-prompt');
+  return { loggedIn: Boolean(user), user, title, origin: location.origin, editor, apiError };
+})())()`;
+}
+
 export function buildAnswerTextJs() {
   return `(() => {
   const hs = [...document.querySelectorAll("h4")].filter((h) => {
