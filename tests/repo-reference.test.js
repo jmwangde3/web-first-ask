@@ -91,7 +91,7 @@ test("wfa code needs no --file when current repository has a remote", async () =
   assert.deepEqual([...preview.providers].sort(), ["chatgpt", "gemini"]);
   assert.equal(preview.sessionPolicy, "fresh");
   assert.equal(preview.filesCount, 0);
-  assert.equal(preview.concurrency, 1);
+  assert.equal(preview.concurrency, 2);
   const disabled = run("--no-repo");
   assert.equal(disabled.status, 1);
   const bundle = run("--bundle-repo");

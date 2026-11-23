@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { getHomeDir } from "../paths.js";
 import { WfaError } from "../errors.js";
-import { runCdpTurn } from "./cdp-engine.js";
 import { recoverBrowser } from "../browser/recovery.js";
 import { connectCdp } from "../browser/cdp.js";
 import * as defaultDriver from "../browser/driver.js";
@@ -10,6 +9,8 @@ import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
 import { sleep as defaultSleep } from "../util.js";
 import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
+import { ensureBroker, createTurn, waitForTurn } from "../broker/client.js";
+import { spawnDetachedBroker } from "../broker/cli.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -25,6 +26,7 @@ const VALUE_FLAGS = new Set([
   "settle",
   "chrome-path",
   "min-interval",
+  "conversation-id",
 ]);
 
 function parseArgs(argv) {
@@ -79,22 +81,23 @@ function printCdpHelp(stdout = process.stdout) {
 
 Commands:
   wfa cdp ask    --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
-                 [--mode background|visible|headless] [--json] [--timeout <s>] [--settle <ms>]
-                 [--min-interval <ms>]
+                 [--mode background|visible|headless] [--conversation-id <id>] [--json]
+                 [--timeout <s>] [--settle <ms>] [--min-interval <ms>]
   wfa cdp status [--json]
   wfa cdp login  [--provider <chatgpt|gemini>] [--mode visible|background]
                  [--timeout <seconds>] [--json]
 
 Options:
-  --provider <name>       chatgpt or gemini
-  --prompt <text>         Prompt string
-  --prompt-file <path>    Path to prompt file
-  --mode <mode>           background (default for ask, visible for login), visible, or headless
-  --json                  Output machine-readable JSON
-  --timeout <seconds>     Overall / stall timeout in seconds
-  --settle <ms>           Answer stabilization window in milliseconds (default: 4000)
-  --min-interval <ms>     Minimum interval between provider turns in milliseconds
-  --help, -h              Show this help message
+  --provider <name>          chatgpt or gemini
+  --prompt <text>            Prompt string
+  --prompt-file <path>       Path to prompt file
+  --mode <mode>              background (default for ask, visible for login), visible, or headless
+  --conversation-id <id>     Optional conversation ID to serialize same-session turns
+  --json                     Output machine-readable JSON
+  --timeout <seconds>        Overall / stall timeout in seconds
+  --settle <ms>              Answer stabilization window in milliseconds (default: 4000)
+  --min-interval <ms>        Minimum interval between provider turns in milliseconds
+  --help, -h                 Show this help message
 `);
 }
 
@@ -395,6 +398,7 @@ async function handleLogin(argv, deps) {
 async function handleAsk(argv, deps) {
   const stdout = deps.stdout || process.stdout;
   const stderr = deps.stderr || process.stderr;
+  const home = deps.home || getHomeDir();
 
   const { positional, options } = parseArgs(argv);
 
@@ -471,35 +475,105 @@ async function handleAsk(argv, deps) {
     }
   }
 
-  const onWait = (remainingMs) => {
-    stderr.write(`[cdp] waiting ${(remainingMs / 1000).toFixed(1)}s for the provider interval\n`);
-  };
+  let conversationId = deps.conversationId ?? null;
+  if (options["conversation-id"] !== undefined) {
+    conversationId = String(options["conversation-id"]).trim();
+    if (!conversationId) {
+      throw new WfaError("INVALID_ARGUMENT", "Option --conversation-id must be a non-empty string.");
+    }
+  }
 
-  const turnFn = deps.runCdpTurn || runCdpTurn;
-  const result = await turnFn({
+  const startTime = Date.now();
+  const ensureFn = deps.ensureBroker || ensureBroker;
+  const spawnFn = deps.spawnBroker || (() => spawnDetachedBroker({ home, mode, deps, stdout }));
+  const record = await ensureFn({ home, spawnBroker: spawnFn });
+
+  const createTurnFn = deps.createTurn || createTurn;
+  const turnRes = await createTurnFn(record, {
     provider,
     prompt,
-    home: deps.home,
     mode,
-    chromePath: options["chrome-path"],
     settleMs,
     stallTimeoutMs,
     hardTimeoutMs,
-    minIntervalMs,
-    onWait,
-    keepBrowser: Boolean(options["keep-browser"]),
+    ...(conversationId !== null ? { conversationId } : {}),
+    ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
+    ...(options["chrome-path"] ? { chromePath: options["chrome-path"] } : {}),
+  });
+
+  const created = turnRes?.json;
+  if (turnRes?.status >= 400) {
+    if (options.json) {
+      stdout.write(`${JSON.stringify({
+        error: created?.error || "BROKER_ERROR",
+        status: turnRes.status,
+        ...(created?.orphan ? { orphan: created.orphan } : {}),
+        ...(created?.hint ? { hint: created.hint } : {}),
+      }, null, 2)}\n`);
+    } else {
+      const code = String(created?.error || "BROKER_ERROR").toUpperCase();
+      const hint = typeof created?.hint === "string" ? created.hint.trim() : "";
+      const detail = [`HTTP ${turnRes.status}`, hint].filter(Boolean).join("; ");
+      stderr.write(`wfa: ${code}: ${detail}\n`);
+    }
+    return { code: 1, error: created };
+  }
+
+  const turnId = created?.id;
+  if (!turnId) {
+    stderr.write("wfa: BROKER_ERROR: Failed to create turn\n");
+    return { code: 1 };
+  }
+
+  const waitFn = deps.waitForTurn || waitForTurn;
+  let lastCooldownKey = null;
+  const onProgress = (polledTurn) => {
+    const remainingMs = polledTurn?.cooldownWaitMs;
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0) return;
+    const key = `${remainingMs}:${polledTurn.cooldownWaitAt ?? ""}`;
+    if (key === lastCooldownKey) return;
+    lastCooldownKey = key;
+    stderr.write(`[cdp] waiting ${(remainingMs / 1000).toFixed(1)}s for the provider interval\n`);
+  };
+  const turn = await waitFn({
+    record,
+    turnId,
+    timeoutMs: hardTimeoutMs,
+    onProgress,
     deps,
   });
+
+  const startedAtMs = Date.parse(turn.startedAt || turn.createdAt || "");
+  const finishedAtMs = Date.parse(turn.finishedAt || "");
+  const elapsedMs = Number.isFinite(startedAtMs) && Number.isFinite(finishedAtMs)
+    ? Math.max(0, finishedAtMs - startedAtMs)
+    : Math.max(0, Date.now() - startTime);
+
+  const result = {
+    id: turn.id ?? turnId,
+    provider: turn.provider ?? provider,
+    conversationId: turn.conversationId ?? conversationId,
+    mode: turn.mode ?? mode,
+    status: turn.state,
+    text: turn.text ?? "",
+    reason: turn.reason ?? null,
+    evidence: turn.evidence ?? null,
+    ...(turn.sendCommittedAt != null ? { sendCommittedAt: turn.sendCommittedAt } : {}),
+    elapsedMs,
+  };
 
   if (options.json) {
     stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   } else {
-    const elapsedSec = ((result.elapsedMs ?? 0) / 1000).toFixed(1);
+    const elapsedSec = (elapsedMs / 1000).toFixed(1);
     stdout.write(`[cdp] provider=${provider} status=${result.status} elapsed=${elapsedSec}s\n`);
     if (result.status === "completed" && result.text) {
       stdout.write(`${result.text}${result.text.endsWith("\n") ? "" : "\n"}`);
     } else if (result.status !== "completed" && result.reason) {
       stderr.write(`[cdp] reason: ${result.reason}\n`);
+    }
+    if (result.status !== "completed" && result.sendCommittedAt != null) {
+      stderr.write("[cdp] warning: prompt was already sent; do not resend\n");
     }
   }
 

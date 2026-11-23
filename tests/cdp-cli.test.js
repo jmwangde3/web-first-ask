@@ -372,7 +372,6 @@ test("runCdpTurn: cancellation before typePrompt leaves evidence as null", async
   assert.equal(result.sendCommittedAt, undefined);
 });
 
-
 test("runCdpCommand ask --json: normal output can be parsed by JSON.parse", async () => {
   const stdout = createMockStream();
   const stderr = createMockStream();
@@ -1438,26 +1437,37 @@ test("wfa cdp login: dead broker record - Browser.close sent", async () => {
   assert.match(stdout.output, /logged in as a@b\.c/);
 });
 
-test("wfa cdp ask: passes --min-interval to runCdpTurn", async () => {
+test("wfa cdp ask: passes --min-interval to createTurn and prints cooldown wait progress", async () => {
   const stdout = createMockStream();
   const stderr = createMockStream();
-  let passedOptions = null;
+  let createdPayload = null;
 
   const res = await runCdpCommand(["ask", "--provider", "chatgpt", "--prompt", "Hello", "--min-interval", "3500"], {
     stdout,
     stderr,
-    runCdpTurn: async (opts) => {
-      passedOptions = opts;
-      if (typeof opts.onWait === "function") {
-        opts.onWait(2500);
-      }
-      return { status: "completed", text: "Answer text", elapsedMs: 100 };
+    ensureBroker: async () => ({ host: "127.0.0.1", port: 43210, token: "test-token" }),
+    createTurn: async (_record, payload) => {
+      createdPayload = payload;
+      return { status: 202, json: { id: "turn-123", state: "queued" } };
+    },
+    waitForTurn: async ({ onProgress }) => {
+      onProgress?.({ id: "turn-123", state: "running", cooldownWaitMs: 2500, cooldownWaitAt: 1000 });
+      onProgress?.({ id: "turn-123", state: "running", cooldownWaitMs: 2500, cooldownWaitAt: 1000 });
+      return {
+        id: "turn-123",
+        provider: "chatgpt",
+        mode: "background",
+        state: "completed",
+        text: "Answer text",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        finishedAt: "2026-01-01T00:00:00.100Z",
+      };
     },
   });
 
   assert.equal(res.code, 0);
-  assert.equal(passedOptions.minIntervalMs, 3500);
-  assert.match(stderr.output, /\[cdp\] waiting 2\.5s for the provider interval/);
+  assert.equal(createdPayload.minIntervalMs, 3500);
+  assert.equal(stderr.output.match(/\[cdp\] waiting 2\.5s for the provider interval/g)?.length, 1);
 });
 
 test("wfa cdp ask: rejects negative --min-interval with INVALID_ARGUMENT", async () => {
@@ -1485,7 +1495,3 @@ test("wfa cdp ask: rejects decimal, hex, and scientific notation in --min-interv
     assert.match(stderr.output, /INVALID_ARGUMENT/);
   }
 });
-
-
-
-

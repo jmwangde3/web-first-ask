@@ -1,5 +1,5 @@
 import path from "node:path";
-import { PROVIDERS } from "./constants.js";
+import { DEFAULT_CONFIG, PROVIDERS } from "./constants.js";
 import { isArchiveAttachment } from "./attachments.js";
 import { WfaError } from "./errors.js";
 
@@ -65,9 +65,8 @@ export function buildJobs({
 }
 
 export function validateConcurrency(concurrency, providerCount, maxConcurrency = 3) {
-  // Serial by default: concurrent browser tabs interfere with each other on the
-  // setups this tool is used on, and a corrupted answer costs more than the wait.
-  const value = concurrency ?? 1;
+  // Dual-provider parallel by default; explicit `--concurrency 1` forces serial execution.
+  const value = concurrency ?? DEFAULT_CONFIG.defaultConcurrency;
   if (!Number.isInteger(value) || value < 1 || value > maxConcurrency) {
     throw new WfaError("INVALID_CONCURRENCY", `Concurrency must be an integer between 1 and ${maxConcurrency}; 1 runs ${providerCount} provider(s) sequentially.`);
   }
@@ -77,3 +76,4 @@ export function validateConcurrency(concurrency, providerCount, maxConcurrency =
 export function resolveAttachmentPaths(paths = [], cwd = process.cwd()) {
   return paths.map((item) => path.resolve(cwd, item));
 }
+

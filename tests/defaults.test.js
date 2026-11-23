@@ -33,7 +33,7 @@ test("config defaults to both providers, serial execution and a single login pro
     assert.deepEqual(config.defaultProviders, ["gemini", "chatgpt"]);
     // compare must not silently prefer a different first provider than ask.
     assert.deepEqual(config.defaultCompareProviders, ["gemini", "chatgpt"]);
-    assert.equal(config.defaultConcurrency, 1);
+    assert.equal(config.defaultConcurrency, 2);
     assert.equal(config.defaultProvider, "chatgpt");
     // Gemini runs in Task mode by default, so the pair is "gemini task + chatgpt".
     assert.equal(config.geminiMode, "task");
@@ -53,7 +53,11 @@ test("CLI defaults to gemini+chatgpt serially and still allows narrowing", async
     const wide = dryRunCli(home, ["ask", "--prompt", "x", "--dry-run"]);
     assert.equal(wide.status, 0, wide.stderr);
     assert.deepEqual(wide.preview.providers, ["gemini", "chatgpt"]);
-    assert.equal(wide.preview.concurrency, 1);
+    assert.equal(wide.preview.concurrency, 2);
+
+    const serialFallback = dryRunCli(home, ["ask", "--providers", "chatgpt,gemini", "--concurrency", "1", "--prompt", "x", "--dry-run"]);
+    assert.equal(serialFallback.status, 0, serialFallback.stderr);
+    assert.equal(serialFallback.preview.concurrency, 1);
 
     const narrow = dryRunCli(home, ["ask", "--provider", "chatgpt", "--prompt", "x", "--dry-run"]);
     assert.equal(narrow.status, 0, narrow.stderr);
@@ -224,3 +228,4 @@ test("the inactivity watchdog waits 15 minutes by default, and can still be narr
     assert.equal(explicit.preview.stallTimeoutSeconds, 120);
   });
 });
+

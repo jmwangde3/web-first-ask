@@ -103,6 +103,32 @@ test("scheduler enforces conversation, provider and global limits; release resto
   release(scheduler, named);
 });
 
+test("scheduler enforces conversation and global limits while allowing same-provider independent conversations when maxPerProvider is 2", () => {
+  const scheduler = createScheduler({ maxPerProvider: 2, maxTotal: 2 });
+  const turn = (provider, conversationId) => createTurn({ provider, prompt: "hi", conversationId });
+  const a = turn("chatgpt", "shared");
+  const b = turn("gemini", "shared");
+  const c = turn("chatgpt", "c-only");
+  const d = turn("gemini", "d-only");
+  assert.deepEqual(schedule(scheduler, a), { accepted: true });
+  assert.equal(schedule(scheduler, b).reason, "conversation_busy");
+  assert.deepEqual(schedule(scheduler, c), { accepted: true });
+  assert.equal(schedule(scheduler, d).reason, "global_busy");
+  assert.equal(snapshot(scheduler).runningTotal, 2);
+  assert.equal(snapshot(scheduler).runningByProvider.chatgpt, 2);
+  release(scheduler, a);
+  assert.deepEqual(schedule(scheduler, d), { accepted: true });
+  release(scheduler, c);
+  release(scheduler, d);
+  assert.deepEqual(schedule(scheduler, b), { accepted: true });
+  release(scheduler, b);
+  const x = turn("chatgpt", null), y = turn("chatgpt", null);
+  assert.deepEqual(schedule(scheduler, x), { accepted: true });
+  assert.deepEqual(schedule(scheduler, y), { accepted: true });
+  release(scheduler, x);
+  release(scheduler, y);
+});
+
 test("lifecycle record, exclusive lock, stale owner recovery", async t => {
   const home = await tempHome();
   t.after(() => rm(home, { recursive: true, force: true }));

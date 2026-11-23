@@ -45,8 +45,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   // Every ask/code request goes to both providers unless the caller narrows it.
   // With geminiMode below, the default pair is "gemini in Task mode + chatgpt".
   defaultProviders: ["gemini", "chatgpt"],
-  // Serial by default; concurrent browser tabs interfere on known setups.
-  defaultConcurrency: 1,
+  // Dual-provider parallel by default; pass `--concurrency 1` for explicit serial fallback.
+  defaultConcurrency: 2,
   defaultTimeoutSeconds: 1200,
   maxTimeoutSeconds: 7200,
   // Same pair and same order as defaultProviders: compare must not silently
@@ -61,3 +61,4 @@ export const DEFAULT_CONFIG = Object.freeze({
 
   downloadImages: false,
 });
+

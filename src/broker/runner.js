@@ -110,7 +110,7 @@ export function createCdpRunner({
     }
   }
 
-  async function run(turn, signal) {
+  async function run(turn, signal, { onProgress } = {}) {
     if (signal?.aborted) {
       return { status: "failed", reason: "cancelled", text: "" };
     }
@@ -135,6 +135,10 @@ export function createCdpRunner({
     const effectiveMode = ["background", "visible", "headless"].includes(turn?.mode)
       ? turn.mode
       : runnerMode;
+    const effectiveChromePath = turn?.chromePath ?? chromePath;
+    const effectiveSettleMs = turn?.settleMs ?? settleMs;
+    const effectiveStallTimeoutMs = turn?.stallTimeoutMs ?? stallTimeoutMs;
+    const effectiveHardTimeoutMs = turn?.hardTimeoutMs ?? hardTimeoutMs;
 
     try {
       if (turnController.signal.aborted) {
@@ -146,7 +150,7 @@ export function createCdpRunner({
         rec = await dedupedRecover({
           home: runnerHome,
           mode: effectiveMode,
-          chromePath,
+          chromePath: effectiveChromePath,
         });
       } catch (err) {
         return {
@@ -182,15 +186,25 @@ export function createCdpRunner({
         onSendAborted: () => journal.clearCommit(runnerHome, turnId),
       };
 
+      const onWait = typeof onProgress === "function"
+        ? (remainingMs) => {
+            if (Number.isFinite(remainingMs) && remainingMs > 0) {
+              onProgress({ cooldownWaitMs: remainingMs, cooldownWaitAt: Date.now() });
+            }
+          }
+        : undefined;
+
       const result = await runTurnFn({
         provider: turn.provider,
         prompt: turn.prompt,
         home: runnerHome,
         mode: effectiveMode,
-        chromePath,
-        settleMs,
-        stallTimeoutMs,
-        hardTimeoutMs,
+        chromePath: effectiveChromePath,
+        settleMs: effectiveSettleMs,
+        stallTimeoutMs: effectiveStallTimeoutMs,
+        hardTimeoutMs: effectiveHardTimeoutMs,
+        ...(turn?.minIntervalMs != null ? { minIntervalMs: turn.minIntervalMs } : {}),
+        ...(onWait ? { onWait } : {}),
         signal: turnController.signal,
         deps: turnDeps,
       });

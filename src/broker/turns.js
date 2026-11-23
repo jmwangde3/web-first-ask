@@ -21,19 +21,38 @@ function invalid(message, code = "INVALID_ARGUMENT") {
   return error;
 }
 
-export function createTurn({ id = randomUUID(), provider, prompt, conversationId = null,
-  mode = "background", createdAt = new Date().toISOString() } = {}) {
+export function createTurn({
+  id = randomUUID(),
+  provider,
+  prompt,
+  conversationId = null,
+  mode = "background",
+  settleMs = null,
+  stallTimeoutMs = null,
+  hardTimeoutMs = null,
+  minIntervalMs = null,
+  chromePath = null,
+  createdAt = new Date().toISOString(),
+} = {}) {
   if (typeof id !== "string" || !id.trim() ||
       !["chatgpt", "gemini"].includes(provider) ||
       typeof prompt !== "string" || !prompt.trim() ||
       (conversationId !== null && (typeof conversationId !== "string" || !conversationId.trim())) ||
       typeof mode !== "string" || !mode.trim() ||
+      (settleMs !== null && (!Number.isFinite(settleMs) || settleMs < 0)) ||
+      (stallTimeoutMs !== null && (!Number.isFinite(stallTimeoutMs) || stallTimeoutMs <= 0)) ||
+      (hardTimeoutMs !== null && (!Number.isFinite(hardTimeoutMs) || hardTimeoutMs <= 0)) ||
+      (minIntervalMs !== null && (!Number.isSafeInteger(minIntervalMs) || minIntervalMs < 0)) ||
+      (chromePath !== null && (typeof chromePath !== "string" || !chromePath.trim())) ||
       typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) {
     throw invalid("Invalid turn arguments");
   }
   return {
-    id, provider, prompt, conversationId, mode, createdAt,
+    id, provider, prompt, conversationId, mode,
+    settleMs, stallTimeoutMs, hardTimeoutMs, minIntervalMs, chromePath,
+    createdAt,
     state: "queued", startedAt: null, finishedAt: null,
+    cooldownWaitMs: null, cooldownWaitAt: null,
     sendCommittedAt: null, text: null, reason: null, evidence: null,
   };
 }

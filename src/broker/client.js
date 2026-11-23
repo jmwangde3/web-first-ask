@@ -7,6 +7,7 @@ function coded(code, cause) {
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const WAIT_DONE_STATES = new Set(["completed", "failed", "stalled", "needs_human", "takeover"]);
 
 export async function discoverBroker(home) {
   const record = await readBrokerRecord(home);
@@ -76,3 +77,39 @@ export const getStatus = record => request(record, "GET", "/status");
 export const createTurn = (record, payload) => request(record, "POST", "/turns", payload);
 export const getTurn = (record, id) => request(record, "GET", `/turns/${encodeURIComponent(id)}`);
 export const cancelTurn = (record, id) => request(record, "POST", `/turns/${encodeURIComponent(id)}/cancel`);
+
+export async function waitForTurn({
+  record,
+  turnId,
+  timeoutMs = 900000,
+  pollIntervalMs = 1000,
+  onProgress,
+  deps = {},
+} = {}) {
+  if (!record || typeof turnId !== "string" || !turnId.trim() ||
+      !Number.isFinite(timeoutMs) || timeoutMs <= 0 ||
+      !Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+    throw coded("INVALID_ARGUMENT");
+  }
+  const getTurnFn = deps.getTurn || getTurn;
+  const sleepFn = deps.sleep || sleep;
+  const nowFn = deps.now || (() => Date.now());
+  const onProgressFn = onProgress || deps.onProgress;
+  const deadline = nowFn() + timeoutMs;
+
+  while (nowFn() < deadline) {
+    const res = await getTurnFn(record, turnId);
+    const turn = res?.json;
+    if (turn && WAIT_DONE_STATES.has(turn.state)) {
+      return turn;
+    }
+    if (turn && typeof onProgressFn === "function") {
+      onProgressFn(turn);
+    }
+    const remaining = deadline - nowFn();
+    if (remaining <= 0) break;
+    await sleepFn(Math.min(pollIntervalMs, remaining));
+  }
+
+  throw coded("TIMEOUT");
+}

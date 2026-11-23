@@ -47,7 +47,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   const instanceId = lock.instanceId;
   const token = randomUUID();
   const startedAt = new Date().toISOString();
-  const scheduler = createScheduler();
+  const scheduler = createScheduler({ maxPerProvider: 2 });
   const turns = new Map();
   const controllers = new Map();
   const active = new Map();
@@ -71,10 +71,20 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     else idleSince ??= Date.now();
   }
 
+  function updateProgress(id, patch) {
+    const current = turns.get(id);
+    if (current?.state !== "running" || !patch || typeof patch !== "object" || Array.isArray(patch)) return;
+    const { id: _id, state: _state, provider: _provider, prompt: _prompt,
+      conversationId: _conversationId, ...fields } = patch;
+    turns.set(id, { ...current, ...fields });
+  }
+
   function finish(id, state, patch = {}) {
     const current = turns.get(id);
     if (current?.state !== "running") return;
     turns.set(id, transition(current, state, {
+      cooldownWaitMs: null,
+      cooldownWaitAt: null,
       ...patch,
       ...((TERMINAL_STATES.includes(state)) ? { finishedAt: new Date().toISOString() } : {}),
     }));
@@ -88,7 +98,9 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     const task = (async () => {
       await Promise.resolve();
       try {
-        const result = await runner.run(running, controller.signal);
+        const result = await runner.run(running, controller.signal, {
+          onProgress: (patch) => updateProgress(turn.id, patch),
+        });
         const status = result?.status;
         const next = ["completed", "needs_human", "stalled", "failed"].includes(status)
           ? status : "failed";
@@ -161,8 +173,17 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         });
         return;
       }
-      const turn = createTurn({ provider: body.provider, prompt: body.prompt,
-        conversationId: body.conversationId, mode: body.mode });
+      const turn = createTurn({
+        provider: body.provider,
+        prompt: body.prompt,
+        conversationId: body.conversationId,
+        mode: body.mode,
+        ...(body.settleMs !== undefined ? { settleMs: body.settleMs } : {}),
+        ...(body.stallTimeoutMs !== undefined ? { stallTimeoutMs: body.stallTimeoutMs } : {}),
+        ...(body.hardTimeoutMs !== undefined ? { hardTimeoutMs: body.hardTimeoutMs } : {}),
+        ...(body.minIntervalMs !== undefined ? { minIntervalMs: body.minIntervalMs } : {}),
+        ...(body.chromePath !== undefined ? { chromePath: body.chromePath } : {}),
+      });
       turns.set(turn.id, turn);
       const decision = schedule(scheduler, turn);
       if (decision.accepted) runTurn(turn);

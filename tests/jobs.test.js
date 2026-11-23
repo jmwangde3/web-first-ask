@@ -39,14 +39,13 @@ test("Gemini image attachments are rejected before upstream launch", () => {
   }), /image attachments for Gemini/);
 });
 
-test("concurrency defaults to one and explicit parallelism remains available", () => {
-  // Serial is the safe default: concurrent browser tabs collide on the setups
-  // this tool runs on. Parallelism stays available when asked for explicitly.
-  assert.equal(validateConcurrency(undefined, 1, 3), 1);
-  assert.equal(validateConcurrency(undefined, 2, 3), 1);
+test("concurrency defaults to two and explicit serial fallback remains available", () => {
+  assert.equal(validateConcurrency(undefined, 1, 3), 2);
+  assert.equal(validateConcurrency(undefined, 2, 3), 2);
   assert.equal(validateConcurrency(1, 2, 3), 1);
   assert.equal(validateConcurrency(2, 2, 3), 2);
   assert.equal(validateConcurrency(3, 2, 3), 3);
   assert.throws(() => validateConcurrency(0, 2, 3), /between 1 and 3/);
   assert.throws(() => validateConcurrency(4, 2, 3), /between 1 and 3/);
 });
+
