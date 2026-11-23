@@ -45,7 +45,15 @@ export async function clearBrokerRecord(home, expectedInstanceId) {
     const current = await readBrokerRecord(home);
     if (!current || current.instanceId !== expectedInstanceId) return;
   }
-  await fs.rm(file, { force: true });
+  try {
+    await fs.rm(file, { force: true });
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (expectedInstanceId !== undefined) {
+    const after = await readBrokerRecord(home);
+    if (after && after.instanceId !== expectedInstanceId) return;
+  }
 }
 
 function pidAlive(pid) {
@@ -58,21 +66,29 @@ function pidAlive(pid) {
   }
 }
 
+async function fetchStatusOnce(record, timeoutMs) {
+  const response = await fetch(`http://127.0.0.1:${record.port}/status`, {
+    headers: { "x-wfa-token": record.token },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) return { ok: false, retryable: false };
+  const data = await response.json();
+  return { ok: data.instanceId === record.instanceId && data.pid === record.pid, retryable: false };
+}
+
 export async function isInstanceAlive(record) {
   if (!record || !pidAlive(record.pid) || record.host !== "127.0.0.1" ||
       !Number.isInteger(record.port) || record.port < 1 || record.port > 65535 ||
       typeof record.token !== "string") return false;
-  try {
-    const response = await fetch(`http://127.0.0.1:${record.port}/status`, {
-      headers: { "x-wfa-token": record.token },
-      signal: AbortSignal.timeout(300),
-    });
-    if (!response.ok) return false;
-    const data = await response.json();
-    return data.instanceId === record.instanceId && data.pid === record.pid;
-  } catch {
-    return false;
+  for (const timeoutMs of [300, 600]) {
+    try {
+      const result = await fetchStatusOnce(record, timeoutMs);
+      return result.ok;
+    } catch {
+      if (timeoutMs === 600 || !pidAlive(record.pid)) return false;
+    }
   }
+  return false;
 }
 
 export async function acquireInstanceLock(home) {
@@ -80,14 +96,13 @@ export async function acquireInstanceLock(home) {
   const lockPath = path.join(dir, "broker.lock");
   await fs.mkdir(dir, { recursive: true });
   const instanceId = randomUUID();
+  const payload = JSON.stringify({ pid: process.pid, instanceId }) + "\n";
+
   for (let attempt = 0; attempt < 2; attempt++) {
-    let handle;
+    const temp = `${lockPath}.${process.pid}.${instanceId}.tmp`;
     try {
-      handle = await fs.open(lockPath, "wx", 0o600);
-      await handle.writeFile(JSON.stringify({ pid: process.pid, instanceId }) + "\n", "utf8");
-      await handle.sync();
-      await handle.close();
-      handle = null;
+      await fs.writeFile(temp, payload, { flag: "wx", mode: 0o600 });
+      await fs.link(temp, lockPath);
       let released = false;
       return {
         instanceId,
@@ -103,10 +118,6 @@ export async function acquireInstanceLock(home) {
         },
       };
     } catch (error) {
-      if (handle) {
-        await handle.close().catch(() => {});
-        if (error?.code !== "EEXIST") await fs.rm(lockPath, { force: true }).catch(() => {});
-      }
       if (error?.code !== "EEXIST") throw error;
       if (attempt === 1) return null;
       let old;
@@ -117,6 +128,8 @@ export async function acquireInstanceLock(home) {
       try { latest = JSON.parse(await fs.readFile(lockPath, "utf8")); } catch { latest = null; }
       if (latest && pidAlive(latest.pid)) return null;
       await fs.rm(lockPath, { force: true }).catch(() => {});
+    } finally {
+      await fs.rm(temp, { force: true }).catch(() => {});
     }
   }
   return null;

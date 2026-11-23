@@ -1,4 +1,7 @@
-import { clearBrokerRecord, isInstanceAlive, readBrokerRecord } from "./lifecycle.js";
+import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { clearBrokerRecord, getBrokerPaths, isInstanceAlive, readBrokerRecord } from "./lifecycle.js";
 
 function coded(code, cause) {
   const error = new Error(code, cause ? { cause } : undefined);
@@ -8,39 +11,150 @@ function coded(code, cause) {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const WAIT_DONE_STATES = new Set(["completed", "failed", "stalled", "needs_human", "takeover"]);
+const START_LOCK_STALE_MS = 30000;
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function isStartLockStale(entry, now = Date.now()) {
+  if (!entry || typeof entry !== "object") return false;
+  if (!pidAlive(entry.pid)) return true;
+  return !Number.isFinite(entry.createdAt) || (now - entry.createdAt > START_LOCK_STALE_MS);
+}
+
+async function readStartLock(lockPath) {
+  try {
+    return JSON.parse(await fs.readFile(lockPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function acquireStartLock(home) {
+  const { home: dir } = getBrokerPaths(home);
+  const lockPath = path.join(dir, "broker-start.lock");
+  await fs.mkdir(dir, { recursive: true });
+  const lockId = randomUUID();
+  const payload = JSON.stringify({ pid: process.pid, createdAt: Date.now(), lockId }) + "\n";
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let handle;
+    try {
+      handle = await fs.open(lockPath, "wx", 0o600);
+      await handle.writeFile(payload, "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = null;
+      let released = false;
+      return {
+        async release() {
+          if (released) return;
+          released = true;
+          try {
+            const stored = JSON.parse(await fs.readFile(lockPath, "utf8"));
+            if (stored.lockId === lockId) {
+              await fs.rm(lockPath, { force: true }).catch(() => {});
+            }
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+          }
+        },
+      };
+    } catch (error) {
+      if (handle) {
+        await handle.close().catch(() => {});
+        if (error?.code !== "EEXIST") await fs.rm(lockPath, { force: true }).catch(() => {});
+      }
+      if (error?.code !== "EEXIST") throw error;
+      if (attempt === 2) return null;
+
+      let old = await readStartLock(lockPath);
+      if (!old) {
+        await sleep(25);
+        old = await readStartLock(lockPath);
+        if (!old) {
+          try {
+            const st = await fs.stat(lockPath);
+            if (Date.now() - st.mtimeMs <= START_LOCK_STALE_MS) return null;
+          } catch (statErr) {
+            if (statErr?.code === "ENOENT") continue;
+            return null;
+          }
+          await fs.rm(lockPath, { force: true }).catch(() => {});
+          continue;
+        }
+      }
+      if (!isStartLockStale(old)) return null;
+
+      const latest = await readStartLock(lockPath);
+      if (latest && (!isStartLockStale(latest) || latest.pid !== old.pid ||
+          latest.createdAt !== old.createdAt || latest.lockId !== old.lockId)) {
+        return null;
+      }
+      await fs.rm(lockPath, { force: true }).catch(() => {});
+    }
+  }
+  return null;
+}
 
 export async function discoverBroker(home) {
   const record = await readBrokerRecord(home);
   return record && await isInstanceAlive(record) ? record : null;
 }
 
-export async function ensureBroker({ home, spawnBroker, timeoutMs = 15000 } = {}) {
+export async function ensureBroker({ home, spawnBroker, timeoutMs = 30000 } = {}) {
   if (typeof spawnBroker !== "function" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw coded("INVALID_ARGUMENT");
   }
   const existing = await discoverBroker(home);
   if (existing) return existing;
-  const stale = await readBrokerRecord(home);
-  if (stale) {
-    let dead = false;
-    try { process.kill(stale.pid, 0); } catch (error) { dead = error?.code === "ESRCH"; }
-    if (dead) await clearBrokerRecord(home, stale.instanceId);
-  }
+
   const deadline = Date.now() + timeoutMs;
-  let timer;
-  try {
-    await Promise.race([
-      Promise.resolve().then(() => spawnBroker()),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(coded("BROKER_TIMEOUT")), timeoutMs);
-      }),
-    ]);
-  } catch (error) {
-    // Another caller may have won the instance lock and be starting the broker.
-    if (error?.code !== "BROKER_LOCKED") throw error;
-  } finally {
-    clearTimeout(timer);
+  const startLock = await acquireStartLock(home);
+  if (startLock) {
+    try {
+      const rechecked = await discoverBroker(home);
+      if (rechecked) return rechecked;
+
+      const stale = await readBrokerRecord(home);
+      if (stale && !pidAlive(stale.pid)) {
+        await clearBrokerRecord(home, stale.instanceId);
+      }
+
+      const remaining = Math.max(1, deadline - Date.now());
+      let timer;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => spawnBroker()),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(coded("BROKER_TIMEOUT")), remaining);
+          }),
+        ]);
+      } catch (error) {
+        // Another caller may have won the instance lock and be starting the broker.
+        if (error?.code !== "BROKER_LOCKED") throw error;
+      } finally {
+        clearTimeout(timer);
+      }
+
+      while (Date.now() < deadline) {
+        const record = await discoverBroker(home);
+        if (record) return record;
+        await sleep(Math.min(100, Math.max(1, deadline - Date.now())));
+      }
+      throw coded("BROKER_TIMEOUT");
+    } finally {
+      await startLock.release().catch(() => {});
+    }
   }
+
   while (Date.now() < deadline) {
     const record = await discoverBroker(home);
     if (record) return record;

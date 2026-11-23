@@ -24,6 +24,19 @@ function createMockStream() {
   };
 }
 
+// Batch1+: runCdpCommand ask routes through the broker. Tests inject the
+// ensureBroker/createTurn/waitForTurn trio instead of the removed runCdpTurn.
+function mockBrokerDeps(turnResult) {
+  const record = { instanceId: "mock-inst", pid: 5000, port: 9444, host: "127.0.0.1", token: "tok" };
+  const created = { status: 202, json: { id: "mock-turn-1" } };
+  const waitStates = Array.isArray(turnResult) ? turnResult.slice() : [turnResult];
+  return {
+    ensureBroker: async () => record,
+    createTurn: async () => created,
+    waitForTurn: async () => waitStates.shift() ?? waitStates[waitStates.length - 1] ?? {},
+  };
+}
+
 test("runCdpTurn: full successful flow with SAFE_START, verifies driver.submitTurn is called and status is completed", async () => {
   let submitTurnCalled = false;
   let typePromptText = "";
@@ -376,34 +389,38 @@ test("runCdpCommand ask --json: normal output can be parsed by JSON.parse", asyn
   const stdout = createMockStream();
   const stderr = createMockStream();
 
-  const mockTurnResult = {
-    status: "completed",
+  const mockTurn = {
+    state: "completed",
+    provider: "chatgpt",
     text: "console.log('JSON test');",
     reason: "completed",
     evidence: { answerChars: 25 },
-    conversationUrl: "https://chatgpt.com/c/123",
-    browser: { pid: 5000, port: 9222, mode: "background", reused: true },
-    elapsedMs: 2500,
+    sendCommittedAt: Date.now(),
+    startedAt: new Date(Date.now() - 2500).toISOString(),
+    finishedAt: new Date().toISOString(),
   };
 
+  let seenPayload;
   const res = await runCdpCommand(
     ["ask", "--provider", "chatgpt", "--prompt", "Test prompt", "--json"],
     {
       stdout,
       stderr,
-      runCdpTurn: async (opts) => {
-        assert.equal(opts.provider, "chatgpt");
-        assert.equal(opts.prompt, "Test prompt");
-        return mockTurnResult;
+      ...mockBrokerDeps(mockTurn),
+      createTurn: async (record, payload) => {
+        seenPayload = payload;
+        return { status: 202, json: { id: "mock-turn-1" } };
       },
     },
   );
 
   assert.equal(res.code, 0);
+  assert.equal(seenPayload.provider, "chatgpt");
+  assert.equal(seenPayload.prompt, "Test prompt");
   const parsed = JSON.parse(stdout.output);
   assert.equal(parsed.status, "completed");
   assert.equal(parsed.text, "console.log('JSON test');");
-  assert.equal(parsed.browser.pid, 5000);
+  assert.equal(parsed.provider, "chatgpt");
 });
 
 test("runCdpCommand: unknown subcommand returns code: 2", async () => {
@@ -506,15 +523,18 @@ test("runCdpCommand ask: non-json prints [cdp] prefix and text on completion", a
   const stdout = createMockStream();
   const stderr = createMockStream();
 
+  const mockTurn = {
+    state: "completed",
+    provider: "gemini",
+    text: "Gemini text response\n",
+    startedAt: new Date(Date.now() - 1200).toISOString(),
+    finishedAt: new Date().toISOString(),
+  };
+
   const res = await runCdpCommand(["ask", "--provider=gemini", "--prompt=hello"], {
     stdout,
     stderr,
-    runCdpTurn: async () => ({
-      status: "completed",
-      text: "Gemini text response\n",
-      elapsedMs: 1200,
-      browser: { pid: 100, port: 9222, mode: "background", reused: true },
-    }),
+    ...mockBrokerDeps(mockTurn),
   });
 
   assert.equal(res.code, 0);
@@ -526,15 +546,19 @@ test("runCdpCommand ask: non-completed turn returns code: 1", async () => {
   const stdout = createMockStream();
   const stderr = createMockStream();
 
+  const mockTurn = {
+    state: "failed",
+    provider: "chatgpt",
+    reason: "EDITOR_NOT_FOUND",
+    text: "",
+    startedAt: new Date(Date.now() - 800).toISOString(),
+    finishedAt: new Date().toISOString(),
+  };
+
   const res = await runCdpCommand(["ask", "--provider", "chatgpt", "--prompt", "fail test"], {
     stdout,
     stderr,
-    runCdpTurn: async () => ({
-      status: "failed",
-      reason: "EDITOR_NOT_FOUND",
-      text: "",
-      elapsedMs: 800,
-    }),
+    ...mockBrokerDeps(mockTurn),
   });
 
   assert.equal(res.code, 1);
@@ -552,16 +576,20 @@ test("runCdpCommand ask: reads from --prompt-file", async () => {
 
   try {
     let receivedPrompt = "";
+    const mockTurn = {
+      state: "completed",
+      provider: "chatgpt",
+      text: "OK",
+      startedAt: new Date(Date.now() - 500).toISOString(),
+      finishedAt: new Date().toISOString(),
+    };
     const res = await runCdpCommand(["ask", "--provider", "chatgpt", "--prompt-file", promptFile], {
       stdout,
       stderr,
-      runCdpTurn: async (opts) => {
-        receivedPrompt = opts.prompt;
-        return {
-          status: "completed",
-          text: "OK",
-          elapsedMs: 500,
-        };
+      ...mockBrokerDeps(mockTurn),
+      createTurn: async (record, payload) => {
+        receivedPrompt = payload.prompt;
+        return { status: 202, json: { id: "mock-turn-1" } };
       },
     });
 

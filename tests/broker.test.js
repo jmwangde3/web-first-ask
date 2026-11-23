@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createTurn, canTransition, transition, publicView, isSendCommitted, TERMINAL_STATES } from "../src/broker/turns.js";
@@ -237,4 +238,123 @@ test("ensureBroker discovers and spawns; off mode idles out", async t => {
   assert.equal((await ensureBroker({ home, spawnBroker: () => { spawned++; } })).instanceId, server.instanceId);
   assert.equal(spawned, 1);
   await eventually(async () => await discoverBroker(home) === null);
+});
+
+test("8 concurrent ensureBroker calls trigger only 1 spawnBroker and all receive the same record", async t => {
+  const home = await tempHome();
+  let server;
+  t.after(async () => { await server?.close(); await rm(home, { recursive: true, force: true }); });
+  let spawned = 0;
+  const spawnBroker = async () => {
+    spawned++;
+    await delay(50);
+    server = await startBroker({
+      home,
+      mode: "tray",
+      runner: { run: async () => ({ status: "completed" }), cancel() {} },
+    });
+  };
+  const records = await Promise.all(
+    Array.from({ length: 8 }, () => ensureBroker({ home, timeoutMs: 5000, spawnBroker }))
+  );
+  assert.equal(spawned, 1);
+  for (const r of records) {
+    assert.deepEqual(r, records[0]);
+    assert.equal(r.instanceId, server.instanceId);
+  }
+});
+
+test("ensureBroker recovers stale broker-start.lock with dead pid without deadlocking", async t => {
+  const home = await tempHome();
+  let server;
+  t.after(async () => { await server?.close(); await rm(home, { recursive: true, force: true }); });
+  await writeFile(
+    path.join(home, "broker-start.lock"),
+    JSON.stringify({ pid: 2147483647, createdAt: Date.now(), lockId: "stale-lock" }),
+  );
+  let spawned = 0;
+  const record = await ensureBroker({
+    home,
+    timeoutMs: 3000,
+    spawnBroker: async () => {
+      spawned++;
+      server = await startBroker({
+        home,
+        mode: "tray",
+        runner: { run: async () => ({ status: "completed" }), cancel() {} },
+      });
+    },
+  });
+  assert.equal(spawned, 1);
+  assert.equal(record.instanceId, server.instanceId);
+});
+
+test("clearBrokerRecord concurrent calls do not throw ENOENT or safe-delete errors", async t => {
+  const home = await tempHome();
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const record = {
+    schema: 1,
+    instanceId: "concurrent-clear",
+    pid: process.pid,
+    host: "127.0.0.1",
+    port: 40002,
+    token: "secret",
+  };
+  await writeBrokerRecord(home, record);
+  await Promise.all(
+    Array.from({ length: 8 }, () => clearBrokerRecord(home, record.instanceId))
+  );
+  assert.equal(await readBrokerRecord(home), null);
+  await clearBrokerRecord(home, record.instanceId);
+});
+
+test("acquireInstanceLock writes complete JSON atomically under concurrent contention", async t => {
+  const home = await tempHome();
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const results = await Promise.all(
+    Array.from({ length: 8 }, () => acquireInstanceLock(home))
+  );
+  const winners = results.filter(Boolean);
+  assert.equal(winners.length, 1);
+  const raw = await readFile(path.join(home, "broker.lock"), "utf8");
+  const parsed = JSON.parse(raw);
+  assert.equal(parsed.pid, process.pid);
+  assert.equal(parsed.instanceId, winners[0].instanceId);
+  await winners[0].release();
+});
+
+test("isInstanceAlive retries once after single fetch timeout and returns true", async t => {
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits++;
+    if (req.url !== "/status" || req.headers["x-wfa-token"] !== "tok") {
+      res.writeHead(401);
+      res.end();
+      return;
+    }
+    if (hits === 1) {
+      setTimeout(() => {
+        if (!res.writableEnded) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ instanceId: "retry-inst", pid: process.pid }));
+        }
+      }, 450);
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ instanceId: "retry-inst", pid: process.pid }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const { port } = server.address();
+  const record = {
+    schema: 1,
+    instanceId: "retry-inst",
+    pid: process.pid,
+    host: "127.0.0.1",
+    port,
+    token: "tok",
+  };
+  assert.equal(await isInstanceAlive(record), true);
+  assert.equal(hits, 2);
 });
