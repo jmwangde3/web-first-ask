@@ -427,6 +427,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       userTurns: 0,
       answerTurns: 0,
       answerText: "",
+      answerActionsVisible: null,
       stopVisible: false,
       editorEmpty: false,
       title: "",
@@ -456,6 +457,9 @@ export async function readTurnState(cdp, sessionId, adapter) {
       userTurns: Number(parsed.userTurns) || 0,
       answerTurns: Number(parsed.answerTurns) || 0,
       answerText: typeof parsed.answerText === "string" ? parsed.answerText : "",
+      answerActionsVisible: parsed.answerActionsVisible === null || parsed.answerActionsVisible === undefined
+        ? null
+        : Boolean(parsed.answerActionsVisible),
       stopVisible: Boolean(parsed.stopVisible),
       editorEmpty: parsed.editorEmpty !== null && parsed.editorEmpty !== undefined ? Boolean(parsed.editorEmpty) : null,
       title: typeof parsed.title === "string" ? parsed.title : "",
@@ -472,6 +476,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       userTurns: 0,
       answerTurns: 0,
       answerText: "",
+      answerActionsVisible: null,
       stopVisible: false,
       editorEmpty: null,
       title: "",
@@ -624,17 +629,28 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     const stopVisibleForMs = stopVisibleSince === null ? 0 : now() - stopVisibleSince;
     const stopGone = !state.stopVisible;
     const stopDegraded = state.stopVisible && stopVisibleForMs >= stopGraceMs;
+    // 若 adapter 提供回答完成标记（如 Gemini 的 message-actions），它必须可见才算完成。
+    // 真机证据（2026-11-24）：Gemini 长思考暂停时停止按钮会消失，仅靠 stopGone 会把
+    // 只输出了 18 字符的回答判为完成，而完整回答（20575 字符）要几十秒后才继续生成。
+    const actionsDone = state.answerActionsVisible === null || state.answerActionsVisible === undefined
+      ? true
+      : state.answerActionsVisible === true;
+    const actionsGraceMs = 180000;
+    const actionsStale = !actionsDone && (now() - lastProgressAt) >= actionsGraceMs;
 
-    if (hasAnswer && settled && (stopGone || stopDegraded)) {
+    if (hasAnswer && settled && (stopGone || stopDegraded) && (actionsDone || actionsStale)) {
       return {
         status: "completed",
-        reason: stopDegraded ? "completed_stop_signal_unreliable" : "completed",
+        reason: actionsStale
+          ? "completed_actions_unverified"
+          : (stopDegraded ? "completed_stop_signal_unreliable" : "completed"),
         text: state.answerText,
         elapsedMs: now() - startTime,
         evidence: {
           ...buildEvidence(state, now() - lastProgressAt),
           stopVisibleForMs,
           stopSignalDegraded: stopDegraded,
+          actionsUnverified: actionsStale,
         },
       };
     }

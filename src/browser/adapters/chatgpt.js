@@ -61,16 +61,42 @@ export function buildReadStateJs() {
     answerTurns = document.querySelectorAll('article[data-message-author-role="assistant"]').length;
   }
 
+  // 真机核实（2026-11-24）：DOM innerText 不包含代码围栏, 导致 native CDP
+  // 拿到的回答无法被 parseFileBlocks 解析。这里按 pre/code-block 重建围栏。
+  const FENCE = String.fromCharCode(96, 96, 96);
+  const LF = String.fromCharCode(10);
+  const CODE_SEL = "pre, code-block, code[class*=block]";
+  const LABEL_RE = /^(代码|CODE|Code|code|[A-Za-z0-9+#._-]{1,20})$/;
+  const withCodeFences = (root) => {
+    let text = String((root && (root.innerText || root.textContent)) || "").trim();
+    const blocks = root && typeof root.querySelectorAll === "function"
+      ? [...root.querySelectorAll(CODE_SEL)].filter((el) => !el.parentElement || !el.parentElement.closest(CODE_SEL))
+      : [];
+    let searchFrom = 0;
+    for (const el of blocks) {
+      const code = String((el.innerText || el.textContent) || "").trim();
+      if (!code) continue;
+      const idx = text.indexOf(code, searchFrom);
+      if (idx === -1) continue;
+      let head = text.slice(0, idx);
+      const headBody = head.endsWith(LF) ? head.slice(0, head.length - 1) : head;
+      const nl = headBody.lastIndexOf(LF);
+      if (LABEL_RE.test(headBody.slice(nl + 1).trim())) head = headBody.slice(0, nl + 1);
+      text = head + FENCE + LF + code + LF + FENCE + text.slice(idx + code.length);
+      searchFrom = head.length + code.length + 8;
+    }
+    return text;
+  };
   let answerText = "";
   const lastH = assistantHs[assistantHs.length - 1];
   const nextEl = lastH && lastH.nextElementSibling;
   if (nextEl) {
-    answerText = (nextEl.innerText || nextEl.textContent || "").trim();
+    answerText = withCodeFences(nextEl);
   } else if (answerTurns > 0) {
     const articles = document.querySelectorAll('article[data-message-author-role="assistant"]');
     const lastArt = articles[articles.length - 1];
     if (lastArt) {
-      answerText = (lastArt.innerText || lastArt.textContent || "").trim();
+      answerText = withCodeFences(lastArt);
     }
   }
 

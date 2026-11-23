@@ -71,11 +71,50 @@ export function buildReadStateJs() {
   const modelResponses = document.querySelectorAll("model-response");
   const answerTurns = modelResponses.length;
 
+  // 真机核实（2026-11-24）：DOM innerText 不包含代码围栏, native CDP 的回答
+  // 因此无法被 parseFileBlocks 解析。这里按 pre/code-block 重建围栏。
+  const FENCE = String.fromCharCode(96, 96, 96);
+  const LF = String.fromCharCode(10);
+  const CODE_SEL = "pre, code-block, code[class*=block]";
+  const LABEL_RE = /^(代码|CODE|Code|code|[A-Za-z0-9+#._-]{1,20})$/;
+  const withCodeFences = (root) => {
+    let text = String((root && (root.innerText || root.textContent)) || "").trim();
+    const blocks = root && typeof root.querySelectorAll === "function"
+      ? [...root.querySelectorAll(CODE_SEL)].filter((el) => !el.parentElement || !el.parentElement.closest(CODE_SEL))
+      : [];
+    let searchFrom = 0;
+    for (const el of blocks) {
+      const code = String((el.innerText || el.textContent) || "").trim();
+      if (!code) continue;
+      const idx = text.indexOf(code, searchFrom);
+      if (idx === -1) continue;
+      let head = text.slice(0, idx);
+      const headBody = head.endsWith(LF) ? head.slice(0, head.length - 1) : head;
+      const nl = headBody.lastIndexOf(LF);
+      if (LABEL_RE.test(headBody.slice(nl + 1).trim())) head = headBody.slice(0, nl + 1);
+      text = head + FENCE + LF + code + LF + FENCE + text.slice(idx + code.length);
+      searchFrom = head.length + code.length + 8;
+    }
+    return text;
+  };
   let answerText = "";
   const last = modelResponses[modelResponses.length - 1];
   if (last) {
     const body = last.querySelector("message-content, .markdown") ?? last;
-    answerText = ((body.innerText || body.textContent || "").trim()).replace(/^(Gemini|Bard)\\s*(said|说)\\s*[:：]?\\s*/i, "").trim();
+    answerText = withCodeFences(body).replace(/^(Gemini|Bard)\\s*(said|说)\\s*[:：]?\\s*/i, "").trim();
+  }
+
+  // 真机核实（2026-11-24）：生成中与思考暂停期间都读不到 message-actions，
+  // 回答完整结束后才出现操作栏（copy/thumb/regenerate）。这是比停止按钮可靠的完成信号。
+  let answerActionsVisible = null;
+  if (last) {
+    const actions = last.querySelector("message-actions");
+    if (actions) {
+      const ar = typeof actions.getBoundingClientRect === "function" ? actions.getBoundingClientRect() : null;
+      answerActionsVisible = ar ? ar.width > 0 && ar.height > 0 : true;
+    } else {
+      answerActionsVisible = false;
+    }
   }
 
   const editor = document.querySelector('rich-textarea div[contenteditable="true"], div.ql-editor[contenteditable="true"]');
@@ -138,6 +177,7 @@ export function buildReadStateJs() {
     userTurns,
     answerTurns,
     answerText,
+    answerActionsVisible,
     stopVisible,
     editorEmpty,
     title,

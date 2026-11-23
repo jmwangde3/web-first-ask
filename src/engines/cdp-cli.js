@@ -12,6 +12,7 @@ import { sleep as defaultSleep } from "../util.js";
 import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
 import { ensureBroker, createTurn, waitForTurn } from "../broker/client.js";
 import { spawnDetachedBroker } from "../broker/cli.js";
+import { stageCdpResponse as defaultStageCdpResponse } from "./cdp-stage.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -29,6 +30,7 @@ const VALUE_FLAGS = new Set([
   "min-interval",
   "conversation-id",
   "request-id",
+  "workspace",
 ]);
 
 function parseArgs(argv) {
@@ -85,6 +87,7 @@ Commands:
   wfa cdp ask    --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
                  [--mode background|visible|headless] [--conversation-id <id>] [--request-id <id>] [--json]
                  [--timeout <s>] [--settle <ms>] [--min-interval <ms>]
+                 [--no-stage] [--workspace <dir>]
   wfa cdp status [--json]
   wfa cdp login  [--provider <chatgpt|gemini>] [--mode visible|background]
                  [--timeout <seconds>] [--json]
@@ -100,6 +103,8 @@ Options:
   --timeout <seconds>        Overall / stall timeout in seconds
   --settle <ms>              Answer stabilization window in milliseconds (default: 4000)
   --min-interval <ms>        Minimum interval between provider turns in milliseconds
+  --no-stage                 Disable automatic file staging for code responses
+  --workspace <dir>          Target workspace root for staging (default: current directory)
   --help, -h                 Show this help message
 `);
 }
@@ -566,20 +571,67 @@ async function handleAsk(argv, deps) {
     ? Math.max(0, finishedAtMs - startedAtMs)
     : Math.max(0, Date.now() - startTime);
 
+  const rawText = turn.text ?? "";
   const result = {
     id: turn.id ?? turnId,
     provider: turn.provider ?? provider,
     conversationId: turn.conversationId ?? conversationId,
     mode: turn.mode ?? mode,
     status: turn.state,
-    text: turn.text ?? "",
+    text: rawText,
     reason: turn.reason ?? null,
     evidence: turn.evidence ?? null,
     ...(turn.sendCommittedAt != null ? { sendCommittedAt: turn.sendCommittedAt } : {}),
     elapsedMs,
   };
 
-  if (options.json) {
+  let stagedResult = null;
+  const shouldStage = result.status === "completed" && Boolean(rawText) && !options["no-stage"];
+  if (shouldStage) {
+    const stageFn = deps.stageCdpResponse || defaultStageCdpResponse;
+    const workspaceRoot = options.workspace ? path.resolve(String(options.workspace)) : process.cwd();
+    try {
+      stagedResult = await stageFn({
+        home,
+        runId: result.id,
+        provider: result.provider,
+        text: rawText,
+        workspaceRoot,
+      });
+    } catch (error) {
+      // staging 是优化，不能因为补丁格式不完整就丢掉本轮答案。
+      const code = error?.code || error?.message || String(error);
+      stderr.write(`[cdp] stage skipped: ${code}\n`);
+      stagedResult = null;
+    }
+  }
+
+  if (stagedResult) {
+    const firstNonEmptyLine = rawText.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) || "";
+    const summary = firstNonEmptyLine.length > 200 ? `${firstNonEmptyLine.slice(0, 200)}...` : firstNonEmptyLine;
+    const textBytes = Buffer.byteLength(rawText, "utf8");
+
+    if (options.json) {
+      const { text: _omittedText, ...restResult } = result;
+      const jsonOutput = {
+        ...restResult,
+        summary,
+        textBytes,
+        staged: stagedResult,
+      };
+      stdout.write(`${JSON.stringify(jsonOutput, null, 2)}\n`);
+    } else {
+      const elapsedSec = (elapsedMs / 1000).toFixed(1);
+      stdout.write(`[cdp] provider=${provider} status=${result.status} elapsed=${elapsedSec}s\n`);
+      stdout.write(`[cdp] stageRoot: ${stagedResult.stageRoot}\n`);
+      stdout.write(`[cdp] manifestPath: ${stagedResult.manifestPath}\n`);
+      stdout.write("[cdp] staged files:\n");
+      for (const f of stagedResult.files) {
+        const shortHash = (f.stagedSha256 || "").slice(0, 12);
+        stdout.write(`  - ${f.path} (${f.bytes} bytes, sha256:${shortHash})\n`);
+      }
+    }
+  } else if (options.json) {
     stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   } else {
     const elapsedSec = (elapsedMs / 1000).toFixed(1);
@@ -589,15 +641,16 @@ async function handleAsk(argv, deps) {
     } else if (result.status !== "completed" && result.reason) {
       stderr.write(`[cdp] reason: ${result.reason}\n`);
     }
-    if (result.evidence?.conversationWarning === "CONVERSATION_40_TURNS") {
-      const turns = Number.isSafeInteger(result.evidence.conversationTurns)
-        ? result.evidence.conversationTurns
-        : 40;
-      stderr.write(`[cdp] warning: conversation reached ${turns} turns (CONVERSATION_40_TURNS); consider starting a new conversation\n`);
-    }
-    if (result.status !== "completed" && result.sendCommittedAt != null) {
-      stderr.write("[cdp] warning: prompt was already sent; do not resend\n");
-    }
+  }
+
+  if (result.evidence?.conversationWarning === "CONVERSATION_40_TURNS") {
+    const turns = Number.isSafeInteger(result.evidence.conversationTurns)
+      ? result.evidence.conversationTurns
+      : 40;
+    stderr.write(`[cdp] warning: conversation reached ${turns} turns (CONVERSATION_40_TURNS); consider starting a new conversation\n`);
+  }
+  if (result.status !== "completed" && result.sendCommittedAt != null) {
+    stderr.write("[cdp] warning: prompt was already sent; do not resend\n");
   }
 
   return { code: result.status === "completed" ? 0 : 1, result };

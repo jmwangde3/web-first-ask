@@ -1767,3 +1767,29 @@ test("typePrompt: truncated text in editable editor throws PROMPT_NOT_TYPED", as
 });
 
 
+
+test("Gemini readState rebuilds code fences from pre blocks (staging prerequisite)", () => {
+  const code = "console.log('hi');";
+  const body = {
+    innerText: "FILE: src/x.js\n" + code + "\n",
+    textContent: "",
+    querySelectorAll: (sel) => (sel.indexOf("pre") !== -1 ? [{ innerText: code, textContent: code, parentElement: null }] : []),
+  };
+  const last = { querySelector: () => body };
+  const doc = {
+    title: "Google Gemini",
+    querySelectorAll(sel) {
+      if (sel === "user-query") return [{ innerText: "Hello" }];
+      if (sel === "model-response") return [last];
+      return [];
+    },
+    querySelector(sel) {
+      if (sel.includes("rich-textarea") || sel.includes("ql-editor")) return { innerText: "" };
+      if (sel.includes("Google 账号") || sel.includes("SignOutOptions")) return { nodeName: "BUTTON" };
+      return null;
+    },
+  };
+  const fn = new Function("document", "window", "return " + geminiAdapter.buildReadStateJs());
+  const state = JSON.parse(fn(doc, {}));
+  assert.ok(state.answerText.includes("```\n" + code + "\n```"), state.answerText);
+});
