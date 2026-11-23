@@ -12,7 +12,7 @@ test("1. two concurrent run() calls with different providers trigger exactly one
     await new Promise((r) => setTimeout(r, 20));
     return {
       action: "SAFE_START",
-      chrome: { pid: 100, port: 9222 },
+      chrome: { pid: process.pid, port: 9222 },
     };
   };
 
@@ -50,7 +50,7 @@ test("2. a failed probe re-runs recovery, and a successful probe reuses the cach
     recoverCalls++;
     return {
       action: "SAFE_START",
-      chrome: { pid: 100 + recoverCalls, port: 9222 },
+      chrome: { pid: process.pid, port: 9222 },
     };
   };
 
@@ -443,7 +443,7 @@ test("recovery cache keyed by mode: run with mode A, then mode B (triggers 2 rec
     recoverCalls++;
     return {
       action: "SAFE_START",
-      chrome: { pid: 100 + recoverCalls, port: 9222 },
+      chrome: { pid: process.pid, port: 9222 },
     };
   };
 
@@ -541,3 +541,36 @@ test("cancel after submit carries sendCommittedAt: engine outcome and runner.run
   assert.equal(runnerRes.reason, "cancelled");
   assert.equal(runnerRes.sendCommittedAt, engineRes.sendCommittedAt);
 });
+
+test("dedupedRecover does not trust port without live PID: dead PID triggers re-recovery and updates runner.chrome", async () => {
+  let recoverCalls = 0;
+  const mockRecover = async () => {
+    recoverCalls++;
+    return {
+      action: "SAFE_START",
+      chrome: {
+        pid: recoverCalls === 1 ? 999999 : process.pid,
+        port: 9222,
+      },
+    };
+  };
+
+  const runner = createCdpRunner({
+    deps: {
+      recoverBrowser: mockRecover,
+      fetch: async () => ({ ok: true, status: 200 }),
+      runCdpTurn: async () => ({ status: "completed", text: "ok" }),
+    },
+  });
+
+  // Call 1: returns record with dead pid: 999999
+  await runner.run({ id: "turn-1", provider: "chatgpt", prompt: "p1" });
+  assert.equal(recoverCalls, 1);
+  assert.equal(runner.chrome?.pid, 999999);
+
+  // Call 2: port is alive (fetch returns 200), but pid 999999 is dead -> must not trust cache, calls recoverBrowser again
+  await runner.run({ id: "turn-2", provider: "chatgpt", prompt: "p2" });
+  assert.equal(recoverCalls, 2, "recoverBrowser must be called again when PID is dead");
+  assert.equal(runner.chrome?.pid, process.pid, "runner.chrome must not be the stale one");
+});
+

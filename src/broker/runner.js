@@ -2,6 +2,12 @@ import { getHomeDir } from "../paths.js";
 import { recoverBrowser } from "../browser/recovery.js";
 import { runCdpTurn } from "../engines/cdp-engine.js";
 import { WfaError } from "../errors.js";
+import * as defaultJournal from "./journal.js";
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === "EPERM"; }
+}
 
 export function createCdpRunner({
   home,
@@ -51,10 +57,14 @@ export function createCdpRunner({
 
     try {
       const cacheKey = `${opts.home || runnerHome}::${opts.mode || runnerMode}`;
+      const checkPidAlive = deps.isPidAlive || deps.probes?.isPidAlive || isPidAlive;
       if (cachedRecovery?.key === cacheKey && cachedRecovery.rec?.action !== "RECOVERY_REQUIRED" &&
+          cachedRecovery.rec?.chrome?.pid && checkPidAlive(cachedRecovery.rec.chrome.pid) &&
           cachedRecovery.rec?.chrome?.port && await isPortAlive(cachedRecovery.rec.chrome.port)) {
         return cachedRecovery.rec;
       }
+      cachedRecovery = null;
+      lastChrome = null;
 
       const recFn = opts.recoverBrowser || realRecover;
       const rec = await recFn({
@@ -159,9 +169,17 @@ export function createCdpRunner({
         return { status: "failed", reason: "cancelled", text: "" };
       }
 
+      const journal = deps.journal || defaultJournal;
       const turnDeps = {
         ...deps,
         recoverBrowser: dedupedRecover,
+        onSendIntent: ({ provider, prompt }) => journal.recordCommit(runnerHome, {
+          turnId,
+          provider,
+          promptSha256: journal.hashPrompt(prompt),
+          conversationId: turn.conversationId,
+        }),
+        onSendAborted: () => journal.clearCommit(runnerHome, turnId),
       };
 
       const result = await runTurnFn({
@@ -203,6 +221,10 @@ export function createCdpRunner({
         ...(err?.sendCommittedAt != null ? { sendCommittedAt: err.sendCommittedAt } : {}),
       };
     } finally {
+      if (turnId) {
+        const journal = deps.journal || defaultJournal;
+        await journal.clearCommit(runnerHome, turnId).catch(() => {});
+      }
       if (signal) {
         try {
           signal.removeEventListener("abort", onAbort);

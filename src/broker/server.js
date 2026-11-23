@@ -3,6 +3,7 @@ import http from "node:http";
 import { acquireInstanceLock, clearBrokerRecord, writeBrokerRecord } from "./lifecycle.js";
 import { createScheduler, release, schedule, snapshot } from "./queue.js";
 import { createTurn, publicView, TERMINAL_STATES, transition, TURN_STATES } from "./turns.js";
+import * as defaultJournal from "./journal.js";
 
 function coded(code, message = code) {
   const error = new Error(message);
@@ -33,7 +34,7 @@ async function parseBody(req) {
 }
 
 export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 60000,
-  onIdle = async () => {}, log = () => {} } = {}) {
+  onIdle = async () => {}, log = () => {}, deps = {} } = {}) {
   if (!["off", "tray"].includes(mode) || !runner || typeof runner.run !== "function" ||
       !Number.isFinite(idleTimeoutMs) || idleTimeoutMs < 1 ||
       typeof onIdle !== "function" || typeof log !== "function") {
@@ -42,6 +43,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   const lock = await acquireInstanceLock(home);
   if (!lock) throw coded("BROKER_LOCKED", "Another broker owns the instance lock");
 
+  const journal = deps?.journal || defaultJournal;
   const instanceId = lock.instanceId;
   const token = randomUUID();
   const startedAt = new Date().toISOString();
@@ -137,16 +139,28 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     const pathname = url.pathname;
     if (req.method === "GET" && pathname === "/status") {
       const state = snapshot(scheduler);
+      const orphanedTurns = await journal.listOrphans(home).catch(() => []);
       send(res, 200, {
         instanceId, pid: process.pid, port: boundPort, url: boundPort ? `http://127.0.0.1:${boundPort}` : null,
         startedAt, mode, chrome: runner.chrome ?? null,
         providers: { chatgpt: state.runningByProvider.chatgpt ?? 0, gemini: state.runningByProvider.gemini ?? 0 },
         turns: [...turns.values()].map(publicView), scheduler: state,
+        orphanedTurns,
       });
       return;
     }
     if (req.method === "POST" && pathname === "/turns") {
       const body = await parseBody(req);
+      const promptSha256 = journal.hashPrompt(body.prompt);
+      const orphan = await journal.findCommitted(home, { provider: body.provider, promptSha256 });
+      if (orphan) {
+        send(res, 409, {
+          error: "previously_submitted_uncertain",
+          orphan: { turnId: orphan.turnId, submittedAt: orphan.submittedAt },
+          hint: "This prompt was submitted by a broker that died before reporting a result. Inspect the provider tab before resending.",
+        });
+        return;
+      }
       const turn = createTurn({ provider: body.provider, prompt: body.prompt,
         conversationId: body.conversationId, mode: body.mode });
       turns.set(turn.id, turn);

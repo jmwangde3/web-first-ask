@@ -202,6 +202,28 @@ export async function runCdpTurn({
     const baselineUserTurns = initialState?.userTurns ?? 0;
     const baselineAnswerTurns = initialState?.answerTurns ?? 0;
 
+    if (typeof deps.onSendIntent === "function") {
+      submittedAt = Date.now();
+      try {
+        await deps.onSendIntent({ provider: normalizedProvider, prompt, submittedAt });
+      } catch (intentErr) {
+        return {
+          status: "needs_human",
+          text: "",
+          reason: "journal_unwritable",
+          evidence: { message: intentErr?.message || String(intentErr) },
+          conversationUrl,
+          browser: {
+            pid: recovery.chrome?.pid ?? null,
+            port: recovery.chrome?.port ?? null,
+            mode,
+            reused: recovery.action === "ADOPT",
+          },
+          elapsedMs: Date.now() - startTime,
+        };
+      }
+    }
+
     await driver.typePrompt(cdp, sessionId, adapter, prompt);
     if (signal?.aborted) {
       const err = new Error("Operation cancelled");
@@ -209,9 +231,18 @@ export async function runCdpTurn({
       throw err;
     }
 
-    await driver.submitTurn(cdp, sessionId, adapter);
+    if (!submittedAt) {
+      submittedAt = Date.now();
+    }
+    try {
+      await driver.submitTurn(cdp, sessionId, adapter);
+    } catch (submitErr) {
+      if (typeof deps.onSendAborted === "function") {
+        await deps.onSendAborted({ provider: normalizedProvider }).catch(() => {});
+      }
+      throw submitErr;
+    }
     submitted = true;
-    submittedAt = Date.now();
     if (signal?.aborted) {
       const err = new Error("Operation cancelled");
       err.code = "CANCELLED";

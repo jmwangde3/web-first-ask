@@ -8,6 +8,7 @@ import { startBroker } from "./server.js";
 import { createCdpRunner } from "./runner.js";
 import { discoverBroker, ensureBroker, createTurn, getStatus, getTurn, request } from "./client.js";
 import { TURN_STATES } from "./turns.js";
+import * as defaultJournal from "./journal.js";
 
 const VALUE_FLAGS = new Set(["mode", "state", "timeout", "provider", "prompt", "prompt-file"]);
 
@@ -46,6 +47,7 @@ Commands:
   wfa broker start [--mode background|visible|headless] [--detach] [--json]
   wfa broker status [--json]
   wfa broker turns [--state <state>] [--json]
+  wfa broker clear-orphan <turnId> [--json]
   wfa broker stop [--json]
   wfa broker wait <id> [--timeout <s>] [--json]
   wfa broker ask --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
@@ -284,8 +286,11 @@ async function handleTurns(argv, deps) {
   try {
     const res = await reqFn(record, "GET", route);
     const turns = res?.json || [];
+    const journal = deps.journal || defaultJournal;
+    const orphans = await journal.listOrphans(home).catch(() => []);
+
     if (options.json) {
-      stdout.write(`${JSON.stringify(turns, null, 2)}\n`);
+      stdout.write(`${JSON.stringify({ turns, orphans }, null, 2)}\n`);
     } else {
       for (const turn of turns) {
         const elapsed = turn.startedAt
@@ -294,8 +299,12 @@ async function handleTurns(argv, deps) {
         const preview = (turn.promptPreview || "").slice(0, 60);
         stdout.write(`${turn.id}  ${turn.state}  ${turn.provider}  ${elapsed}  ${turn.reason || "-"}  ${preview}\n`);
       }
+      stdout.write(`orphaned turns: ${orphans.length}\n`);
+      for (const orphan of orphans) {
+        stdout.write(`  ${orphan.turnId}  ${orphan.submittedAt}  ${orphan.provider}\n`);
+      }
     }
-    return { code: 0 };
+    return { code: 0, turns, orphans };
   } catch (err) {
     stderr.write(`wfa: BROKER_UNREACHABLE: ${err?.message || String(err)}\n`);
     return { code: 1 };
@@ -584,6 +593,35 @@ async function handleBrokerAsk(argv, deps) {
   });
 }
 
+async function handleClearOrphan(argv, deps) {
+  const stdout = deps.stdout || process.stdout;
+  const stderr = deps.stderr || process.stderr;
+  const home = deps.home || getHomeDir();
+  const { positional, options } = parseArgs(argv);
+
+  const turnId = positional[0];
+  if (!turnId) {
+    stderr.write("wfa: INVALID_ARGUMENT: Missing <turnId> for clear-orphan\n");
+    return { code: 1 };
+  }
+
+  const journal = deps.journal || defaultJournal;
+  const orphans = await journal.listOrphans(home).catch(() => []);
+  const orphan = orphans.find((o) => o.turnId === turnId);
+  if (!orphan) {
+    stderr.write(`wfa: NOT_FOUND: Orphan turn "${turnId}" not found\n`);
+    return { code: 1 };
+  }
+
+  await journal.clearCommit(home, turnId);
+  if (options.json) {
+    stdout.write(`${JSON.stringify({ cleared: true, orphan }, null, 2)}\n`);
+  } else {
+    stdout.write(`cleared orphan ${orphan.turnId} (${orphan.provider}, submittedAt: ${orphan.submittedAt})\n`);
+  }
+  return { code: 0, cleared: true, orphan };
+}
+
 export async function runBrokerCommand(argv = [], deps = {}) {
   const stdout = deps.stdout || process.stdout;
   const stderr = deps.stderr || process.stderr;
@@ -594,8 +632,8 @@ export async function runBrokerCommand(argv = [], deps = {}) {
   }
 
   const subcmd = argv[0];
-  if (!subcmd || !["start", "status", "turns", "stop", "wait", "ask"].includes(subcmd)) {
-    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing broker subcommand "${subcmd || ""}". Usage: wfa broker <start|status|turns|stop|wait|ask>\n`);
+  if (!subcmd || !["start", "status", "turns", "stop", "wait", "ask", "clear-orphan"].includes(subcmd)) {
+    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing broker subcommand "${subcmd || ""}". Usage: wfa broker <start|status|turns|stop|wait|ask|clear-orphan>\n`);
     return { code: 2 };
   }
 
@@ -606,6 +644,7 @@ export async function runBrokerCommand(argv = [], deps = {}) {
     if (subcmd === "stop") return await handleStop(argv.slice(1), deps);
     if (subcmd === "wait") return await handleWait(argv.slice(1), deps);
     if (subcmd === "ask") return await handleBrokerAsk(argv.slice(1), deps);
+    if (subcmd === "clear-orphan") return await handleClearOrphan(argv.slice(1), deps);
   } catch (error) {
     if (error instanceof WfaError) {
       stderr.write(`wfa: ${error.code}: ${error.message}\n`);
