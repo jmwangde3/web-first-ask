@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.0 - Unreleased
+
+First stable release. The native CDP engine (`wfa cdp`) and its front-end queue
+(`wfa broker`) are now the default browser path, with `ask-bridge` retained only
+as a legacy fallback for `wfa ask` / `code` / `compare`. This release hardens the
+CDP turn lifecycle end to end:
+
+- Prompt typing selects and replaces existing draft content with read-back
+  validation (`PROMPT_NOT_TYPED`); sends go through scoped `sendSelector` clicks
+  with single-fire semantics (`SEND_BUTTON_*`, `SEND_UNCONFIRMED`), no Enter
+  fallback and no automatic retry.
+- Page-level rate limit / provider errors fast-fail with an `answerTurns`-guarded
+  check; a per-provider cooldown (`last-turn.json`, cross-process lock) is
+  enforced by both `cdp ask` and `broker`, with `--min-interval`.
+- `waitForCompletion` adds `unresolvedGraceMs` so fast short answers are not
+  falsely failed by an empty first read, with a second confirmation before
+  `MESSAGE_SELECTOR_UNRESOLVED`.
+- Broker journals committed prompts; a broker that dies after send reports its
+  turn as orphaned and refuses a blind resend with 409
+  `previously_submitted_uncertain`, surfaced clearly by the CLI in text and JSON.
+- Send selectors aligned to current ChatGPT/Gemini DOM. 364 tests pass.
+
 ## 0.2.10 - Unreleased
 
 0.2.9 fixed `--detach` locking the workspace by treating two empty batch logs as

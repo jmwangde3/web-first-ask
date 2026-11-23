@@ -3,7 +3,7 @@ name: web-first
 description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Every nontrivial request — requirements, root cause, architecture, debugging, code design or implementation — goes through the local wfa CLI to Gemini (Task mode) + ChatGPT by default, serially, and must return complete file contents or exact replacement blocks, not a plan or a diff. For a project with a Git remote the local agent submits the repository reference plus the requirement and lets the providers read the repository; it only sends code or files when a provider asks for them.
 ---
 
-Version: 0.2.10
+Version: 1.0.0
 
 # Web-First
 
