@@ -4,7 +4,7 @@ function invalid(message) {
   return error;
 }
 
-export function createScheduler({ maxPerProvider = 1, maxTotal = 2, now = () => Date.now() } = {}) {
+export function createScheduler({ maxPerProvider = 4, maxTotal = 8, now = () => Date.now() } = {}) {
   if (!Number.isInteger(maxPerProvider) || maxPerProvider < 1 ||
       !Number.isInteger(maxTotal) || maxTotal < 1 || typeof now !== "function") {
     throw invalid("Invalid scheduler limits");
@@ -22,7 +22,7 @@ export function schedule(scheduler, turn) {
   }
   const active = [...scheduler.running.values()];
   const conversationKey = turn.conversationId == null
-    ? `anonymous:${turn.id}` : `named:${turn.conversationId}`;
+    ? `anonymous:${turn.id}` : `named:${turn.provider}:${turn.conversationId}`;
   let reason = null;
   if (active.some(item => item.conversationKey === conversationKey)) {
     reason = "conversation_busy";

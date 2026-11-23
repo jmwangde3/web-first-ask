@@ -47,7 +47,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   const instanceId = lock.instanceId;
   const token = randomUUID();
   const startedAt = new Date().toISOString();
-  const scheduler = createScheduler({ maxPerProvider: 2 });
+  const scheduler = createScheduler({ maxPerProvider: 4, maxTotal: 8 });
   const turns = new Map();
   const controllers = new Map();
   const active = new Map();

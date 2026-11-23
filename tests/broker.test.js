@@ -70,27 +70,31 @@ test("strict transition table and immutability", () => {
 });
 
 test("scheduler enforces conversation, provider and global limits; release restores slots", () => {
-  const scheduler = createScheduler();
+  const scheduler = createScheduler({ maxPerProvider: 1, maxTotal: 2 });
   const turn = (provider, conversationId) => createTurn({ provider, prompt: "hi", conversationId });
   const a = turn("chatgpt", "shared");
+  const aSame = turn("chatgpt", "shared");
   const b = turn("gemini", "shared");
   const c = turn("chatgpt", "c-only");
   const d = turn("gemini", "different");
   const e = turn("chatgpt", null);
   assert.deepEqual(schedule(scheduler, a), { accepted: true });
-  assert.equal(schedule(scheduler, b).reason, "conversation_busy");
+  assert.equal(schedule(scheduler, aSame).reason, "conversation_busy");
+  assert.deepEqual(schedule(scheduler, b), { accepted: true });
   assert.equal(schedule(scheduler, c).reason, "provider_busy");
-  assert.equal(schedule(scheduler, d).accepted, true);
+  assert.equal(schedule(scheduler, d).reason, "provider_busy");
   assert.equal(schedule(scheduler, e).reason, "provider_busy");
-  const f = { ...turn("chatgpt", null), provider: "other" };
-  assert.equal(schedule(scheduler, f).reason, "global_busy");
   assert.equal(snapshot(scheduler).runningTotal, 2);
   release(scheduler, a);
-  assert.equal(schedule(scheduler, c).accepted, true);
+  const f = { ...turn("chatgpt", null), provider: "other" };
+  assert.deepEqual(schedule(scheduler, c), { accepted: true });
+  assert.equal(schedule(scheduler, f).reason, "global_busy");
   release(scheduler, c);
-  release(scheduler, d);
-  assert.equal(schedule(scheduler, b).accepted, true);
   release(scheduler, b);
+  release(scheduler, aSame);
+  release(scheduler, d);
+  release(scheduler, e);
+  release(scheduler, f);
   const x = turn("chatgpt", null), y = turn("gemini", null);
   assert.equal(schedule(scheduler, x).accepted, true);
   assert.equal(schedule(scheduler, y).accepted, true);
@@ -108,26 +112,76 @@ test("scheduler enforces conversation and global limits while allowing same-prov
   const scheduler = createScheduler({ maxPerProvider: 2, maxTotal: 2 });
   const turn = (provider, conversationId) => createTurn({ provider, prompt: "hi", conversationId });
   const a = turn("chatgpt", "shared");
+  const aSame = turn("chatgpt", "shared");
   const b = turn("gemini", "shared");
   const c = turn("chatgpt", "c-only");
   const d = turn("gemini", "d-only");
   assert.deepEqual(schedule(scheduler, a), { accepted: true });
-  assert.equal(schedule(scheduler, b).reason, "conversation_busy");
+  assert.equal(schedule(scheduler, aSame).reason, "conversation_busy");
   assert.deepEqual(schedule(scheduler, c), { accepted: true });
   assert.equal(schedule(scheduler, d).reason, "global_busy");
   assert.equal(snapshot(scheduler).runningTotal, 2);
   assert.equal(snapshot(scheduler).runningByProvider.chatgpt, 2);
   release(scheduler, a);
-  assert.deepEqual(schedule(scheduler, d), { accepted: true });
-  release(scheduler, c);
-  release(scheduler, d);
   assert.deepEqual(schedule(scheduler, b), { accepted: true });
+  release(scheduler, c);
   release(scheduler, b);
+  release(scheduler, aSame);
+  release(scheduler, d);
   const x = turn("chatgpt", null), y = turn("chatgpt", null);
   assert.deepEqual(schedule(scheduler, x), { accepted: true });
   assert.deepEqual(schedule(scheduler, y), { accepted: true });
   release(scheduler, x);
   release(scheduler, y);
+});
+
+test("scheduler defaults to 4 per provider and 8 total, and scopes conversation lease by provider", () => {
+  const scheduler = createScheduler();
+  assert.equal(scheduler.maxPerProvider, 4);
+  assert.equal(scheduler.maxTotal, 8);
+  const turn = (provider, conversationId) => createTurn({ provider, prompt: "hi", conversationId });
+
+  const sharedChatgpt = turn("chatgpt", "shared");
+  const sharedGemini = turn("gemini", "shared");
+  assert.deepEqual(schedule(scheduler, sharedChatgpt), { accepted: true });
+  assert.deepEqual(schedule(scheduler, sharedGemini), { accepted: true });
+
+  const sameProviderBusy = turn("chatgpt", "shared");
+  assert.equal(schedule(scheduler, sameProviderBusy).reason, "conversation_busy");
+
+  const chatgptTurns = [
+    sharedChatgpt,
+    turn("chatgpt", "c-2"),
+    turn("chatgpt", "c-3"),
+    turn("chatgpt", "c-4"),
+  ];
+  const geminiTurns = [
+    sharedGemini,
+    turn("gemini", "g-2"),
+    turn("gemini", "g-3"),
+    turn("gemini", "g-4"),
+  ];
+  for (const t of chatgptTurns.slice(1)) {
+    assert.deepEqual(schedule(scheduler, t), { accepted: true });
+  }
+  for (const t of geminiTurns.slice(1)) {
+    assert.deepEqual(schedule(scheduler, t), { accepted: true });
+  }
+
+  const state = snapshot(scheduler);
+  assert.equal(state.runningTotal, 8);
+  assert.equal(state.runningByProvider.chatgpt, 4);
+  assert.equal(state.runningByProvider.gemini, 4);
+
+  const fifthGemini = turn("gemini", "g-5");
+  assert.equal(schedule(scheduler, fifthGemini).reason, "provider_busy");
+  assert.equal(snapshot(scheduler).queued.some(item => item.id === fifthGemini.id), true);
+
+  for (const t of [...chatgptTurns, ...geminiTurns, sameProviderBusy, fifthGemini]) {
+    release(scheduler, t);
+  }
+  assert.equal(snapshot(scheduler).runningTotal, 0);
+  assert.equal(snapshot(scheduler).queued.length, 0);
 });
 
 test("lifecycle record, exclusive lock, stale owner recovery", async t => {
