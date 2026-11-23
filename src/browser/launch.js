@@ -72,6 +72,13 @@ export function buildChromeArgs({ userDataDir, mode = "headless" } = {}) {
     // Cloudflare fingerprints the automation switch itself: both headless and a
     // plain headful launch land on the interstitial. Keep it in every mode.
     "--disable-blink-features=AutomationControlled",
+    // Suppress the "Chrome didn't shut down correctly" crash-restore bubble.
+    // Both switches are kept: Chrome silently ignores unknown/inapplicable ones,
+    // so this is a zero-risk fallback across builds (verified on this machine).
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+    // WebRTC must not leak the real/local IP via non-proxied UDP candidates.
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
   ];
   if (mode === "headless") args.push("--headless=new");
   if (mode === "background" || mode === "headful") args.push("--window-size=1440,1200", "--window-position=-2000,-2000");

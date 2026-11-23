@@ -246,6 +246,21 @@ test("openTab and submitTurn: standard CDP protocol execution", async () => {
     assert.equal(call.sessionId, tab.sessionId, `${method} must be scoped to the target session`);
   }
 
+  const runtimeEnableCall = calls.find((call) => call.method === "Runtime.enable");
+  const timezoneOverrideCall = calls.find((call) => call.method === "Emulation.setTimezoneOverride");
+  const navigateCall = calls.find((call) => call.method === "Page.navigate");
+  assert.ok(timezoneOverrideCall, "timezone override must be sent for the new target");
+  assert.deepEqual(timezoneOverrideCall.params, { timezoneId: "Asia/Tokyo" });
+  assert.equal(timezoneOverrideCall.sessionId, tab.sessionId, "timezone override must be scoped to the target session");
+  assert.ok(
+    calls.indexOf(runtimeEnableCall) < calls.indexOf(timezoneOverrideCall),
+    "timezone override must be sent after Runtime.enable"
+  );
+  assert.ok(
+    calls.indexOf(timezoneOverrideCall) < calls.indexOf(navigateCall),
+    "timezone override must be sent before Page.navigate"
+  );
+
   const legacyAdapter = { id: "legacy" };
   const submitRes = await submitTurn(mockCdp, tab.sessionId, legacyAdapter);
   assert.ok(typeof submitRes.submittedAt === "number");

@@ -33,6 +33,9 @@ export async function openTab(cdp, url, { timeoutMs = 60000 } = {}) {
 
   await cdp.send("Page.enable", {}, sessionId);
   await cdp.send("Runtime.enable", {}, sessionId);
+  // Pin the page timezone before any script runs. Session-scoped so each tab
+  // is isolated; must precede Page.navigate so first-paint code sees Asia/Tokyo.
+  await cdp.send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" }, sessionId);
 
   if (url) {
     await cdp.send("Page.navigate", { url }, sessionId);

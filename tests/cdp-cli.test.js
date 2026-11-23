@@ -1068,17 +1068,23 @@ test("wfa cdp login: exits 0 even when Browser.close never resolves", async () =
   assert.match(stdout.output, /session persisted; later runs restore it with --restore-last-session/);
 });
 
-test("launch.js: the argument list contains --restore-last-session for background, visible, and headless", async () => {
+test("launch.js: the argument list contains the shared switches for all browser modes", async () => {
   const { buildChromeArgs, launchChrome } = await import("../src/browser/launch.js");
   const { EventEmitter } = await import("node:events");
 
-  for (const mode of ["background", "visible", "headless"]) {
+  for (const mode of ["background", "visible", "headless", "headful"]) {
     // 1. Direct argument builder check
     const args = buildChromeArgs({ userDataDir: "/tmp/profile", mode });
     assert.ok(args.includes("--restore-last-session"), `args for ${mode} must include --restore-last-session`);
     assert.ok(args.includes("--disable-background-timer-throttling"), `args for ${mode} must include --disable-background-timer-throttling`);
     assert.ok(args.includes("--disable-backgrounding-occluded-windows"), `args for ${mode} must include --disable-backgrounding-occluded-windows`);
     assert.ok(args.includes("--disable-renderer-backgrounding"), `args for ${mode} must include --disable-renderer-backgrounding`);
+    assert.ok(args.includes("--disable-session-crashed-bubble"), `args for ${mode} must include --disable-session-crashed-bubble`);
+    assert.ok(args.includes("--hide-crash-restore-bubble"), `args for ${mode} must include --hide-crash-restore-bubble`);
+    assert.ok(
+      args.includes("--force-webrtc-ip-handling-policy=disable_non_proxied_udp"),
+      `args for ${mode} must include --force-webrtc-ip-handling-policy=disable_non_proxied_udp`
+    );
     const noFirstRunIdx = args.indexOf("--no-first-run");
     const restoreIdx = args.indexOf("--restore-last-session");
     assert.equal(restoreIdx, noFirstRunIdx + 1, "--restore-last-session must be placed next to --no-first-run");
@@ -1107,6 +1113,12 @@ test("launch.js: the argument list contains --restore-last-session for backgroun
 
     assert.ok(spawnedArgs, `spawn must have been called for mode ${mode}`);
     assert.ok(spawnedArgs.includes("--restore-last-session"), `spawned args for ${mode} must include --restore-last-session`);
+    assert.ok(spawnedArgs.includes("--disable-session-crashed-bubble"), `spawned args for ${mode} must include --disable-session-crashed-bubble`);
+    assert.ok(spawnedArgs.includes("--hide-crash-restore-bubble"), `spawned args for ${mode} must include --hide-crash-restore-bubble`);
+    assert.ok(
+      spawnedArgs.includes("--force-webrtc-ip-handling-policy=disable_non_proxied_udp"),
+      `spawned args for ${mode} must include --force-webrtc-ip-handling-policy=disable_non_proxied_udp`
+    );
   }
 });
 
