@@ -1,8 +1,9 @@
 export const id = "chatgpt";
 export const url = "https://chatgpt.com/";
 export const editorSelector = '#prompt-textarea, div.ProseMirror[contenteditable="true"], textarea#mobile-composer-prompt, [role="textbox"][contenteditable="true"]';
-export const stopSelector = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"]';
+export const stopSelector = 'button[data-testid="stop-button"], main button[aria-label="Stop generating"], main button[aria-label="停止生成"]';
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证/i;
+export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
 export function buildLoginProbeJs() {
   return `(() => (async () => {
@@ -71,9 +72,9 @@ export function buildReadStateJs() {
   }
 
   const ed = document.querySelector(${JSON.stringify(editorSelector)});
-  const editorEmpty = !ed || ((("value" in ed) ? ed.value : (ed.innerText || ed.textContent || "")).trim() === "");
+  const editorEmpty = ed ? ((("value" in ed) ? ed.value : (ed.innerText || ed.textContent || "")).trim() === "") : null;
 
-  const stopEl = document.querySelector('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"]');
+  const stopEl = document.querySelector(${JSON.stringify(stopSelector)});
   let stopVisible = false;
   if (stopEl) {
     if (typeof stopEl.getBoundingClientRect === "function") {
@@ -86,12 +87,13 @@ export function buildReadStateJs() {
 
   const title = document.title || "";
   const hasChallenge = Boolean(
-    document.querySelector('iframe[src*="challenges.cloudflare.com"], input[type="password"]') ||
-    ${challengeTitlePattern.toString()}.test(title) ||
-    /cloudflare|just a moment|security check|challenges\\.cloudflare\\.com/i.test(title)
+    document.querySelector('input[type="password"]') ||
+    ${turnChallengeTitlePattern.toString()}.test(title)
   );
 
-  const loggedOut = !document.querySelector('div.ProseMirror[contenteditable="true"]') && Boolean(document.querySelector('textarea#mobile-composer-prompt'));
+  const hasProseMirror = Boolean(document.querySelector('div.ProseMirror[contenteditable="true"]'));
+  const hasMobileComposer = Boolean(document.querySelector('textarea#mobile-composer-prompt'));
+  const loggedOut = !hasProseMirror && hasMobileComposer;
 
   return JSON.stringify({
     userTurns,
@@ -102,6 +104,8 @@ export function buildReadStateJs() {
     title,
     hasChallenge,
     loggedOut,
+    hasProseMirror,
+    hasMobileComposer,
   });
 })()`;
 }

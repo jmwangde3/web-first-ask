@@ -1,8 +1,19 @@
 export const id = "gemini";
 export const url = "https://gemini.google.com/app";
 export const editorSelector = 'rich-textarea div[contenteditable="true"], div.ql-editor[contenteditable="true"]';
-export const stopSelector = 'button[aria-label*="Stop response"], button[aria-label*="停止回答"], button[aria-label*="Stop"], button[aria-label*="停止"], .stop-button';
+export const stopSelector = [
+  'main button[aria-label="Stop response"]',
+  'main button[aria-label="停止回答"]',
+  'main button[aria-label="Stop generating"]',
+  'main button[aria-label="停止生成"]',
+  'main button[aria-label="Stop"]',
+  'main button[aria-label="停止"]',
+  'conversation-container button[aria-label*="Stop"]',
+  'conversation-container button[aria-label*="停止"]',
+  '.stop-button',
+].join(', ');
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证|sign in|log in|登录/i;
+export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
 export function buildLoginProbeJs() {
   return `(() => {
@@ -63,9 +74,9 @@ export function buildReadStateJs() {
   }
 
   const editor = document.querySelector('rich-textarea div[contenteditable="true"], div.ql-editor[contenteditable="true"]');
-  const editorEmpty = !editor || (editor.innerText || editor.textContent || "").trim() === "";
+  const editorEmpty = editor ? ((editor.innerText || editor.textContent || "").trim() === "") : null;
 
-  const stopEl = document.querySelector('button[aria-label*="Stop response"], button[aria-label*="停止回答"], button[aria-label*="Stop"], button[aria-label*="停止"], .stop-button');
+  const stopEl = document.querySelector(${JSON.stringify(stopSelector)});
   let stopVisible = false;
   if (stopEl) {
     if (typeof stopEl.getBoundingClientRect === "function") {
@@ -78,13 +89,22 @@ export function buildReadStateJs() {
 
   const title = document.title || "";
   const hasChallenge = Boolean(
-    document.querySelector('input[type="password"], iframe[src*="challenges.cloudflare.com"]') ||
-    /challenges\\.cloudflare\\.com/i.test(document.documentElement?.innerHTML || "") ||
-    /sign in|log in|登录|人机验证/i.test(title)
+    document.querySelector('input[type="password"]') ||
+    ${turnChallengeTitlePattern.toString()}.test(title)
   );
 
-  const signInEl = document.querySelector('button[aria-label*="登录"], button[aria-label*="Sign in"], button[aria-label*="Sign In"], a[href*="accounts.google.com"]');
-  const loggedOut = userTurns === 0 && Boolean(signInEl);
+  const signedInEl = document.querySelector(
+    'button[aria-label*="Google 账号"], button[aria-label*="Google Account"], ' +
+    'img[aria-label*="个人资料"], img[aria-label*="Profile"], ' +
+    'a[href*="accounts.google.com/SignOutOptions"]'
+  );
+  const signedOutEl = document.querySelector(
+    'button[aria-label*="登录"], button[aria-label*="Sign in"], button[aria-label*="Sign In"], ' +
+    'a[href*="accounts.google.com/ServiceLogin"], a[href*="accounts.google.com/AccountChooser"]'
+  );
+  const signedIn = Boolean(signedInEl);
+  const signedOut = Boolean(signedOutEl);
+  const loggedOut = userTurns === 0 && !signedIn && signedOut;
 
   return JSON.stringify({
     userTurns,
@@ -95,6 +115,8 @@ export function buildReadStateJs() {
     title,
     hasChallenge,
     loggedOut,
+    signedIn,
+    signedOut,
   });
 })()`;
 }

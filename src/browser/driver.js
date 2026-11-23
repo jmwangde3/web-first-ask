@@ -66,7 +66,7 @@ export async function waitForEditor(cdp, sessionId, adapter, {
   let lastHasPassword = false;
   let consecutiveChallenged = 0;
 
-  const challengePattern = adapter.challengeTitlePattern || /cloudflare|just a moment|security check|challenges\.cloudflare\.com/i;
+  const challengePattern = adapter.turnChallengeTitlePattern || adapter.challengeTitlePattern || /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
   while (now() - startTime < timeoutMs) {
     if (signal?.aborted) {
@@ -253,10 +253,14 @@ export async function readTurnState(cdp, sessionId, adapter) {
       answerTurns: Number(parsed.answerTurns) || 0,
       answerText: typeof parsed.answerText === "string" ? parsed.answerText : "",
       stopVisible: Boolean(parsed.stopVisible),
-      editorEmpty: Boolean(parsed.editorEmpty),
+      editorEmpty: parsed.editorEmpty !== null && parsed.editorEmpty !== undefined ? Boolean(parsed.editorEmpty) : null,
       title: typeof parsed.title === "string" ? parsed.title : "",
       hasChallenge: Boolean(parsed.hasChallenge),
       loggedOut: Boolean(parsed.loggedOut),
+      hasProseMirror: Boolean(parsed.hasProseMirror),
+      hasMobileComposer: Boolean(parsed.hasMobileComposer),
+      signedIn: Boolean(parsed.signedIn),
+      signedOut: Boolean(parsed.signedOut),
     };
   } catch {
     return {
@@ -264,10 +268,14 @@ export async function readTurnState(cdp, sessionId, adapter) {
       answerTurns: 0,
       answerText: "",
       stopVisible: false,
-      editorEmpty: false,
+      editorEmpty: null,
       title: "",
       hasChallenge: false,
       loggedOut: false,
+      hasProseMirror: false,
+      hasMobileComposer: false,
+      signedIn: false,
+      signedOut: false,
     };
   }
 }
@@ -293,7 +301,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   let lastState = null;
   let stopVisibleSince = null;
 
-  const challengePattern = adapter.challengeTitlePattern || /cloudflare|just a moment|security check|challenges\.cloudflare\.com/i;
+  const challengePattern = adapter.turnChallengeTitlePattern || adapter.challengeTitlePattern || /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
   while (true) {
     if (signal?.aborted) {
@@ -321,10 +329,10 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       stopVisibleSince = null;
     }
 
-    if (
-      state.hasChallenge ||
-      challengePattern.test(state.title || "")
-    ) {
+    const composerReady = (state.editorEmpty !== null && state.editorEmpty !== undefined) || Boolean(state.hasProseMirror);
+    const challenged = (state.hasChallenge || challengePattern.test(state.title || "")) && !composerReady;
+
+    if (challenged) {
       return {
         status: "needs_human",
         reason: "human_verification_required",

@@ -237,6 +237,19 @@ conversationUrl, browser, elapsedMs}`.
 - The CDP profile is ours (`<WFA_HOME>/chrome-profile`). A Cloudflare challenge is profile-scoped: measured on
   2026-11-23, the shared ask-bridge profile was challenged while a fresh profile loaded normally in the same
   minute. Log in once with `wfa cdp login`; do not copy cookies from the legacy profile.
+- `wfa cdp login` and `wfa login` are different profiles and do not share a session. Logging in on one leaves the
+  other signed out.
+- The session survives restarts because every launch passes `--restore-last-session`; ChatGPT keeps its session in
+  a non-persistent cookie (`oai-asli`). Never launch this profile without that switch, and never hand-edit
+  `Default/Preferences` (Windows `Secure Preferences` resets it). If `cdp ask` returns `login_required` after a
+  working session, someone launched the profile without the switch — re-run `wfa cdp login`; it is usually a few
+  seconds because the identity provider's cookie is persistent.
+- `wfa cdp login` succeeds only when the product origin reports a real user. A page parked on
+  `auth.openai.com` is `offOrigin` and keeps polling, so a slow OAuth redirect is not mistaken for success.
+- `wfa broker turns` prints `orphaned turns`. An orphan is a prompt that was typed by a broker that died before it
+  could report a result: never resend it blindly. Check the provider tab, then drop it with
+  `wfa broker clear-orphan <turnId>`. `POST /turns` already refuses a matching prompt with 409
+  `previously_submitted_uncertain`.
 
 ## Trust and evidence
 

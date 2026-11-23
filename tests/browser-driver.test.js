@@ -498,7 +498,7 @@ test("waitForCompletion: triggers needs_human on challenges.cloudflare.com detec
               answerTurns: 0,
               answerText: "",
               stopVisible: false,
-              editorEmpty: false,
+              editorEmpty: null,
               title: "Just a moment... challenges.cloudflare.com",
               hasChallenge: true,
             }),
@@ -621,6 +621,9 @@ test("ChatGPT adapter: buildReadStateJs and buildAnswerTextJs in simulated DOM",
   assert.equal(state.editorEmpty, true);
   assert.equal(state.stopVisible, false);
   assert.equal(state.title, "ChatGPT conversation");
+  assert.equal(state.hasProseMirror, true);
+  assert.equal(state.hasMobileComposer, false);
+  assert.equal(state.loggedOut, false);
 
   const answerTextCode = chatgptAdapter.buildAnswerTextJs();
   const answerTextFn = new Function("document", "window", "return " + answerTextCode);
@@ -668,11 +671,90 @@ test("Gemini adapter: buildReadStateJs and buildAnswerTextJs in simulated DOM", 
   assert.equal(state.editorEmpty, true);
   assert.equal(state.stopVisible, false);
   assert.equal(state.title, "Gemini");
+  assert.equal(state.signedIn, false);
+  assert.equal(state.signedOut, false);
+  assert.equal(state.loggedOut, false);
 
   const answerTextCode = geminiAdapter.buildAnswerTextJs();
   const answerTextFn = new Function("document", "window", "return " + answerTextCode);
   const text = answerTextFn(mockDoc, {});
   assert.equal(text, "Here is your answer.");
+});
+
+test("Gemini adapter: buildReadStateJs evaluates loggedOut heuristic accurately", () => {
+  const readStateCode = geminiAdapter.buildReadStateJs();
+  assert.ok(readStateCode.includes("signedIn"));
+  assert.ok(readStateCode.includes("signedOut"));
+
+  const readStateFn = new Function("document", "window", "return " + readStateCode);
+
+  const makeDoc = ({ userTurns = 0, signedIn = false, signedOut = false } = {}) => ({
+    title: "Gemini",
+    querySelectorAll(selector) {
+      if (selector === "user-query") {
+        return Array(userTurns).fill({ innerText: "User query" });
+      }
+      return [];
+    },
+    querySelector(selector) {
+      if (signedIn && (selector.includes("Google 账号") || selector.includes("Google Account") || selector.includes("SignOutOptions"))) {
+        return { nodeName: "BUTTON" };
+      }
+      if (signedOut && (selector.includes("登录") || selector.includes("Sign in") || selector.includes("ServiceLogin") || selector.includes("AccountChooser"))) {
+        return { nodeName: "BUTTON" };
+      }
+      return null;
+    },
+  });
+
+  // 1. signedIn true, signedOut false, userTurns 0 -> loggedOut false
+  const state1 = JSON.parse(readStateFn(makeDoc({ userTurns: 0, signedIn: true, signedOut: false }), {}));
+  assert.equal(state1.signedIn, true);
+  assert.equal(state1.signedOut, false);
+  assert.equal(state1.userTurns, 0);
+  assert.equal(state1.loggedOut, false, "signed-in with 0 user turns must not report loggedOut");
+
+  // 2. signedIn true, signedOut true, userTurns 0 -> loggedOut false (signed-in wins)
+  const state2 = JSON.parse(readStateFn(makeDoc({ userTurns: 0, signedIn: true, signedOut: true }), {}));
+  assert.equal(state2.signedIn, true);
+  assert.equal(state2.signedOut, true);
+  assert.equal(state2.userTurns, 0);
+  assert.equal(state2.loggedOut, false, "both true must resolve to signed-in (loggedOut false)");
+
+  // 3. signedIn false, signedOut true, userTurns 0 -> loggedOut true
+  const state3 = JSON.parse(readStateFn(makeDoc({ userTurns: 0, signedIn: false, signedOut: true }), {}));
+  assert.equal(state3.signedIn, false);
+  assert.equal(state3.signedOut, true);
+  assert.equal(state3.userTurns, 0);
+  assert.equal(state3.loggedOut, true, "signedOut true and signedIn false with 0 user turns must report loggedOut");
+
+  // 4. userTurns 1 and signed-out markers present -> loggedOut false
+  const state4 = JSON.parse(readStateFn(makeDoc({ userTurns: 1, signedIn: false, signedOut: true }), {}));
+  assert.equal(state4.userTurns, 1);
+  assert.equal(state4.signedIn, false);
+  assert.equal(state4.signedOut, true);
+  assert.equal(state4.loggedOut, false, "userTurns > 0 must not report loggedOut even if signed-out markers present");
+});
+
+test("ChatGPT adapter: buildReadStateJs emits hasProseMirror and hasMobileComposer evidence", () => {
+  const readStateCode = chatgptAdapter.buildReadStateJs();
+  assert.ok(readStateCode.includes("hasProseMirror"));
+  assert.ok(readStateCode.includes("hasMobileComposer"));
+
+  const readStateFn = new Function("document", "window", "return " + readStateCode);
+
+  const mockLoggedOutDoc = {
+    title: "ChatGPT",
+    querySelectorAll: () => [],
+    querySelector: (sel) => {
+      if (sel.includes("mobile-composer-prompt")) return { value: "" };
+      return null;
+    },
+  };
+  const state = JSON.parse(readStateFn(mockLoggedOutDoc, {}));
+  assert.equal(state.hasProseMirror, false);
+  assert.equal(state.hasMobileComposer, true);
+  assert.equal(state.loggedOut, true);
 });
 
 test("findDevToolsPort: parses DevToolsActivePort file", async () => {
@@ -690,4 +772,308 @@ test("findDevToolsPort: parses DevToolsActivePort file", async () => {
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }
+});
+
+test("Gemini state with title 'Google Gemini', one editor, hasChallenge false: normal turn completion", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: JSON.stringify({
+              userTurns: 1,
+              answerTurns: 1,
+              answerText: "Answer from Gemini",
+              stopVisible: false,
+              editorEmpty: true,
+              title: "Google Gemini",
+              hasChallenge: false,
+            }),
+          },
+        };
+      }
+      return {};
+    },
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", geminiAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    settleMs: 100,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+
+  assert.equal(res.status, "completed");
+  assert.equal(res.text, "Answer from Gemini");
+});
+
+test("Gemini state with title '请稍候', no editor, hasChallenge true: human_verification_required", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: JSON.stringify({
+              userTurns: 0,
+              answerTurns: 0,
+              answerText: "",
+              stopVisible: false,
+              editorEmpty: null,
+              title: "请稍候",
+              hasChallenge: true,
+            }),
+          },
+        };
+      }
+      return {};
+    },
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", geminiAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+
+  assert.equal(res.status, "needs_human");
+  assert.equal(res.reason, "human_verification_required");
+});
+
+test("Gemini state with title 'Google Gemini', editor present, hasChallenge true (racy/stale probe): turn proceeds, not human_verification_required", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: JSON.stringify({
+              userTurns: 1,
+              answerTurns: 1,
+              answerText: "Proceeded successfully",
+              stopVisible: false,
+              editorEmpty: true,
+              title: "Google Gemini",
+              hasChallenge: true,
+            }),
+          },
+        };
+      }
+      return {};
+    },
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", geminiAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    settleMs: 100,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+
+  assert.notEqual(res.status, "needs_human");
+  assert.equal(res.status, "completed");
+  assert.equal(res.text, "Proceeded successfully");
+});
+
+test("ChatGPT state with title 'ChatGPT', hasProseMirror true, hasChallenge true: proceeds", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: JSON.stringify({
+              userTurns: 1,
+              answerTurns: 1,
+              answerText: "ChatGPT proceeds",
+              stopVisible: false,
+              editorEmpty: null,
+              hasProseMirror: true,
+              title: "ChatGPT",
+              hasChallenge: true,
+            }),
+          },
+        };
+      }
+      return {};
+    },
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    settleMs: 100,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+
+  assert.notEqual(res.status, "needs_human");
+  assert.equal(res.status, "completed");
+  assert.equal(res.text, "ChatGPT proceeds");
+});
+
+test("Login probe still treats 'sign in' / '登录' titles as not logged in yet", () => {
+  assert.ok(geminiAdapter.challengeTitlePattern.test("登录到您的 Google 账号"));
+  assert.ok(geminiAdapter.challengeTitlePattern.test("Sign in - Google Accounts"));
+  assert.ok(chatgptAdapter.challengeTitlePattern.test("人机验证 - 请稍候"));
+
+  // While turnChallengeTitlePattern must NOT include sign-in words
+  assert.equal(geminiAdapter.turnChallengeTitlePattern.test("登录"), false);
+  assert.equal(geminiAdapter.turnChallengeTitlePattern.test("Sign in"), false);
+  assert.equal(chatgptAdapter.turnChallengeTitlePattern.test("Sign in"), false);
+});
+
+test("Gemini adapter stopSelector and buildReadStateJs scoping contracts", () => {
+  assert.ok(geminiAdapter.stopSelector.includes('main button[aria-label="Stop response"]'));
+  assert.equal(/(^|,)\s*button\[aria-label\*="停止"\]/.test(geminiAdapter.stopSelector), false);
+
+  const readStateCode = geminiAdapter.buildReadStateJs();
+  assert.ok(readStateCode.includes('main button[aria-label=\\"Stop response\\"]') || readStateCode.includes('main button[aria-label="Stop response"]'));
+  assert.equal(/(^|,|["'`\s])button\[aria-label\*="停止"\]/.test(readStateCode), false);
+
+  assert.ok(chatgptAdapter.stopSelector.includes('main button[aria-label="Stop generating"]'));
+  assert.ok(chatgptAdapter.stopSelector.includes('main button[aria-label="停止生成"]'));
+  const chatgptReadCode = chatgptAdapter.buildReadStateJs();
+  assert.ok(chatgptReadCode.includes('main button[aria-label=\\"Stop generating\\"]') || chatgptReadCode.includes('main button[aria-label="Stop generating"]'));
+});
+
+function createMockGeminiDocForStop(elements = []) {
+  return {
+    title: "Google Gemini",
+    querySelectorAll(selector) {
+      if (selector === "user-query") return [{ innerText: "Hello" }];
+      if (selector === "model-response") return [{ querySelector: () => ({ innerText: "Answer" }) }];
+      return [];
+    },
+    querySelector(selector) {
+      if (selector.includes("rich-textarea") || selector.includes("ql-editor")) {
+        return { innerText: "" };
+      }
+      if (selector.includes("Google 账号") || selector.includes("SignOutOptions")) {
+        return { nodeName: "BUTTON" };
+      }
+      const subSelectors = selector.split(",").map((s) => s.trim());
+      for (const el of elements) {
+        for (const sel of subSelectors) {
+          if (sel === ".stop-button" && el.className?.includes("stop-button")) {
+            return el;
+          }
+          if (sel.startsWith("main button[")) {
+            if (el.parentTag === "main" && el.tagName === "BUTTON") {
+              const exactLabel = sel.match(/aria-label="([^"]+)"/)?.[1];
+              if (exactLabel && el.ariaLabel === exactLabel) return el;
+            }
+          }
+          if (sel.startsWith("conversation-container button[")) {
+            if (el.parentTag === "conversation-container" && el.tagName === "BUTTON") {
+              const subLabel = sel.match(/aria-label\*="([^"]+)"/)?.[1];
+              if (subLabel && el.ariaLabel?.includes(subLabel)) return el;
+            }
+          }
+          if (sel.startsWith("button[aria-label*=")) {
+            if (el.tagName === "BUTTON") {
+              const subLabel = sel.match(/aria-label\*="([^"]+)"/)?.[1];
+              if (subLabel && el.ariaLabel?.includes(subLabel)) return el;
+            }
+          }
+        }
+      }
+      return null;
+    },
+  };
+}
+
+test("Gemini state with sidebar button with 'More options for 停止生成测试' and no generation control: stopVisible false", () => {
+  const sidebarBtn = {
+    tagName: "BUTTON",
+    parentTag: "aside",
+    ariaLabel: "More options for 停止生成测试",
+    getBoundingClientRect: () => ({ width: 32, height: 32 }),
+    disabled: false,
+  };
+  const mockDoc = createMockGeminiDocForStop([sidebarBtn]);
+  const readStateCode = geminiAdapter.buildReadStateJs();
+  const readStateFn = new Function("document", "window", "return " + readStateCode);
+  const state = JSON.parse(readStateFn(mockDoc, {}));
+
+  assert.equal(state.stopVisible, false);
+});
+
+test("Gemini state with 'main button[aria-label=\"Stop response\"]' present: stopVisible true", () => {
+  const mainStopBtn = {
+    tagName: "BUTTON",
+    parentTag: "main",
+    ariaLabel: "Stop response",
+    getBoundingClientRect: () => ({ width: 32, height: 32 }),
+    disabled: false,
+  };
+  const mockDoc = createMockGeminiDocForStop([mainStopBtn]);
+  const readStateCode = geminiAdapter.buildReadStateJs();
+  const readStateFn = new Function("document", "window", "return " + readStateCode);
+  const state = JSON.parse(readStateFn(mockDoc, {}));
+
+  assert.equal(state.stopVisible, true);
+});
+
+test("Gemini state with generation control inside conversation-container: stopVisible true", () => {
+  const containerStopBtn = {
+    tagName: "BUTTON",
+    parentTag: "conversation-container",
+    ariaLabel: "停止回答",
+    getBoundingClientRect: () => ({ width: 32, height: 32 }),
+    disabled: false,
+  };
+  const mockDoc = createMockGeminiDocForStop([containerStopBtn]);
+  const readStateCode = geminiAdapter.buildReadStateJs();
+  const readStateFn = new Function("document", "window", "return " + readStateCode);
+  const state = JSON.parse(readStateFn(mockDoc, {}));
+
+  assert.equal(state.stopVisible, true);
+});
+
+test("waitForCompletion: stopVisible persisting past stopGraceMs (60s) completes with completed_stop_signal_unreliable", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: JSON.stringify({
+              userTurns: 1,
+              answerTurns: 1,
+              answerText: "Final answer from model",
+              stopVisible: true,
+              editorEmpty: true,
+              title: "Google Gemini",
+            }),
+          },
+        };
+      }
+      return {};
+    },
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", geminiAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    settleMs: 2000,
+    stopGraceMs: 60000,
+    stallTimeoutMs: 120000,
+    hardTimeoutMs: 150000,
+    pollIntervalMs: 500,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "completed");
+  assert.equal(res.reason, "completed_stop_signal_unreliable");
+  assert.equal(res.text, "Final answer from model");
+  assert.equal(res.evidence.stopSignalDegraded, true);
+  assert.ok(res.evidence.stopVisibleForMs >= 60000);
 });

@@ -94,6 +94,17 @@ wfa login --provider claude
 
 Only log in to the providers you intend to use.
 
+The native path has its own profile and its own login command:
+
+```powershell
+wfa cdp login --provider chatgpt
+wfa cdp login --provider gemini
+```
+
+They are separate profiles: `wfa login` signs in the ask-bridge profile under `~/.config/ask-bridge`, while
+`wfa cdp login` signs in `<WFA_HOME>/chrome-profile`. Logging in to one does not log in to the other. The
+native command persists the session across restarts; see *Sessions and how they survive* below.
+
 ## Basic use
 
 Set the default browser mode once. WFA saves the setting in its local `config.json` and uses it for subsequent `ask`, `compare`, and `code` tasks.
@@ -264,11 +275,12 @@ The `ANCHOR` must match exactly once, including surrounding lines. Missing and a
 | `wfa install-skill [--target …]` | Install the Skill to Codex, WorkBuddy or a chosen directory |
 | `wfa upstream update` | Run ask-bridge's official update command |
 | `wfa cdp ask --provider <p> --prompt <text>` | Native CDP turn; `background` (default), `visible`, `headless`; `--json`, `--timeout`, `--settle` |
-| `wfa cdp login [--provider <p>]` | Open our own Chrome profile and poll until the provider reports a logged-in composer |
-| `wfa cdp status [--json]` | Show the broker this home is running, if any |
+| `wfa cdp login [--provider <p>]` | Log in once on our own profile, verify it on the product origin, close Chrome cleanly |
+| `wfa cdp status [--json]` | Show the browser this home owns and whether a turn could start now |
 | `wfa broker start [--detach]` | Run the turn queue in the foreground, or detach it with a log file |
 | `wfa broker ask --provider <p> --prompt <text> [--wait]` | Submit a turn to the queue instead of driving Chrome directly |
 | `wfa broker status \| turns \| wait <id> \| stop` | Inspect and drain the queue |
+| `wfa broker clear-orphan <turnId>` | Drop one commit-journal entry after a human checked the provider tab |
 
 Use `--json` for machine-readable summaries. Reuse `--request-id` only when recovering the **exact same logical request with identical prompt, providers, attachments and options**. A changed request must use a new request ID.
 
@@ -298,6 +310,7 @@ DevTools Protocol by a zero-dependency client, and keep all of their state insid
 <home>/chrome-profile/   our own Chrome profile (log in once, keep the cookies)
 <home>/broker.json       running broker: pid, loopback port, token, startedAt
 <home>/broker.lock       single-broker instance lock
+<home>/turns/            commit journal: prompts that were typed but not yet answered
 <home>/logs/             detached broker logs
 ```
 
@@ -333,10 +346,46 @@ never retried once submitted. `wfa broker ask` submits and optionally waits; `wf
 `off` mode an idle broker shuts itself down after 60 s; `start` runs in `tray` mode and stays up for
 `scripts/wfa-tray.ps1`, which polls `/status` every two seconds.
 
-Known limits of this path: the broker's turn table lives in memory, so a `SIGKILL`ed broker loses the queue —
-`wfa cdp status` still shows Chrome and `src/browser/recovery.js` will adopt it on the next start, but a turn that
-was running when the broker died can only be found in the provider's own chat history. Only ChatGPT and Gemini
-adapters exist; Claude is still ask-bridge-only.
+Before a prompt is typed, the broker writes `{ turnId, provider, promptSha256, conversationId, submittedAt }`
+into `<home>/turns/`, and deletes it when the turn settles. A broker that dies between submit and completion
+leaves that file behind, which is the only honest record that the prompt may already have been sent. On the
+next start the entry appears as an orphan: `GET /status` reports `orphanedTurns`, `wfa broker turns` prints
+them, and `POST /turns` refuses a prompt whose provider and hash match one with HTTP 409
+`previously_submitted_uncertain` instead of sending it again. Inspect the provider tab, then either drop the
+entry with `wfa broker clear-orphan <turnId>` or keep it as a reminder. If the journal cannot be written, the
+turn fails closed with `journal_unwritable` before anything is typed.
+
+Known limits of this path: only ChatGPT and Gemini adapters exist; Claude is still ask-bridge-only.
+
+### Sessions and how they survive
+
+`wfa cdp login --provider <chatgpt|gemini>` opens a visible window at `100,100`, polls until the provider
+itself confirms a session, then closes Chrome cleanly so the profile is written out. It is the only command
+that should be used for authentication on this path.
+
+ChatGPT does not use a persistent session cookie. Its session is `oai-asli` on `chatgpt.com` with
+`is_persistent = 0`, so a browser that shuts down normally would drop it. Chrome keeps such cookies across a
+restart only when it is **started with `--restore-last-session`**, which is why `launch.js` passes that switch
+on every launch, in every mode. Measured on Windows 11 with Chrome 158: log in, close the product tab, close
+Chrome via `Browser.close` (`profile.exit_type` becomes `Normal`), relaunch with the switch, and
+`fetch('/api/auth/session')` still returns the user. A crash exit behaves the same way, because Chrome
+preserves session cookies whenever the last exit was unclean as well.
+
+Do not hand-edit `Default/Preferences` to set `session.restore_on_startup`. On Windows that preference is
+covered by `Secure Preferences` and the HMAC is invalidated, so Chrome resets it on load. The command-line
+switch is the supported mechanism.
+
+`wfa cdp login` reports success only when the product origin answers with a real user:
+
+- while the browser is on `auth.openai.com`, the probe returns `offOrigin` and keeps waiting instead of
+  declaring victory. That mistake used to close the browser in the middle of the OAuth redirect, which left
+  the identity provider signed in and the product signed out.
+- if the tab stays on the identity provider for 45 s, the command navigates it back to the product once, at
+  most twice per run.
+
+If the profile is ever launched **without** the switch, Chrome deletes the non-persistent cookies at startup
+and the next `wfa cdp ask` returns `login_required`. Re-run `wfa cdp login`; the identity provider's
+persistent cookie usually makes that a few seconds without retyping a password.
 
 ## Known issues
 
