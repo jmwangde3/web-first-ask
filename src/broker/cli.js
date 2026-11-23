@@ -567,6 +567,24 @@ async function handleBrokerAsk(argv, deps) {
   }
 
   const created = turnRes?.json;
+
+  if (turnRes?.status >= 400) {
+    if (options.json) {
+      stdout.write(`${JSON.stringify({
+        error: created?.error || "BROKER_ERROR",
+        status: turnRes.status,
+        ...(created?.orphan ? { orphan: created.orphan } : {}),
+        ...(created?.hint ? { hint: created.hint } : {}),
+      }, null, 2)}\n`);
+    } else {
+      const code = String(created?.error || "BROKER_ERROR").toUpperCase();
+      const hint = typeof created?.hint === "string" ? created.hint.trim() : "";
+      const detail = [`HTTP ${turnRes.status}`, hint].filter(Boolean).join("; ");
+      stderr.write(`wfa: ${code}: ${detail}\n`);
+    }
+    return { code: 1, error: created };
+  }
+
   const turnId = created?.id;
   if (!turnId) {
     stderr.write("wfa: BROKER_ERROR: Failed to create turn\n");

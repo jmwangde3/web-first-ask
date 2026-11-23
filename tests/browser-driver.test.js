@@ -569,6 +569,139 @@ test("waitForCompletion: fail-closed with MESSAGE_SELECTOR_UNRESOLVED if answer 
   assert.equal(res.reason, "MESSAGE_SELECTOR_UNRESOLVED");
 });
 
+test("waitForCompletion: delayed first token during unresolvedGraceMs completes successfully without false failure", async () => {
+  let virtualTime = 0;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        // First token "ONE" only arrives at virtualTime >= 5000
+        const hasToken = virtualTime >= 5000;
+        return {
+          result: {
+            value: JSON.stringify({
+              userTurns: 1,
+              answerTurns: 1,
+              answerText: hasToken ? "ONE" : "",
+              stopVisible: false,
+              editorEmpty: true,
+              title: "ChatGPT",
+            }),
+          },
+        };
+      }
+      return {};
+    },
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    settleMs: 4000,
+    unresolvedGraceMs: 6000,
+    pollIntervalMs: 500,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  // Without unresolvedGraceMs, it would have falsely failed at 4000ms.
+  // With 6000ms grace, token arriving at 5000ms settles at 5000 + 4000 = 9000ms.
+  assert.equal(res.status, "completed");
+  assert.equal(res.reason, "completed");
+  assert.equal(res.text, "ONE");
+  assert.equal(virtualTime, 9000);
+});
+
+test("waitForCompletion: true selector failure past settleMs + unresolvedGraceMs fails with MESSAGE_SELECTOR_UNRESOLVED", async () => {
+  let virtualTime = 0;
+  let confirmEvalCount = 0;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        confirmEvalCount++;
+        return {
+          result: {
+            value: JSON.stringify({
+              userTurns: 1,
+              answerTurns: 1,
+              answerText: "",
+              stopVisible: false,
+              editorEmpty: true,
+              title: "ChatGPT",
+            }),
+          },
+        };
+      }
+      return {};
+    },
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    settleMs: 2000,
+    unresolvedGraceMs: 3000,
+    pollIntervalMs: 500,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "failed");
+  assert.equal(res.reason, "MESSAGE_SELECTOR_UNRESOLVED");
+  assert.ok(res.elapsedMs >= 5000);
+  assert.ok(confirmEvalCount > 0);
+});
+
+test("waitForCompletion: stopVisible resets unresolvedGraceMs timer", async () => {
+  let virtualTime = 0;
+
+  const mockCdp = {
+    send: async (method) => {
+      if (method === "Runtime.evaluate") {
+        // At 0-2000: empty, stopVisible false -> unresolvedCandidate at 2000ms
+        // At 3500-4500: stopVisible becomes true -> resets unresolvedSince
+        // At 5000+: answerText arrives "Delayed answer", stopVisible false
+        const isGenerating = virtualTime >= 3500 && virtualTime < 4500;
+        const hasText = virtualTime >= 5000;
+        return {
+          result: {
+            value: JSON.stringify({
+              userTurns: 1,
+              answerTurns: 1,
+              answerText: hasText ? "Delayed answer" : "",
+              stopVisible: isGenerating,
+              editorEmpty: true,
+              title: "ChatGPT",
+            }),
+          },
+        };
+      }
+      return {};
+    },
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    settleMs: 2000,
+    unresolvedGraceMs: 2500,
+    pollIntervalMs: 500,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "completed");
+  assert.equal(res.reason, "completed");
+  assert.equal(res.text, "Delayed answer");
+});
+
 test("classifyRunError: classifies errors into needs_human or failed", () => {
   const errCloudflare = new Error("Encountered challenges.cloudflare.com challenge");
   assert.deepEqual(classifyRunError(errCloudflare), {
@@ -1446,6 +1579,57 @@ test("T5-eval: focusExpr regex escape in template literal correctly strips white
   const valWithText = "   \u200bhello  ";
   const snippet2 = `const cleaned = (${JSON.stringify(valWithText)}).replace(/[\\s\\u00a0\\u200b]/g, ""); cleaned.length;`;
   assert.equal(eval(snippet2), 5, "Real text characters must remain");
+});
+
+test("ChatGPT adapter: sendSelector matches single submit button in composer form", async () => {
+  assert.equal(typeof chatgptAdapter.sendSelector, "string");
+  assert.ok(chatgptAdapter.sendSelector.includes('form:has([contenteditable="true"], textarea) button[type="submit"]'));
+  assert.ok(chatgptAdapter.sendSelector.includes('button[type="submit"][aria-label="发送"]'));
+  assert.ok(chatgptAdapter.sendSelector.includes('button[type="submit"][aria-label="Send"]'));
+
+  let clickTriggered = false;
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("btn.click()")) {
+          clickTriggered = true;
+          return { result: { value: { clicked: true } } };
+        }
+        assert.ok(params.expression.includes(JSON.stringify(chatgptAdapter.sendSelector)));
+        return { result: { value: { exists: true, visible: true, disabled: false, enabledCount: 1 } } };
+      }
+      return {};
+    },
+  };
+
+  const res = await submitTurn(mockCdp, "session-1", chatgptAdapter, { sendButtonTimeoutMs: 500, pollIntervalMs: 50 });
+  assert.equal(res.method, "click");
+  assert.equal(clickTriggered, true);
+  assert.ok(typeof res.submittedAt === "number");
+});
+
+test("Gemini adapter: sendSelector matches single native button inside gem-icon-button", async () => {
+  assert.equal(geminiAdapter.sendSelector, "gem-icon-button.send-button.submit button");
+
+  let clickTriggered = false;
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Runtime.evaluate") {
+        if (params.expression.includes("btn.click()")) {
+          clickTriggered = true;
+          return { result: { value: { clicked: true } } };
+        }
+        assert.ok(params.expression.includes(JSON.stringify(geminiAdapter.sendSelector)));
+        return { result: { value: { exists: true, visible: true, disabled: false, enabledCount: 1 } } };
+      }
+      return {};
+    },
+  };
+
+  const res = await submitTurn(mockCdp, "session-1", geminiAdapter, { sendButtonTimeoutMs: 500, pollIntervalMs: 50 });
+  assert.equal(res.method, "click");
+  assert.equal(clickTriggered, true);
+  assert.ok(typeof res.submittedAt === "number");
 });
 
 

@@ -409,3 +409,114 @@ test("15. start returns { code: 0 } when serverInstance.closed resolves", async 
   const res = await startPromise;
   assert.equal(res.code, 0);
 });
+
+test("16. ask with HTTP 409 previously_submitted_uncertain prints error, status, and hint to stderr and exits 1", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  const mockRecord = { host: "127.0.0.1", port: 5050, token: "test-token" };
+
+  const res = await runBrokerCommand(["ask", "--provider", "chatgpt", "--prompt", "test prompt"], {
+    stdout,
+    stderr,
+    ensureBroker: async () => mockRecord,
+    createTurn: async () => ({
+      status: 409,
+      json: {
+        error: "previously_submitted_uncertain",
+        orphan: { turnId: "turn-orphan-409", submittedAt: "2026-11-23T09:00:00.000Z" },
+        hint: "This prompt was submitted by a broker that died before reporting a result. Inspect the provider tab before resending.",
+      },
+    }),
+  });
+
+  assert.equal(res.code, 1);
+  assert.match(stderr.output, /wfa: PREVIOUSLY_SUBMITTED_UNCERTAIN: HTTP 409; This prompt was submitted by a broker that died before reporting a result/);
+  assert.doesNotMatch(stderr.output, /BROKER_ERROR/);
+  assert.equal(stdout.output, "");
+});
+
+test("17. ask with HTTP 500 without error prints BROKER_ERROR: HTTP 500 and exits 1", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  const mockRecord = { host: "127.0.0.1", port: 5050, token: "test-token" };
+
+  const res = await runBrokerCommand(["ask", "--provider", "chatgpt", "--prompt", "test prompt"], {
+    stdout,
+    stderr,
+    ensureBroker: async () => mockRecord,
+    createTurn: async () => ({
+      status: 500,
+      json: null,
+    }),
+  });
+
+  assert.equal(res.code, 1);
+  assert.match(stderr.output, /wfa: BROKER_ERROR: HTTP 500/);
+});
+
+test("18. ask with HTTP 201 and valid id proceeds normally and exits 0", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  const mockRecord = { host: "127.0.0.1", port: 5050, token: "test-token" };
+
+  const res = await runBrokerCommand(["ask", "--provider", "gemini", "--prompt", "test prompt 201"], {
+    stdout,
+    stderr,
+    ensureBroker: async () => mockRecord,
+    createTurn: async () => ({
+      status: 201,
+      json: { id: "turn-201-success", state: "accepted" },
+    }),
+  });
+
+  assert.equal(res.code, 0);
+  assert.equal(stdout.output, "turn turn-201-success\n");
+  assert.equal(stderr.output, "");
+});
+
+test("19. ask with HTTP 200 without turnId falls back to BROKER_ERROR and exits 1", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  const mockRecord = { host: "127.0.0.1", port: 5050, token: "test-token" };
+
+  const res = await runBrokerCommand(["ask", "--provider", "chatgpt", "--prompt", "test prompt 200 no id"], {
+    stdout,
+    stderr,
+    ensureBroker: async () => mockRecord,
+    createTurn: async () => ({
+      status: 200,
+      json: { someKey: "no-id-here" },
+    }),
+  });
+
+  assert.equal(res.code, 1);
+  assert.match(stderr.output, /wfa: BROKER_ERROR: Failed to create turn/);
+});
+
+test("20. ask with HTTP 409 and --json prints structured JSON to stdout and exits 1", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+  const mockRecord = { host: "127.0.0.1", port: 5050, token: "test-token" };
+
+  const res = await runBrokerCommand(["ask", "--provider", "chatgpt", "--prompt", "test prompt", "--json"], {
+    stdout,
+    stderr,
+    ensureBroker: async () => mockRecord,
+    createTurn: async () => ({
+      status: 409,
+      json: {
+        error: "previously_submitted_uncertain",
+        orphan: { turnId: "turn-orphan-409", submittedAt: "2026-11-23T09:00:00.000Z" },
+        hint: "This prompt was submitted by a broker that died before reporting a result. Inspect the provider tab before resending.",
+      },
+    }),
+  });
+
+  assert.equal(res.code, 1);
+  const parsed = JSON.parse(stdout.output);
+  assert.equal(parsed.error, "previously_submitted_uncertain");
+  assert.equal(parsed.status, 409);
+  assert.equal(parsed.orphan?.turnId, "turn-orphan-409");
+  assert.match(parsed.hint, /Inspect the provider tab before resending/);
+  assert.equal(stderr.output, "");
+});

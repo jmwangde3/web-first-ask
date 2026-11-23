@@ -473,6 +473,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   baselineAnswerTurns = 0,
   baselineUserTurns = 0,
   settleMs = 4000,
+  unresolvedGraceMs = 6000,
   stopGraceMs = 60000,
   hardTimeoutMs = 900000,
   stallTimeoutMs = 180000,
@@ -490,6 +491,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   let lastAnswerText = "";
   let lastState = null;
   let stopVisibleSince = null;
+  let unresolvedSince = null;
 
   const challengePattern = adapter.turnChallengeTitlePattern || adapter.challengeTitlePattern || /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
@@ -515,6 +517,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 
     if (state.stopVisible) {
       if (stopVisibleSince === null) stopVisibleSince = now();
+      unresolvedSince = null;
     } else {
       stopVisibleSince = null;
     }
@@ -586,6 +589,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       lastProgressAt = now();
       lastAnswerChars = currentChars;
       lastAnswerText = currentText;
+      unresolvedSince = null;
     }
 
     if (now() - lastProgressAt >= stallTimeoutMs) {
@@ -618,14 +622,29 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       };
     }
 
-    if (state.answerTurns > baselineAnswerTurns && stopGone && settled && !hasAnswer) {
-      return {
-        status: "failed",
-        reason: "MESSAGE_SELECTOR_UNRESOLVED",
-        text: "",
-        elapsedMs: now() - startTime,
-        evidence: buildEvidence(state, now() - lastProgressAt),
-      };
+    const unresolvedCandidate = state.answerTurns > baselineAnswerTurns && stopGone && settled && !hasAnswer;
+    if (unresolvedCandidate) {
+      if (unresolvedSince === null) {
+        unresolvedSince = now();
+      } else if (now() - unresolvedSince >= unresolvedGraceMs) {
+        const confirm = await readTurnState(cdp, sessionId, adapter);
+        lastState = confirm;
+        const confirmHasAnswer = (confirm.answerText || "").trim().length > 0;
+        const confirmStopGone = !confirm.stopVisible;
+        const confirmCandidate = confirm.answerTurns > baselineAnswerTurns && confirmStopGone && confirmHasAnswer === false;
+        if (confirmCandidate) {
+          return {
+            status: "failed",
+            reason: "MESSAGE_SELECTOR_UNRESOLVED",
+            text: "",
+            elapsedMs: now() - startTime,
+            evidence: buildEvidence(confirm, now() - lastProgressAt),
+          };
+        }
+        unresolvedSince = null;
+      }
+    } else {
+      unresolvedSince = null;
     }
 
     await sleep(pollIntervalMs);

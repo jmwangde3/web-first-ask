@@ -2,7 +2,7 @@ export const id = "chatgpt";
 export const url = "https://chatgpt.com/";
 export const editorSelector = '#prompt-textarea, div.ProseMirror[contenteditable="true"], textarea#mobile-composer-prompt, [role="textbox"][contenteditable="true"]';
 export const stopSelector = 'button[data-testid="stop-button"], main button[aria-label="Stop generating"], main button[aria-label="停止生成"]';
-export const sendSelector = 'button[data-testid="send-button"], button[data-testid="fruitjuice-send-button"], button[aria-label="Send prompt"], button[aria-label="发送提示"], button[aria-label="Send message"], button[aria-label="发送消息"]';
+export const sendSelector = 'form:has([contenteditable="true"], textarea) button[type="submit"], button[data-testid="send-button"], button[type="submit"][aria-label="发送"], button[type="submit"][aria-label="Send"]';
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 

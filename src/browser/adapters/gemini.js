@@ -12,7 +12,7 @@ export const stopSelector = [
   'conversation-container button[aria-label*="停止"]',
   '.stop-button',
 ].join(', ');
-export const sendSelector = 'button[aria-label="Send message"], button[aria-label="发送消息"], button[aria-label="Send"], button[aria-label="发送"], button.send-button, .send-button';
+export const sendSelector = 'gem-icon-button.send-button.submit button';
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证|sign in|log in|登录/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
