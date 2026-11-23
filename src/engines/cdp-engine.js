@@ -7,6 +7,7 @@ import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
 import { WfaError } from "../errors.js";
 import { sleep as defaultSleep } from "../util.js";
+import * as defaultConversationStore from "../browser/conversation-store.js";
 import { DEFAULT_MIN_INTERVAL_MS, enforceCooldown, recordLastTurn } from "../browser/cooldown.js";
 
 const DEFAULT_ADAPTERS = {
@@ -14,10 +15,58 @@ const DEFAULT_ADAPTERS = {
   gemini: geminiAdapter,
 };
 
+function isConversationInvalidated(classifier, reason, message) {
+  if (String(reason || "").toLowerCase() === "conversation_invalidated") {
+    return true;
+  }
+  const detail = [reason, message]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join(" ");
+  if (!detail) {
+    return false;
+  }
+  try {
+    return classifier(new Error(detail))?.code === "CONVERSATION_INVALIDATED";
+  } catch {
+    return false;
+  }
+}
+
+async function readCurrentUrl(cdp, sessionId) {
+  if (!cdp || !sessionId) return "";
+  try {
+    const result = await cdp.send("Runtime.evaluate", {
+      expression: "window.location.href",
+      returnByValue: true,
+    }, sessionId);
+    return typeof result?.result?.value === "string" ? result.result.value : "";
+  } catch {
+    return "";
+  }
+}
+
+function isSameConversationUrl(provider, actualUrl, expectedUrl) {
+  if (
+    !defaultConversationStore.isValidConversationUrl(provider, actualUrl) ||
+    !defaultConversationStore.isValidConversationUrl(provider, expectedUrl)
+  ) {
+    return false;
+  }
+  try {
+    const actual = new URL(actualUrl);
+    const expected = new URL(expectedUrl);
+    return actual.hostname === expected.hostname &&
+      actual.pathname.replace(/\/+$/, "") === expected.pathname.replace(/\/+$/, "");
+  } catch {
+    return false;
+  }
+}
+
 export async function runCdpTurn({
   provider,
   prompt,
   home,
+  conversationId = null,
   mode = "background",
   chromePath,
   settleMs = 4000,
@@ -47,6 +96,34 @@ export async function runCdpTurn({
   }
 
   const effectiveHome = home || getHomeDir();
+  const normalizedConversationId = typeof conversationId === "string" && conversationId.trim()
+    ? conversationId
+    : null;
+  const conversationStore = deps.conversationStore || defaultConversationStore;
+  const reportConversationStoreError = async (operation, error) => {
+    if (typeof deps.onConversationStoreError === "function") {
+      try {
+        await deps.onConversationStoreError(operation, error);
+      } catch {}
+      return;
+    }
+    try {
+      console.warn(`[cdp] conversation store ${operation} failed: ${error?.message || String(error)}`);
+    } catch {}
+  };
+  const markConversationInvalid = async (reason) => {
+    if (!normalizedConversationId || typeof conversationStore.markInvalid !== "function") return;
+    try {
+      await conversationStore.markInvalid(
+        effectiveHome,
+        normalizedProvider,
+        normalizedConversationId,
+        reason
+      );
+    } catch (error) {
+      await reportConversationStoreError("markInvalid", error);
+    }
+  };
   const sleepFn = deps.sleep || defaultSleep;
   const enforce = deps.enforceCooldown || enforceCooldown;
   await enforce(effectiveHome, normalizedProvider, {
@@ -80,6 +157,7 @@ export async function runCdpTurn({
   const recover = deps.recoverBrowser || recoverBrowser;
   const connect = deps.connectCdp || connectCdp;
   const driver = deps.driver || defaultDriver;
+  const classifyError = driver.classifyRunError || classifyRunError;
 
   let terminalStatus = "failed";
   let submitted = false;
@@ -141,6 +219,27 @@ export async function runCdpTurn({
     let targetId = null;
     let sessionId = null;
     let conversationUrl = adapter.url || "";
+    let storedSession = null;
+    let restoreUrl = null;
+
+    if (normalizedConversationId && typeof conversationStore.loadSession === "function") {
+      try {
+        storedSession = await conversationStore.loadSession(
+          effectiveHome,
+          normalizedProvider,
+          normalizedConversationId
+        );
+      } catch (error) {
+        await reportConversationStoreError("loadSession", error);
+      }
+      if (
+        storedSession &&
+        !storedSession.invalidated &&
+        defaultConversationStore.isValidConversationUrl(normalizedProvider, storedSession.conversationUrl)
+      ) {
+        restoreUrl = storedSession.conversationUrl;
+      }
+    }
 
     const tryCancelActiveGeneration = async () => {
       if (submitted && cdp && sessionId) {
@@ -174,7 +273,9 @@ export async function runCdpTurn({
         throw err;
       }
 
-      const tab = await driver.openTab(cdp, adapter.url, { timeoutMs: hardTimeoutMs });
+      const targetUrl = restoreUrl || adapter.url;
+      conversationUrl = targetUrl || "";
+      const tab = await driver.openTab(cdp, targetUrl, { timeoutMs: hardTimeoutMs });
       targetId = tab.targetId;
       sessionId = tab.sessionId;
       if (signal?.aborted) {
@@ -194,7 +295,57 @@ export async function runCdpTurn({
         throw err;
       }
 
+      if (restoreUrl) {
+        const actualUrl = await readCurrentUrl(cdp, sessionId);
+
+        if (!isSameConversationUrl(normalizedProvider, actualUrl, restoreUrl)) {
+          await markConversationInvalid("conversation_restore_failed");
+          return withTerminalStatus({
+            status: "needs_human",
+            text: "",
+            reason: "conversation_restore_failed",
+            evidence: {
+              expectedConversationUrl: restoreUrl,
+              actualConversationUrl: actualUrl || null,
+            },
+            conversationUrl: actualUrl || restoreUrl,
+            browser: {
+              pid: recovery.chrome?.pid ?? null,
+              port: recovery.chrome?.port ?? null,
+              mode,
+              reused: recovery.action === "ADOPT",
+            },
+            elapsedMs: Date.now() - startTime,
+          });
+        }
+        conversationUrl = actualUrl;
+      }
+
       const initialState = await driver.readTurnState(cdp, sessionId, adapter);
+      if (isConversationInvalidated(
+        classifyError,
+        initialState?.pageError?.reason,
+        initialState?.pageError?.message
+      )) {
+        await markConversationInvalid("conversation_invalidated");
+        return withTerminalStatus({
+          status: "failed",
+          text: "",
+          reason: "conversation_invalidated",
+          evidence: {
+            message: initialState?.pageError?.message || "Conversation is no longer available",
+          },
+          conversationUrl,
+          browser: {
+            pid: recovery.chrome?.pid ?? null,
+            port: recovery.chrome?.port ?? null,
+            mode,
+            reused: recovery.action === "ADOPT",
+          },
+          elapsedMs: Date.now() - startTime,
+        });
+      }
+
       if (initialState?.loggedOut) {
         return withTerminalStatus({
           status: "needs_human",
@@ -275,6 +426,14 @@ export async function runCdpTurn({
         sleep: sleepFn,
         signal,
       });
+      const completionInvalidated = isConversationInvalidated(
+        classifyError,
+        completion?.reason,
+        completion?.evidence?.pageError?.message
+      );
+      if (completionInvalidated) {
+        await markConversationInvalid("conversation_invalidated");
+      }
       if (signal?.aborted) {
         const err = new Error("Operation cancelled");
         err.code = "CANCELLED";
@@ -282,23 +441,53 @@ export async function runCdpTurn({
         throw err;
       }
 
-      try {
-        const urlRes = await cdp.send("Runtime.evaluate", {
-          expression: "window.location.href",
-          returnByValue: true,
-        }, sessionId);
-        if (urlRes?.result?.value && typeof urlRes.result.value === "string") {
-          conversationUrl = urlRes.result.value;
+      const finalUrl = await readCurrentUrl(cdp, sessionId);
+      if (finalUrl) {
+        conversationUrl = finalUrl;
+      }
+
+      const finalStatus = completionInvalidated ? "failed" : completion.status;
+      const finalReason = completionInvalidated
+        ? "conversation_invalidated"
+        : (completion.reason ? String(completion.reason).toLowerCase() : "");
+
+      let conversationTurns = null;
+      if (
+        normalizedConversationId &&
+        finalStatus === "completed" &&
+        submitted &&
+        submittedAt != null &&
+        defaultConversationStore.isValidConversationUrl(normalizedProvider, conversationUrl)
+      ) {
+        const previousTurnCount = Number.isSafeInteger(storedSession?.turnCount)
+          ? storedSession.turnCount
+          : 0;
+        conversationTurns = previousTurnCount + 1;
+        try {
+          await conversationStore.saveSession(effectiveHome, normalizedProvider, normalizedConversationId, {
+            conversationUrl,
+            turnCount: conversationTurns,
+            invalidated: false,
+            invalidatedReason: null,
+          });
+        } catch (error) {
+          await reportConversationStoreError("saveSession", error);
         }
-      } catch {}
+      }
 
       return withTerminalStatus({
-        status: completion.status,
+        status: finalStatus,
         text: completion.text || "",
-        reason: completion.reason ? String(completion.reason).toLowerCase() : "",
+        reason: finalReason,
         evidence: {
           ...(completion.evidence || {}),
           replacedChars: typeRes?.replacedChars ?? 0,
+          ...(conversationTurns !== null && conversationTurns >= 40
+            ? {
+                conversationTurns,
+                conversationWarning: "CONVERSATION_40_TURNS",
+              }
+            : {}),
         },
         conversationUrl,
         ...(submittedAt != null ? { sendCommittedAt: submittedAt } : {}),
@@ -311,6 +500,39 @@ export async function runCdpTurn({
         elapsedMs: Date.now() - startTime,
       });
     } catch (error) {
+      if (
+        restoreUrl &&
+        cdp &&
+        sessionId &&
+        !submitted &&
+        submittedAt == null &&
+        !signal?.aborted &&
+        error?.code !== "CANCELLED"
+      ) {
+        const actualUrl = await readCurrentUrl(cdp, sessionId);
+        if (!isSameConversationUrl(normalizedProvider, actualUrl, restoreUrl)) {
+          await markConversationInvalid("conversation_restore_failed");
+          return withTerminalStatus({
+            status: "needs_human",
+            text: "",
+            reason: "conversation_restore_failed",
+            evidence: {
+              expectedConversationUrl: restoreUrl,
+              actualConversationUrl: actualUrl || null,
+              editorWaitError: error?.message || String(error),
+            },
+            conversationUrl: actualUrl || restoreUrl,
+            browser: {
+              pid: recovery?.chrome?.pid ?? null,
+              port: recovery?.chrome?.port ?? null,
+              mode,
+              reused: recovery?.action === "ADOPT",
+            },
+            elapsedMs: Date.now() - startTime,
+          });
+        }
+      }
+
       if (signal?.aborted || error?.code === "CANCELLED") {
         await tryCancelActiveGeneration();
         const committedAt = submittedAt != null ? submittedAt : (error?.sendCommittedAt != null ? error.sendCommittedAt : null);
@@ -358,13 +580,22 @@ export async function runCdpTurn({
         });
       }
 
-      const classifier = driver.classifyRunError || classifyRunError;
-      const classified = typeof classifier === "function"
-        ? classifier(error)
+      const classified = typeof classifyError === "function"
+        ? classifyError(error)
         : { state: "failed", code: error?.code || "UNKNOWN_ERROR", detail: error?.message || String(error) };
+      const conversationInvalidated = isConversationInvalidated(
+        classifyError,
+        error?.code,
+        error?.message
+      ) || classified?.code === "CONVERSATION_INVALIDATED";
+      if (conversationInvalidated) {
+        await markConversationInvalid("conversation_invalidated");
+      }
 
       const committedAt = submittedAt != null ? submittedAt : (error?.sendCommittedAt != null ? error.sendCommittedAt : null);
-      const reasonCode = error?.code || classified.code || "unknown_error";
+      const reasonCode = conversationInvalidated
+        ? "CONVERSATION_INVALIDATED"
+        : (error?.code || classified.code || "unknown_error");
       const baseEvidence = (error?.details && typeof error.details === "object")
         ? error.details
         : { message: error?.message || String(error) };

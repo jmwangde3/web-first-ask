@@ -445,7 +445,9 @@ export async function readTurnState(cdp, sessionId, adapter) {
     let pageError = null;
     if (parsed.pageError && typeof parsed.pageError === "object") {
       pageError = {
-        reason: parsed.pageError.reason === "provider_rate_limited" ? "provider_rate_limited" : "provider_error",
+        reason: parsed.pageError.reason === "provider_rate_limited" || parsed.pageError.reason === "conversation_invalidated"
+          ? parsed.pageError.reason
+          : "provider_error",
         message: typeof parsed.pageError.message === "string" ? parsed.pageError.message : "",
       };
     }
@@ -669,6 +671,20 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 export function classifyRunError(error) {
   const code = error?.code || "UNKNOWN_ERROR";
   const message = error?.message || String(error);
+  const conversationInvalidatedPattern =
+    /conversation not found|chat not found|context length|maximum context|对话不存在|上下文过长|会话已失效/i;
+
+  if (
+    code === "CONVERSATION_INVALIDATED" ||
+    conversationInvalidatedPattern.test(message) ||
+    conversationInvalidatedPattern.test(code)
+  ) {
+    return {
+      state: "failed",
+      code: "CONVERSATION_INVALIDATED",
+      detail: message,
+    };
+  }
 
   if (
     code === "HUMAN_VERIFICATION_REQUIRED" ||

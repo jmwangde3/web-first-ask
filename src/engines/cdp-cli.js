@@ -589,6 +589,12 @@ async function handleAsk(argv, deps) {
     } else if (result.status !== "completed" && result.reason) {
       stderr.write(`[cdp] reason: ${result.reason}\n`);
     }
+    if (result.evidence?.conversationWarning === "CONVERSATION_40_TURNS") {
+      const turns = Number.isSafeInteger(result.evidence.conversationTurns)
+        ? result.evidence.conversationTurns
+        : 40;
+      stderr.write(`[cdp] warning: conversation reached ${turns} turns (CONVERSATION_40_TURNS); consider starting a new conversation\n`);
+    }
     if (result.status !== "completed" && result.sendCommittedAt != null) {
       stderr.write("[cdp] warning: prompt was already sent; do not resend\n");
     }

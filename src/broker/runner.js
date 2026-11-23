@@ -203,6 +203,9 @@ export function createCdpRunner({
         settleMs: effectiveSettleMs,
         stallTimeoutMs: effectiveStallTimeoutMs,
         hardTimeoutMs: effectiveHardTimeoutMs,
+        ...(typeof turn?.conversationId === "string" && turn.conversationId.trim()
+          ? { conversationId: turn.conversationId }
+          : {}),
         ...(turn?.minIntervalMs != null ? { minIntervalMs: turn.minIntervalMs } : {}),
         ...(onWait ? { onWait } : {}),
         signal: turnController.signal,

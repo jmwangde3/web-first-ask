@@ -110,8 +110,9 @@ export function buildReadStateJs() {
     const txt = (el.innerText || el.textContent || "").trim();
     if (txt.length > 0) {
       const isRateLimit = /limit|too many requests|rate limit|try again later|429|达到限制|请求过于频繁|请稍后重试|次数过多/i.test(txt);
+      const isInvalidated = /conversation not found|chat not found|context length|maximum context|对话不存在|上下文过长|会话已失效/i.test(txt);
       pageError = {
-        reason: isRateLimit ? "provider_rate_limited" : "provider_error",
+        reason: isInvalidated ? "conversation_invalidated" : (isRateLimit ? "provider_rate_limited" : "provider_error"),
         message: txt.slice(0, 300),
       };
       break;
