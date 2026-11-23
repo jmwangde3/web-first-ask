@@ -13,7 +13,6 @@ Protect the directory as user data. web-first-ask-created task/session JSON and 
 Do not attach:
 - passwords, API keys, session cookies, OAuth tokens, private keys or recovery codes;
 - personal data not required for the task;
-- confidential legal/arbitration material or other sensitive local-only material;
 - unrelated private source files.
 
 The task ledger stores a SHA-256 payload fingerprint rather than duplicating the prompt. The JSONL run input still contains the prompt because ask-bridge reads that file.
