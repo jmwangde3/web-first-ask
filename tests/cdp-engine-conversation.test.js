@@ -41,17 +41,34 @@ function createEngineDeps({
   },
   conversationStore: store = conversationStore,
   openUrls = [],
+  closedTargets = [],
+  evalResults = [],
   counters = {},
 } = {}) {
   let urlIndex = 0;
   let targetIndex = 0;
+  let evalIndex = 0;
   const cdp = {
-    send: async (method) => {
+    send: async (method, params = {}) => {
       if (method === "Runtime.evaluate") {
+        const expression = params?.expression || "";
+        // 会话清理脚本：按 evalResults 顺序返回，默认成功
+        if (/menuitem|Delete|删除/.test(expression)) {
+          if (evalResults.length > 0) {
+            const res = evalResults[Math.min(evalIndex, evalResults.length - 1)];
+            evalIndex += 1;
+            return { result: { value: res } };
+          }
+          return { result: { value: { success: true } } };
+        }
         const index = Math.min(urlIndex, actualUrls.length - 1);
         const value = actualUrls[index] ?? "";
         urlIndex += 1;
         return { result: { value } };
+      }
+      if (method === "Target.closeTarget") {
+        closedTargets.push(params.targetId);
+        return { success: true };
       }
       return {};
     },
@@ -263,7 +280,10 @@ test("context invalidation marks the session; the next turn starts from the prov
     );
 
     assert.equal(next.status, "completed");
-    assert.deepEqual(nextOpenUrls, [chatgptAdapter.url]);
+    // 新会话从 provider 首页打开；旧会话会被独立 tab 打开用于清理
+    assert.equal(nextOpenUrls[0], chatgptAdapter.url);
+    assert.ok(nextOpenUrls.includes(CHATGPT_URL));
+    assert.equal(next.evidence?.sessionCleanup?.status, "deleted");
     const renewed = await conversationStore.loadSession(home, "chatgpt", "invalid-thread");
     assert.equal(renewed.invalidated, false);
     assert.equal(renewed.conversationUrl, CHATGPT_NEW_URL);
@@ -426,4 +446,119 @@ test("driver classifies expired conversations and context-limit errors", () => {
     assert.equal(classified.state, "failed", message);
     assert.equal(classified.code, "CONVERSATION_INVALIDATED", message);
   }
+});
+
+test("successful conversation restore does not trigger cleanup", async () => {
+  await withHome(async (home) => {
+    await conversationStore.saveSession(home, "chatgpt", "thread-ok", {
+      conversationUrl: CHATGPT_URL,
+      turnCount: 1,
+      invalidated: false,
+    });
+
+    const openUrls = [];
+    const deps = createEngineDeps({
+      actualUrls: [CHATGPT_URL, CHATGPT_URL],
+      openUrls,
+    });
+
+    const result = await runEngine(home, "thread-ok", deps);
+    assert.equal(result.status, "completed");
+    assert.deepEqual(openUrls, [CHATGPT_URL]);
+    assert.equal(result.evidence.sessionCleanup, undefined);
+  });
+});
+
+test("when conversation is invalidated and new session starts, old cloud session is cleaned up", async () => {
+  await withHome(async (home) => {
+    await conversationStore.saveSession(home, "chatgpt", "thread-inv", {
+      conversationUrl: CHATGPT_URL,
+      turnCount: 1,
+      invalidated: true,
+      invalidatedReason: "conversation_restore_failed",
+    });
+
+    const openUrls = [];
+    const closedTargets = [];
+    const deps = createEngineDeps({
+      actualUrls: [CHATGPT_NEW_URL],
+      evalResults: [{ success: true }],
+      openUrls,
+      closedTargets,
+    });
+
+    const result = await runEngine(home, "thread-inv", deps);
+    assert.equal(result.status, "completed");
+    assert.equal(result.conversationUrl, CHATGPT_NEW_URL);
+    assert.deepEqual(openUrls, [chatgptAdapter.url, CHATGPT_URL]);
+    assert.ok(closedTargets.includes("target-2"));
+    assert.equal(result.evidence.sessionCleanup?.status, "deleted");
+    assert.equal(result.evidence.sessionCleanup?.url, CHATGPT_URL);
+
+    const updated = await conversationStore.loadSession(home, "chatgpt", "thread-inv");
+    assert.equal(updated.conversationUrl, CHATGPT_NEW_URL);
+    const retired = updated.retired.find((r) => r.conversationUrl === CHATGPT_URL);
+    assert.ok(retired);
+    assert.equal(retired.cleanupStatus, "deleted");
+  });
+});
+
+test("cleanup failure does not affect turn completion status", async () => {
+  await withHome(async (home) => {
+    await conversationStore.saveSession(home, "chatgpt", "thread-fail", {
+      conversationUrl: CHATGPT_URL,
+      turnCount: 1,
+      invalidated: true,
+    });
+
+    const openUrls = [];
+    const deps = createEngineDeps({
+      actualUrls: [chatgptAdapter.url, CHATGPT_NEW_URL],
+      evalResults: [{ success: false, reason: "menu_button_not_found" }],
+      openUrls,
+    });
+
+    const result = await runEngine(home, "thread-fail", deps);
+    assert.equal(result.status, "completed");
+    assert.equal(result.evidence.sessionCleanup?.status, "failed");
+    assert.equal(result.evidence.sessionCleanup?.reason, "menu_button_not_found");
+  });
+});
+
+test("aborted signal skips cleanup execution", async () => {
+  await withHome(async (home) => {
+    await conversationStore.saveSession(home, "chatgpt", "thread-abort", {
+      conversationUrl: CHATGPT_URL,
+      turnCount: 1,
+      invalidated: true,
+    });
+
+    const controller = new AbortController();
+    const openUrls = [];
+    const deps = createEngineDeps({
+      actualUrls: [chatgptAdapter.url],
+      openUrls,
+    });
+
+    controller.abort();
+    const result = await runEngine(home, "thread-abort", deps, { signal: controller.signal });
+    assert.equal(result.status, "failed");
+    assert.equal(result.reason, "cancelled");
+    assert.equal(openUrls.length, 0);
+  });
+});
+
+test("no conversationId does not trigger cleanup", async () => {
+  await withHome(async (home) => {
+    const openUrls = [];
+    const deps = createEngineDeps({
+      actualUrls: [chatgptAdapter.url, CHATGPT_URL],
+      openUrls,
+    });
+
+    const result = await runEngine(home, undefined, deps);
+    assert.equal(result.status, "completed");
+    assert.deepEqual(openUrls, [chatgptAdapter.url]);
+    assert.equal(result.evidence.sessionCleanup, undefined);
+  });
 });

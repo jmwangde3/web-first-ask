@@ -134,3 +134,113 @@ export function buildReadStateJs() {
   });
 })()`;
 }
+
+export function buildDeleteConversationJs() {
+  return `(async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const findVisible = (selectors) => {
+    for (const sel of selectors) {
+      const els = Array.from(document.querySelectorAll(sel));
+      for (const el of els) {
+        const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        if (!r || (r.width > 0 && r.height > 0)) {
+          return el;
+        }
+      }
+    }
+    return null;
+  };
+
+  const waitElement = async (selectors, timeoutMs = 4000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const found = findVisible(selectors);
+      if (found) return found;
+      await sleep(150);
+    }
+    return null;
+  };
+
+  const menuSelectors = [
+    'button[data-testid="conversation-actions-button"]',
+    'button[aria-label="Chat actions"]',
+    'button[aria-label="聊天操作"]',
+    'button[aria-label="Conversation options"]',
+    'button[aria-label="更多操作"]',
+    'nav li a[aria-current="page"] + div button',
+    'header button[aria-haspopup="menu"]',
+  ];
+
+  const menuBtn = await waitElement(menuSelectors, 3500);
+  if (!menuBtn) {
+    return { success: false, reason: "menu_button_not_found" };
+  }
+  menuBtn.click();
+
+  const deleteItemSelectors = [
+    '[role="menuitem"][data-testid*="delete"]',
+    '[role="menuitem"][data-testid="delete-chat-button"]',
+    'div[role="menuitem"] span.text-token-text-error',
+    '[role="menuitem"]',
+  ];
+
+  const deadlineMenu = Date.now() + 3000;
+  let deleteItem = null;
+  while (Date.now() < deadlineMenu) {
+    const items = Array.from(document.querySelectorAll('[role="menuitem"], div[role="menu"] button, ul[role="menu"] li'));
+    for (const it of items) {
+      const txt = (it.innerText || it.textContent || "").trim();
+      if (/Delete|删除/i.test(txt)) {
+        deleteItem = it;
+        break;
+      }
+    }
+    if (deleteItem) break;
+    await sleep(150);
+  }
+
+  if (!deleteItem) {
+    return { success: false, reason: "delete_menu_item_not_found" };
+  }
+  deleteItem.click();
+
+  const confirmBtnSelectors = [
+    'button[data-testid="confirm-delete-button"]',
+    'button.btn-danger',
+    '[role="dialog"] button.btn-danger',
+    '[role="dialog"] button',
+  ];
+
+  const deadlineConfirm = Date.now() + 3500;
+  let confirmBtn = null;
+  while (Date.now() < deadlineConfirm) {
+    const btns = Array.from(document.querySelectorAll('[role="dialog"] button, div[role="alertdialog"] button, .modal button'));
+    for (const btn of btns) {
+      const txt = (btn.innerText || btn.textContent || "").trim();
+      if (/^(Delete|删除|确认删除)$/i.test(txt) || /btn-danger/.test(btn.className || "")) {
+        confirmBtn = btn;
+        break;
+      }
+    }
+    if (confirmBtn) break;
+    await sleep(150);
+  }
+
+  if (!confirmBtn) {
+    return { success: false, reason: "confirm_button_not_found" };
+  }
+  confirmBtn.click();
+
+  const deadlineVerify = Date.now() + 4000;
+  while (Date.now() < deadlineVerify) {
+    const dialogOpen = Boolean(document.querySelector('[role="dialog"], [role="alertdialog"]'));
+    if (!dialogOpen) {
+      return { success: true };
+    }
+    await sleep(200);
+  }
+
+  return { success: true, verified: "timeout_waiting_dialog_close" };
+})()`;
+}

@@ -45,6 +45,81 @@ async function readCurrentUrl(cdp, sessionId) {
   }
 }
 
+async function performSessionCleanup({
+  driver,
+  cdp,
+  adapter,
+  cleanupTargetUrl,
+  home,
+  provider,
+  conversationId,
+  conversationStore,
+  reportError,
+  signal,
+}) {
+  if (!cleanupTargetUrl || signal?.aborted) {
+    return { status: "skipped", reason: signal?.aborted ? "aborted" : "no_target", url: cleanupTargetUrl || null };
+  }
+
+  let cleanupTab = null;
+  try {
+    cleanupTab = await driver.openTab(cdp, cleanupTargetUrl, { timeoutMs: 15000 });
+    if (signal?.aborted) {
+      return { status: "skipped", reason: "aborted", url: cleanupTargetUrl };
+    }
+
+    const script = typeof adapter.buildDeleteConversationJs === "function"
+      ? adapter.buildDeleteConversationJs()
+      : null;
+
+    if (!script) {
+      return { status: "skipped", reason: "adapter_delete_not_supported", url: cleanupTargetUrl };
+    }
+
+    const evalResult = await cdp.send("Runtime.evaluate", {
+      expression: script,
+      awaitPromise: true,
+      returnByValue: true,
+    }, cleanupTab.sessionId);
+
+    const res = evalResult?.result?.value;
+    if (res && res.success) {
+      try {
+        if (typeof conversationStore.markDeleted === "function") {
+          await conversationStore.markDeleted(home, provider, conversationId, cleanupTargetUrl, "deleted");
+        }
+      } catch (err) {
+        await reportError("markDeleted", err);
+      }
+      return { status: "deleted", url: cleanupTargetUrl };
+    }
+
+    try {
+      if (typeof conversationStore.markDeleted === "function") {
+        await conversationStore.markDeleted(home, provider, conversationId, cleanupTargetUrl, "failed");
+      }
+    } catch {}
+
+    return {
+      status: "failed",
+      reason: res?.reason || "delete_eval_failed",
+      url: cleanupTargetUrl,
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      reason: error?.message || String(error),
+      url: cleanupTargetUrl,
+    };
+  } finally {
+    if (cleanupTab && cleanupTab.targetId) {
+      try {
+        await cdp.send("Target.closeTarget", { targetId: cleanupTab.targetId });
+      } catch {}
+    }
+  }
+}
+
 function isSameConversationUrl(provider, actualUrl, expectedUrl) {
   if (
     !defaultConversationStore.isValidConversationUrl(provider, actualUrl) ||
@@ -221,6 +296,7 @@ export async function runCdpTurn({
     let conversationUrl = adapter.url || "";
     let storedSession = null;
     let restoreUrl = null;
+    let cleanupTargetUrl = null;
 
     if (normalizedConversationId && typeof conversationStore.loadSession === "function") {
       try {
@@ -238,6 +314,17 @@ export async function runCdpTurn({
         defaultConversationStore.isValidConversationUrl(normalizedProvider, storedSession.conversationUrl)
       ) {
         restoreUrl = storedSession.conversationUrl;
+      } else if (
+        storedSession &&
+        storedSession.invalidated &&
+        defaultConversationStore.isValidConversationUrl(normalizedProvider, storedSession.conversationUrl)
+      ) {
+        const alreadyDeleted = Array.isArray(storedSession.retired) && storedSession.retired.some(
+          (r) => r.conversationUrl === storedSession.conversationUrl && r.deletedAt != null
+        );
+        if (!alreadyDeleted) {
+          cleanupTargetUrl = storedSession.conversationUrl;
+        }
       }
     }
 
@@ -475,6 +562,35 @@ export async function runCdpTurn({
         }
       }
 
+      let sessionCleanupEvidence = null;
+      if (
+        cleanupTargetUrl &&
+        !restoreUrl &&
+        !signal?.aborted &&
+        cdp
+      ) {
+        try {
+          sessionCleanupEvidence = await performSessionCleanup({
+            driver,
+            cdp,
+            adapter,
+            cleanupTargetUrl,
+            home: effectiveHome,
+            provider: normalizedProvider,
+            conversationId: normalizedConversationId,
+            conversationStore,
+            reportError: reportConversationStoreError,
+            signal,
+          });
+        } catch (cleanupErr) {
+          sessionCleanupEvidence = {
+            status: "failed",
+            reason: cleanupErr?.message || String(cleanupErr),
+            url: cleanupTargetUrl,
+          };
+        }
+      }
+
       return withTerminalStatus({
         status: finalStatus,
         text: completion.text || "",
@@ -482,6 +598,7 @@ export async function runCdpTurn({
         evidence: {
           ...(completion.evidence || {}),
           replacedChars: typeRes?.replacedChars ?? 0,
+          ...(sessionCleanupEvidence ? { sessionCleanup: sessionCleanupEvidence } : {}),
           ...(conversationTurns !== null && conversationTurns >= 40
             ? {
                 conversationTurns,

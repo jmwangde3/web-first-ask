@@ -57,6 +57,16 @@ export function getConversationSessionPath(home, provider, conversationId) {
   return path.join(root, "conversations", provider, `${key}.json`);
 }
 
+function isValidRetiredEntry(item, provider) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+  if (!isValidConversationUrl(provider, item.conversationUrl)) return false;
+  if (item.invalidatedReason !== null && typeof item.invalidatedReason !== "string") return false;
+  if (item.deletedAt !== null && (typeof item.deletedAt !== "string" || !Number.isFinite(Date.parse(item.deletedAt)))) return false;
+  if (item.cleanupStatus !== null && typeof item.cleanupStatus !== "string") return false;
+  if (item.cleanupAttemptedAt !== null && (typeof item.cleanupAttemptedAt !== "string" || !Number.isFinite(Date.parse(item.cleanupAttemptedAt)))) return false;
+  return true;
+}
+
 function isValidStoredSession(record, provider, conversationId) {
   if (
     !record ||
@@ -84,10 +94,19 @@ function isValidStoredSession(record, provider, conversationId) {
   }
 
   if (record.conversationUrl === null) {
-    return record.invalidated;
+    if (!record.invalidated) return false;
+  } else if (!isValidConversationUrl(provider, record.conversationUrl)) {
+    return false;
   }
 
-  return isValidConversationUrl(provider, record.conversationUrl);
+  if (record.retired !== undefined) {
+    if (!Array.isArray(record.retired)) return false;
+    for (const item of record.retired) {
+      if (!isValidRetiredEntry(item, provider)) return false;
+    }
+  }
+
+  return true;
 }
 
 export async function loadSession(home, provider, conversationId) {
@@ -97,7 +116,13 @@ export async function loadSession(home, provider, conversationId) {
   try {
     const content = await readFile(target, "utf8");
     const record = JSON.parse(content);
-    return isValidStoredSession(record, provider, conversationId) ? record : null;
+    if (!isValidStoredSession(record, provider, conversationId)) {
+      return null;
+    }
+    if (!Array.isArray(record.retired)) {
+      record.retired = [];
+    }
+    return record;
   } catch {
     return null;
   }
@@ -149,6 +174,28 @@ export async function saveSession(home, provider, conversationId, patch = {}) {
     throw new Error("INVALID_CONVERSATION_CREATED_AT");
   }
 
+  let retired = Array.isArray(patch.retired)
+    ? [...patch.retired]
+    : (Array.isArray(existing?.retired) ? [...existing.retired] : []);
+
+  if (
+    existing?.conversationUrl &&
+    conversationUrl &&
+    existing.conversationUrl !== conversationUrl &&
+    isValidConversationUrl(provider, existing.conversationUrl)
+  ) {
+    const alreadyRetired = retired.some((r) => r.conversationUrl === existing.conversationUrl);
+    if (!alreadyRetired) {
+      retired.push({
+        conversationUrl: existing.conversationUrl,
+        invalidatedReason: existing.invalidatedReason || "retired_on_new_session",
+        deletedAt: null,
+        cleanupStatus: null,
+        cleanupAttemptedAt: null,
+      });
+    }
+  }
+
   const record = {
     schema: CONVERSATION_SCHEMA,
     provider,
@@ -157,6 +204,7 @@ export async function saveSession(home, provider, conversationId, patch = {}) {
     turnCount,
     invalidated,
     invalidatedReason,
+    retired,
     createdAt,
     updatedAt: now,
   };
@@ -180,6 +228,54 @@ export async function saveSession(home, provider, conversationId, patch = {}) {
   return record;
 }
 
+export async function markDeleted(home, provider, conversationId, targetUrl, status = "deleted") {
+  assertIdentity(provider, conversationId);
+  if (!isValidConversationUrl(provider, targetUrl)) {
+    throw new Error("INVALID_CONVERSATION_URL");
+  }
+
+  const existing = await loadSession(home, provider, conversationId);
+  if (!existing) return null;
+
+  const now = new Date().toISOString();
+  let updated = false;
+  const retired = Array.isArray(existing.retired) ? [...existing.retired] : [];
+
+  for (let i = 0; i < retired.length; i++) {
+    if (retired[i].conversationUrl === targetUrl) {
+      retired[i] = {
+        ...retired[i],
+        deletedAt: status === "deleted" ? (retired[i].deletedAt || now) : retired[i].deletedAt,
+        cleanupStatus: status,
+        cleanupAttemptedAt: now,
+      };
+      updated = true;
+    }
+  }
+
+  if (!updated && existing.conversationUrl === targetUrl) {
+    retired.push({
+      conversationUrl: targetUrl,
+      invalidatedReason: existing.invalidatedReason || "invalidated",
+      deletedAt: status === "deleted" ? now : null,
+      cleanupStatus: status,
+      cleanupAttemptedAt: now,
+    });
+    updated = true;
+  }
+
+  if (!updated) return existing;
+
+  return saveSession(home, provider, conversationId, {
+    conversationUrl: existing.conversationUrl,
+    turnCount: existing.turnCount,
+    invalidated: existing.invalidated,
+    invalidatedReason: existing.invalidatedReason,
+    createdAt: existing.createdAt,
+    retired,
+  });
+}
+
 export async function markInvalid(home, provider, conversationId, reason) {
   assertIdentity(provider, conversationId);
   const existing = await loadSession(home, provider, conversationId);
@@ -192,6 +288,7 @@ export async function markInvalid(home, provider, conversationId, reason) {
     turnCount: existing?.turnCount ?? 0,
     invalidated: true,
     invalidatedReason,
+    retired: existing?.retired ?? [],
     ...(existing?.createdAt ? { createdAt: existing.createdAt } : {}),
   });
 }

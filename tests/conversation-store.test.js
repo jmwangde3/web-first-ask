@@ -7,11 +7,13 @@ import {
   getConversationSessionPath,
   isValidConversationUrl,
   loadSession,
+  markDeleted,
   markInvalid,
   saveSession,
 } from "../src/browser/conversation-store.js";
 
 const CHATGPT_URL = "https://chatgpt.com/c/chat-123";
+const CHATGPT_URL_2 = "https://chatgpt.com/c/chat-456";
 const GEMINI_URL = "https://gemini.google.com/app/gemini_123";
 
 async function withHome(run) {
@@ -143,5 +145,75 @@ test("parallel writes for different conversation IDs remain isolated", async () 
       getConversationSessionPath(home, "chatgpt", "parallel-a"),
       getConversationSessionPath(home, "chatgpt", "parallel-b")
     );
+  });
+});
+
+test("saveSession appends old URL into retired on URL change and deduplicates", async () => {
+  await withHome(async (home) => {
+    await saveSession(home, "chatgpt", "thread-retired", {
+      conversationUrl: CHATGPT_URL,
+      turnCount: 1,
+    });
+
+    const second = await saveSession(home, "chatgpt", "thread-retired", {
+      conversationUrl: CHATGPT_URL_2,
+      turnCount: 1,
+    });
+
+    assert.equal(second.conversationUrl, CHATGPT_URL_2);
+    assert.equal(second.retired.length, 1);
+    assert.equal(second.retired[0].conversationUrl, CHATGPT_URL);
+    assert.equal(second.retired[0].deletedAt, null);
+
+    const third = await saveSession(home, "chatgpt", "thread-retired", {
+      conversationUrl: CHATGPT_URL_2,
+      turnCount: 2,
+    });
+    assert.equal(third.retired.length, 1);
+  });
+});
+
+test("markDeleted updates target url in retired idempotently", async () => {
+  await withHome(async (home) => {
+    await saveSession(home, "chatgpt", "thread-del", {
+      conversationUrl: CHATGPT_URL,
+      turnCount: 1,
+    });
+    await saveSession(home, "chatgpt", "thread-del", {
+      conversationUrl: CHATGPT_URL_2,
+      turnCount: 1,
+    });
+
+    const updated = await markDeleted(home, "chatgpt", "thread-del", CHATGPT_URL, "deleted");
+    assert.equal(updated.retired.length, 1);
+    assert.equal(updated.retired[0].conversationUrl, CHATGPT_URL);
+    assert.ok(updated.retired[0].deletedAt);
+    assert.equal(updated.retired[0].cleanupStatus, "deleted");
+
+    const again = await markDeleted(home, "chatgpt", "thread-del", CHATGPT_URL, "deleted");
+    assert.equal(again.retired[0].deletedAt, updated.retired[0].deletedAt);
+  });
+});
+
+test("legacy session JSON without retired field loads gracefully", async () => {
+  await withHome(async (home) => {
+    const target = getConversationSessionPath(home, "chatgpt", "legacy-thread");
+    await mkdir(path.dirname(target), { recursive: true });
+    const legacyRecord = {
+      schema: 1,
+      provider: "chatgpt",
+      conversationId: "legacy-thread",
+      conversationUrl: CHATGPT_URL,
+      turnCount: 2,
+      invalidated: false,
+      invalidatedReason: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await writeFile(target, JSON.stringify(legacyRecord), "utf8");
+
+    const loaded = await loadSession(home, "chatgpt", "legacy-thread");
+    assert.ok(loaded);
+    assert.deepEqual(loaded.retired, []);
   });
 });
