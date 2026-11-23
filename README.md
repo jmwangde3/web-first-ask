@@ -2,7 +2,9 @@
 
 **Codex-first CLI + Skill for delegating thinking and complete code implementation to ChatGPT and Gemini Web, serially by default.**
 
-`web-first-ask` (`wfa`) is a local Node.js CLI that calls the independently maintained [`ask-bridge`](https://github.com/doggy8088/ask-bridge) executable. It explicitly selects ask-bridge's `browser` backend because its Batch command does not support SIWC. It does not expose an MCP server to Codex and does not reimplement browser automation.
+Current version: **1.0.0** — the native CDP engine is now the default browser path. See [CHANGELOG.md](CHANGELOG.md).
+
+`web-first-ask` (`wfa`) is a local Node.js CLI with two browser paths: a **native CDP engine** (`wfa cdp` / `wfa broker`, the default since 1.0.0) that drives Chrome directly, and a **legacy ask-bridge backend** (`wfa ask` / `code` / `compare`) that calls the independently maintained [`ask-bridge`](https://github.com/doggy8088/ask-bridge) executable. The legacy path explicitly selects ask-bridge's `browser` backend because its Batch command does not support SIWC. WFA does not expose an MCP server to Codex.
 
 **Hard rule for agents: code work is delegated, never hand-written.** Every code problem — a bug, a failing test, a refactor, a feature, a review — goes to `wfa` with both providers and comes back as complete file contents or an exact patch. The local agent integrates the patch, runs the tests and reports the result; it does not diagnose first and does not type the fix itself. The only exception is an explicit instruction from the user that the request must not use agents. The same rule is stated at the top of `skills/web-first/SKILL.md` so an installed Skill carries it.
 
@@ -24,11 +26,11 @@
 - `--stall-timeout` (default 900 s; `0` disables) kills a batch that stops producing progress lines *and* stops advancing its metadata, provided ask-bridge's browser log has also been quiet for two minutes. ask-bridge prints nothing while a page generates, so silence alone is not a stall; a long answer keeps running and the CLI repeats `[wfa] still waiting: ...` every minute so a silent run is never confused with a dead one. When a stall is real, the provider becomes `stalled` — blocking like an uncertain send, never auto-retried — instead of hanging until the full timeout. Already captured stdout/stderr and stalled evidence are retained.
 - Results can be inspected and staged; writing staged code into the workspace requires an explicit `wfa apply --confirm` and SHA-256 revalidation. Stage supports complete `FILE:` blocks or exact `ANCHOR`/`REPLACE` blocks.
 - WFA can continue an existing task conversation with `--followup`.
-- **Native CDP path.** `wfa cdp ask` drives Chrome directly over the DevTools Protocol through a zero-dependency
+- **Native CDP path (default since 1.0.0).** `wfa cdp ask` drives Chrome directly over the DevTools Protocol through a zero-dependency
   client (`src/browser/cdp.js`), a provider driver (`src/browser/driver.js`) and per-site adapters
-  (`src/browser/adapters/`). No MCP server, no npm package, one Chrome per home directory. It is the migration
-  target for the ask-bridge backend; `wfa broker` adds a queue in front of it.
-- ask-bridge remains an external tool; WFA adds no runtime npm dependency.
+  (`src/browser/adapters/`). No MCP server, no npm package, one Chrome per home directory. This is the default
+  browser path for `cdp` / `broker`; `wfa broker` adds a queue in front of it.
+- ask-bridge remains an external tool and is now a legacy fallback for `ask` / `code` / `compare`; WFA adds no runtime npm dependency.
 
 ## Architecture
 
@@ -326,7 +328,9 @@ Browser modes:
 Completion rule for a turn: the send is acknowledged (user turn count increases or the composer empties), the
 answer text is non-empty, the text has been stable for `--settle` milliseconds (default 4000), and the stop
 control is gone — or it has been visible for 60 s, in which case the selector is declared unreliable and the
-answer is still returned with `reason: completed_stop_signal_unreliable`.
+answer is still returned with `reason: completed_stop_signal_unreliable`. A fast short answer can finish
+before the first read; `unresolvedGraceMs` (6000 ms) lets that first empty read settle, and a second
+confirmation is required before the turn is failed as `MESSAGE_SELECTOR_UNRESOLVED`.
 
 Failure reasons are explicit and never retried:
 
@@ -340,7 +344,9 @@ Failure reasons are explicit and never retried:
 | `send_button_disabled` | Send button remained disabled after prompt input. Failed fast before waiting for ACK. |
 | `send_button_ambiguous` | Multiple eligible send buttons matched in DOM; no click performed. |
 | `editor_not_found` | The page loaded but no composer appeared; evidence carries `title`, `adapter` and `bodyLength`. |
+| `PROMPT_NOT_TYPED` | Read-back did not find the typed prompt in the composer. The driver selects and replaces existing draft content; consecutive blank lines are folded in the comparison so ProseMirror's empty-line expansion does not cause a false mismatch. Nothing is sent. |
 | `send_unconfirmed` | Nothing acknowledged the send within 30 s, or CDP click evaluation failed with an uncertain outcome. Treated as uncertain; never resent. |
+| `MESSAGE_SELECTOR_UNRESOLVED` | No answer message was resolved after the send was acknowledged; `unresolvedGraceMs` plus a second confirmation failed. Failed fast instead of waiting for the full timeout. |
 | `no_progress` | The answer stopped growing for `--stall-timeout`. The partial text is returned. |
 | `hard_timeout` / `cancelled` | The overall timeout expired, or the caller aborted. A cancel after submit carries `sendCommittedAt`. |
 | recovery reasons (`lock_corrupt`, `identity_mismatch_profile_held`, …) | `browser.lock` could not be reconciled safely; the turn becomes `needs_human` and `evidence` names the failing check (see `src/browser/recovery.js`). |
@@ -395,7 +401,7 @@ persistent cookie usually makes that a few seconds without retyping a password.
 
 ## Known issues
 
-`docs/known-issues.md` is the upstream-facing list (U1–U15) of defects measured against ask-bridge 0.4.0, with reproduction, expectation and impact per item: attachment verification failing on ordinary filenames, prompts above roughly 44 KiB being truncated without a signal, ChatGPT long answers landing in Canvas instead of `response.md`, `--new-session` still reusing an open tab, Gemini escaping Markdown diffs, unstable concurrent tabs, missing log rotation, the absence of a `submissionState`, and a serial batch closing the previous job's tab. U7 (`exit_type=Crashed`) is fixed in 0.4.0 and kept only as a record. Each item is tagged with WFA's current workaround, never an upstream fix. Read it before sending large context or relying on provider-side isolation.
+`docs/known-issues.md` is the upstream-facing list (U1–U19) of defects measured against ask-bridge 0.4.0, with reproduction, expectation and impact per item: attachment verification failing on ordinary filenames, prompts above roughly 44 KiB being truncated without a signal, ChatGPT long answers landing in Canvas instead of `response.md`, `--new-session` still reusing an open tab, Gemini escaping Markdown diffs, unstable concurrent tabs, missing log rotation, the absence of a `submissionState`, and a serial batch closing the previous job's tab. U7 (`exit_type=Crashed`) is fixed in 0.4.0 and kept only as a record. Each item is tagged with WFA's current workaround, never an upstream fix. Read it before sending large context or relying on provider-side isolation.
 
 **Cloudflare profile challenge (measured 2026-11-23).** With the shared ask-bridge profile, `chatgpt.com` served a
 `请稍候…` interstitial with an empty body to *both* backends, while a brand-new Chrome profile loaded the same URL
