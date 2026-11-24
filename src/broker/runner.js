@@ -206,6 +206,7 @@ export function createCdpRunner({
         ...(typeof turn?.conversationId === "string" && turn.conversationId.trim()
           ? { conversationId: turn.conversationId }
           : {}),
+        ...(Array.isArray(turn?.files) && turn.files.length > 0 ? { files: turn.files } : {}),
         ...(turn?.minIntervalMs != null ? { minIntervalMs: turn.minIntervalMs } : {}),
         ...(onWait ? { onWait } : {}),
         signal: turnController.signal,

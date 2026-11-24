@@ -272,6 +272,135 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
   throw new WfaError("PROMPT_NOT_TYPED", `Unknown editor kind "${kind}" for ${adapter.id}`);
 }
 
+/**
+ * 批次 D 新增：为 native CDP 附加文件到 Provider 界面
+ * @param {object} cdp CDP 客户端连接
+ * @param {string} sessionId 当前页面的 Target Session ID
+ * @param {object} adapter Provider 适配器定义
+ * @param {string[]} filePaths 需要附加的绝对文件路径数组
+ * @param {object} options
+ */
+export async function attachFiles(cdp, sessionId, adapter, filePaths = [], { signal, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+  if (signal?.aborted) {
+    const err = new Error("Operation cancelled");
+    err.code = "CANCELLED";
+    throw err;
+  }
+
+  if (!filePaths || !filePaths.length) {
+    return { attached: [], provider: adapter?.id || "unknown", skipped: [] };
+  }
+
+  // 1. 严格校验绝对路径
+  const absolutePaths = filePaths.map((fp) => String(fp).trim());
+  for (const fp of absolutePaths) {
+    const isAbs = /^[a-zA-Z]:[\\/]/.test(fp) || fp.startsWith("/") || fp.startsWith("\\\\");
+    if (!isAbs) {
+      throw new WfaError("ATTACHMENT_NOT_FOUND", `Attachment path must be absolute: ${fp}`);
+    }
+  }
+
+  // 2. 若 adapter 需要触发前端上传前置动作（例如 Gemini 展开菜单），先执行 buildUploadJs
+  if (typeof adapter.buildUploadJs === "function") {
+    const uploadJs = adapter.buildUploadJs();
+    if (uploadJs) {
+      const evalRes = await cdp.send("Runtime.evaluate", {
+        expression: uploadJs,
+        returnByValue: true,
+        awaitPromise: true,
+      }, sessionId);
+
+      if (signal?.aborted) {
+        const err = new Error("Operation cancelled");
+        err.code = "CANCELLED";
+        throw err;
+      }
+
+      const resVal = evalRes?.result?.value;
+      if (resVal && resVal.success === false) {
+        throw new WfaError("ATTACH_UPLOAD_FAILED", `Failed to prepare upload UI: ${resVal.reason || "unknown"}`);
+      }
+    }
+  }
+
+  const selector = adapter.fileInputSelector || 'input[type="file"]';
+
+  // 3. 核心机制：CDP DOM 查找与 DOM.setFileInputFiles
+  // 先通过 DOM.getDocument 拿 root nodeId，再用 DOM.querySelector 查询 input 元素
+  let fileNodeId = null;
+  let backendNodeId = null;
+
+  try {
+    const doc = await cdp.send("DOM.getDocument", { depth: 0 }, sessionId);
+    if (doc?.root?.nodeId) {
+      const queryRes = await cdp.send("DOM.querySelector", {
+        nodeId: doc.root.nodeId,
+        selector,
+      }, sessionId);
+      if (queryRes?.nodeId) {
+        fileNodeId = queryRes.nodeId;
+      }
+    }
+  } catch {}
+
+  // 兜底路径：若 DOM.querySelector 未直接拿到有效 nodeId，通过 Runtime.evaluate 解析 DOM 并提取 backendNodeId
+  if (!fileNodeId) {
+    const evalNode = await cdp.send("Runtime.evaluate", {
+      expression: `document.querySelector(${JSON.stringify(selector)})`,
+    }, sessionId);
+    const objectId = evalNode?.result?.objectId;
+    if (objectId) {
+      try {
+        const desc = await cdp.send("DOM.describeNode", { objectId }, sessionId);
+        backendNodeId = desc?.node?.backendNodeId;
+      } catch {}
+    }
+  }
+
+  if (!fileNodeId && !backendNodeId) {
+    throw new WfaError("ATTACH_UPLOAD_FAILED", `File input element not found for selector: ${selector}`);
+  }
+
+  if (signal?.aborted) {
+    const err = new Error("Operation cancelled");
+    err.code = "CANCELLED";
+    throw err;
+  }
+
+  // 选择理由：优先采用 CDP DOM.setFileInputFiles 配合 nodeId 或 backendNodeId 注入，
+  // 避免使用 Page.setInterceptFileChooserDialog（其需要真实触发用户点击并捕获原生文件选择对话框，在隐藏式 input 或不同 OS 平台下时序不可靠）。
+  try {
+    if (fileNodeId) {
+      await cdp.send("DOM.setFileInputFiles", {
+        files: absolutePaths,
+        nodeId: fileNodeId,
+      }, sessionId);
+    } else {
+      await cdp.send("DOM.setFileInputFiles", {
+        files: absolutePaths,
+        backendNodeId,
+      }, sessionId);
+    }
+  } catch (err) {
+    throw new WfaError("ATTACH_UPLOAD_FAILED", `CDP DOM.setFileInputFiles failed: ${err.message || String(err)}`);
+  }
+
+  if (signal?.aborted) {
+    const err = new Error("Operation cancelled");
+    err.code = "CANCELLED";
+    throw err;
+  }
+
+  // 4. 不在此处重复 waitForEditor：调用方 engine 已在 openTab 后等待过 editor，
+  // 这里再等一次在 mock/慢渲染下会额外卡 15s，且上传本身不改变 editor 可用性。
+
+  return {
+    attached: absolutePaths,
+    provider: adapter?.id || "unknown",
+    skipped: [],
+  };
+}
+
 export async function submitTurn(cdp, sessionId, adapter, {
   sendButtonTimeoutMs = 2000,
   pollIntervalMs = 100,
@@ -494,6 +623,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
 export async function waitForCompletion(cdp, sessionId, adapter, {
   baselineAnswerTurns = 0,
   baselineUserTurns = 0,
+  baselineAnswerText = "",
   settleMs = 4000,
   unresolvedGraceMs = 6000,
   stopGraceMs = 60000,
@@ -528,7 +658,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       return {
         status: "needs_human",
         reason: "hard_timeout",
-        text: lastState?.answerText || "",
+        text: sawCurrentAnswer ? (lastState?.answerText || "") : "",
         elapsedMs,
         evidence: buildEvidence(lastState, now() - lastProgressAt),
       };
@@ -551,14 +681,22 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       return {
         status: "needs_human",
         reason: "human_verification_required",
-        text: state.answerText || "",
+        text: sawCurrentAnswer ? (state.answerText || "") : "",
         elapsedMs: now() - startTime,
         evidence: buildEvidence(state, now() - lastProgressAt),
       };
     }
 
     const currentAnswerText = (state.answerText || "").trim();
-    if (currentAnswerText && state.answerTurns > baselineAnswerTurns) {
+    // 真机证据（2026-11-24）：续聊时 userTurns 已+1 但 answerTurns 未增，页面唯一文本是上一轮
+    // 旧答案（smoke-actions2: answerTurns=1, 20575 字符旧答案却返回 completed）。
+    // 本轮新答案判定：轮次增加，或（原地覆写时）文本相对基线发生变化。文本必须非空。
+    const baseText = String(baselineAnswerText || "").trim();
+    const isNewTurn = state.answerTurns > baselineAnswerTurns;
+    // 仅在显式提供基线文本时才用文本变化判定（覆盖原地覆写）；未提供时不可凭任意非空历史文本判新，
+    // 否则会破坏 pre-ACK 的 rate-limit 快速失败等既有语义。
+    const textChanged = baseText ? currentAnswerText !== baseText : false;
+    if (currentAnswerText && (isNewTurn || textChanged)) {
       sawCurrentAnswer = true;
     }
     // Tier 1 (pre-ACK): only fatal rate-limit fast-fails, to avoid 30s send_unconfirmed dead-wait
@@ -566,7 +704,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       return {
         status: "needs_human",
         reason: "provider_rate_limited",
-        text: state.answerText || "",
+        text: sawCurrentAnswer ? (state.answerText || "") : "",
         elapsedMs: now() - startTime,
         evidence: buildEvidence(state, now() - lastProgressAt),
       };
@@ -583,8 +721,8 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
         if (now() - startTime >= ackTimeoutMs) {
           return {
             status: "stalled",
-            reason: "send_unconfirmed",
-            text: state.answerText || "",
+        reason: "send_unconfirmed",
+        text: sawCurrentAnswer ? (state.answerText || "") : "",
             elapsedMs: now() - startTime,
             evidence: buildEvidence(state, now() - lastProgressAt),
           };
@@ -599,7 +737,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       return {
         status: "needs_human",
         reason: state.pageError.reason,
-        text: state.answerText || "",
+        text: sawCurrentAnswer ? (state.answerText || "") : "",
         elapsedMs: now() - startTime,
         evidence: buildEvidence(state, now() - lastProgressAt),
       };
@@ -618,7 +756,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       return {
         status: "stalled",
         reason: "no_progress",
-        text: state.answerText || "",
+        text: sawCurrentAnswer ? (state.answerText || "") : "",
         elapsedMs: now() - startTime,
         evidence: buildEvidence(state, now() - lastProgressAt),
       };
@@ -638,7 +776,8 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     const actionsGraceMs = 180000;
     const actionsStale = !actionsDone && (now() - lastProgressAt) >= actionsGraceMs;
 
-    if (hasAnswer && settled && (stopGone || stopDegraded) && (actionsDone || actionsStale)) {
+    // 必须确认本轮产生了新答案，才允许 completed；否则旧答案会从各终态分支泄漏（裁决见 wfa-resume-bug-verdict.md）。
+    if (sawCurrentAnswer && hasAnswer && settled && (stopGone || stopDegraded) && (actionsDone || actionsStale)) {
       return {
         status: "completed",
         reason: actionsStale

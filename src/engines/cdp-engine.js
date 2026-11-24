@@ -165,6 +165,7 @@ export async function runCdpTurn({
   provider,
   prompt,
   home,
+  files = [],
   conversationId = null,
   mode = "background",
   chromePath,
@@ -432,7 +433,24 @@ export async function runCdpTurn({
         conversationUrl = actualUrl;
       }
 
-      const initialState = await driver.readTurnState(cdp, sessionId, adapter);
+      let initialState = await driver.readTurnState(cdp, sessionId, adapter);
+      // 续聊时 SPA 历史消息可能晚于编辑器挂载；baseline 读成 0 会把旧消息误当本轮新答案。
+      // 短轮询等历史稳定：连续两次采样一致即放行，上限 3s（不阻塞正常发送）。
+      if (restoreUrl && (initialState?.userTurns ?? 0) === 0 && (initialState?.answerTurns ?? 0) === 0) {
+        const historyDeadline = Date.now() + 3000;
+        let previous = initialState;
+        while (Date.now() < historyDeadline) {
+          await sleepFn(400);
+          const probe = await driver.readTurnState(cdp, sessionId, adapter);
+          const probeTurns = (probe?.userTurns ?? 0) + (probe?.answerTurns ?? 0);
+          const prevTurns = (previous?.userTurns ?? 0) + (previous?.answerTurns ?? 0);
+          if (probeTurns > 0 && probeTurns === prevTurns) {
+            initialState = probe;
+            break;
+          }
+          previous = probe;
+        }
+      }
       if (isConversationInvalidated(
         classifyError,
         initialState?.pageError?.reason,
@@ -476,6 +494,35 @@ export async function runCdpTurn({
 
       const baselineUserTurns = initialState?.userTurns ?? 0;
       const baselineAnswerTurns = initialState?.answerTurns ?? 0;
+      const baselineAnswerText = initialState?.answerText || "";
+
+      // 批次 D：在 typePrompt 之前附加文件；失败即终止，绝不带着未上传的附件发 prompt。
+      if (Array.isArray(files) && files.length > 0) {
+        const attachFn = driver.attachFiles || defaultDriver.attachFiles;
+        try {
+          await attachFn(cdp, sessionId, adapter, files, { signal, sleep: sleepFn });
+        } catch (attachErr) {
+          if (signal?.aborted || attachErr?.code === "CANCELLED") {
+            const err = new Error("Operation cancelled");
+            err.code = "CANCELLED";
+            throw err;
+          }
+          return withTerminalStatus({
+            status: "failed",
+            text: "",
+            reason: "ATTACH_UPLOAD_FAILED",
+            evidence: { message: attachErr?.message || String(attachErr) },
+            conversationUrl,
+            browser: {
+              pid: recovery.chrome?.pid ?? null,
+              port: recovery.chrome?.port ?? null,
+              mode,
+              reused: recovery.action === "ADOPT",
+            },
+            elapsedMs: Date.now() - startTime,
+          });
+        }
+      }
 
       if (typeof deps.onSendIntent === "function") {
         const intentTime = Date.now();
@@ -531,6 +578,7 @@ export async function runCdpTurn({
       const completion = await driver.waitForCompletion(cdp, sessionId, adapter, {
         baselineUserTurns,
         baselineAnswerTurns,
+        baselineAnswerText,
         settleMs,
         stallTimeoutMs,
         hardTimeoutMs,

@@ -1793,3 +1793,115 @@ test("Gemini readState rebuilds code fences from pre blocks (staging prerequisit
   const state = JSON.parse(fn(doc, {}));
   assert.ok(state.answerText.includes("```\n" + code + "\n```"), state.answerText);
 });
+
+
+// === 续聊读旧答案 bug 回归（三方裁决 2026-11-24，见 wfa-resume-bug-verdict.md）===
+function staleState({ userTurns = 2, answerTurns = 1, answerText = "OLD-ANSWER", stopVisible = false } = {}) {
+  return JSON.stringify({
+    userTurns,
+    answerTurns,
+    answerText,
+    stopVisible,
+    editorEmpty: true,
+    answerActionsVisible: true,
+  });
+}
+
+test("resume bug: answerTurns unchanged + same baseline text never completes with stale answer", async () => {
+  let virtualTime = 0;
+  const mockCdp = { send: async () => ({ result: { value: staleState() } }) };
+  const res = await waitForCompletion(mockCdp, "s", chatgptAdapter, {
+    baselineUserTurns: 1,
+    baselineAnswerTurns: 1,
+    baselineAnswerText: "OLD-ANSWER",
+    settleMs: 200,
+    stallTimeoutMs: 1000,
+    hardTimeoutMs: 3000,
+    pollIntervalMs: 50,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+  assert.notEqual(res.status, "completed");
+  assert.equal(res.text, "", "stale answer must never be returned");
+});
+
+test("resume bug: hard_timeout also clears stale answer text", async () => {
+  let virtualTime = 0;
+  const mockCdp = { send: async () => ({ result: { value: staleState() } }) };
+  const res = await waitForCompletion(mockCdp, "s", chatgptAdapter, {
+    baselineUserTurns: 1,
+    baselineAnswerTurns: 1,
+    baselineAnswerText: "OLD-ANSWER",
+    settleMs: 200,
+    stallTimeoutMs: 5000,
+    hardTimeoutMs: 600,
+    pollIntervalMs: 50,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+  assert.equal(res.reason, "hard_timeout");
+  assert.equal(res.text, "");
+});
+
+test("resume bug: new answer completes normally", async () => {
+  let virtualTime = 0;
+  let n = 0;
+  const mockCdp = { send: async () => ({ result: { value: staleState({
+    answerTurns: n++ === 0 ? 1 : 2,
+    answerText: n <= 1 ? "OLD-ANSWER" : "NEW-ANSWER",
+  }) } }) };
+  const res = await waitForCompletion(mockCdp, "s", chatgptAdapter, {
+    baselineUserTurns: 1,
+    baselineAnswerTurns: 1,
+    baselineAnswerText: "OLD-ANSWER",
+    settleMs: 200,
+    stallTimeoutMs: 5000,
+    hardTimeoutMs: 5000,
+    pollIntervalMs: 50,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+  assert.equal(res.status, "completed");
+  assert.equal(res.text, "NEW-ANSWER");
+});
+
+test("resume bug: in-place rewrite (answerTurns unchanged, text changes) still completes", async () => {
+  let virtualTime = 0;
+  let n = 0;
+  const mockCdp = { send: async () => ({ result: { value: staleState({
+    answerTurns: 1,
+    answerText: n++ === 0 ? "OLD-ANSWER" : "REWRITTEN-ANSWER",
+  }) } }) };
+  const res = await waitForCompletion(mockCdp, "s", chatgptAdapter, {
+    baselineUserTurns: 1,
+    baselineAnswerTurns: 1,
+    baselineAnswerText: "OLD-ANSWER",
+    settleMs: 200,
+    stallTimeoutMs: 5000,
+    hardTimeoutMs: 5000,
+    pollIntervalMs: 50,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+  assert.equal(res.status, "completed");
+  assert.equal(res.text, "REWRITTEN-ANSWER");
+});
+
+test("resume bug: no auto resend - completion helpers never call submit", async () => {
+  let virtualTime = 0;
+  let submitCount = 0;
+  const mockCdp = { send: async () => ({ result: { value: staleState() } }) };
+  await waitForCompletion(mockCdp, "s", chatgptAdapter, {
+    baselineUserTurns: 1,
+    baselineAnswerTurns: 1,
+    baselineAnswerText: "OLD-ANSWER",
+    settleMs: 100,
+    stallTimeoutMs: 400,
+    hardTimeoutMs: 800,
+    pollIntervalMs: 50,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+    onSubmitIntent: async () => { submitCount += 1; },
+  });
+  assert.equal(submitCount, 0, "waitForCompletion must never resend");
+});

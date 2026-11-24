@@ -13,6 +13,7 @@ import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
 import { ensureBroker, createTurn, waitForTurn } from "../broker/client.js";
 import { spawnDetachedBroker } from "../broker/cli.js";
 import { stageCdpResponse as defaultStageCdpResponse } from "./cdp-stage.js";
+import { expandAttachmentInputs } from "../attachments.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -31,6 +32,7 @@ const VALUE_FLAGS = new Set([
   "conversation-id",
   "request-id",
   "workspace",
+  "file",
 ]);
 
 function parseArgs(argv) {
@@ -56,7 +58,14 @@ function parseArgs(argv) {
     } else {
       value = true;
     }
-    options[name] = value;
+    // --file 可重复：累积为数组，不覆盖
+    if (name === "file") {
+      if (!options.file) options.file = [value];
+      else if (Array.isArray(options.file)) options.file.push(value);
+      else options.file = [options.file, value];
+    } else {
+      options[name] = value;
+    }
   }
   return { positional, options };
 }
@@ -87,7 +96,7 @@ Commands:
   wfa cdp ask    --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
                  [--mode background|visible|headless] [--conversation-id <id>] [--request-id <id>] [--json]
                  [--timeout <s>] [--settle <ms>] [--min-interval <ms>]
-                 [--no-stage] [--workspace <dir>]
+                 [--file <path|glob|dir>] [--no-stage] [--workspace <dir>]
   wfa cdp status [--json]
   wfa cdp login  [--provider <chatgpt|gemini>] [--mode visible|background]
                  [--timeout <seconds>] [--json]
@@ -96,6 +105,7 @@ Options:
   --provider <name>          chatgpt or gemini
   --prompt <text>            Prompt string
   --prompt-file <path>       Path to prompt file
+  --file <path|glob|dir>     Repeatable attachment; native CDP uploads via DOM.setFileInputFiles
   --mode <mode>              background (default for ask, visible for login), visible, or headless
   --conversation-id <id>     Optional conversation ID to serialize same-session turns
   --request-id <id>          Optional idempotency key (auto-generated UUID if omitted)
@@ -444,6 +454,13 @@ async function handleAsk(argv, deps) {
     throw new WfaError("EMPTY_PROMPT", "Provide --prompt, --prompt-file, or pipe prompt text through stdin.");
   }
 
+  let attachedFiles = [];
+  if (options.file) {
+    const rawFiles = Array.isArray(options.file) ? options.file : [options.file];
+    const expanded = await expandAttachmentInputs({ files: rawFiles, cwd: process.cwd() });
+    attachedFiles = expanded.files || [];
+  }
+
   let mode = "background";
   if (options.mode) {
     mode = String(options.mode).toLowerCase();
@@ -516,6 +533,7 @@ async function handleAsk(argv, deps) {
     stallTimeoutMs,
     hardTimeoutMs,
     ...(conversationId !== null ? { conversationId } : {}),
+    ...(attachedFiles.length > 0 ? { files: attachedFiles } : {}),
     ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
     ...(options["chrome-path"] ? { chromePath: options["chrome-path"] } : {}),
   });

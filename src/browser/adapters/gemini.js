@@ -20,6 +20,60 @@ export const sendSelector = 'button[aria-label="Send message"], button[aria-labe
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证|sign in|log in|登录/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
+// 批次 D 附件上传契约：Gemini 需点击 trigger 展开菜单，并点击 menuitem 后由 DOM 插入 input
+export const uploadTriggerSelector = 'button[aria-label="Upload & tools"]';
+export const uploadMenuItemSelector = '[role="menuitem"][aria-label^="Upload files"]';
+export const fileInputSelector = 'input[type="file"].hidden-file-input[accept^=".txt"]';
+
+export function buildUploadJs() {
+  return `(async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const waitFor = async (fn, timeoutMs = 8000, intervalMs = 150) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try { const v = fn(); if (v) return v; } catch (e) {}
+      await sleep(intervalMs);
+    }
+    return null;
+  };
+
+  const trigger = await waitFor(() => {
+    const el = document.querySelector(${JSON.stringify(uploadTriggerSelector)});
+    return isVisible(el) ? el : null;
+  }, 8000);
+  if (!trigger) {
+    return { success: false, reason: "upload_trigger_not_found" };
+  }
+  trigger.click();
+
+  const menuItem = await waitFor(() => {
+    const item = document.querySelector(${JSON.stringify(uploadMenuItemSelector)});
+    return isVisible(item) ? item : null;
+  }, 6000);
+  if (!menuItem) {
+    return { success: false, reason: "upload_menu_item_not_found" };
+  }
+  menuItem.click();
+
+  const inputReady = await waitFor(() => {
+    const input = document.querySelector(${JSON.stringify(fileInputSelector)});
+    return Boolean(input);
+  }, 6000);
+  if (!inputReady) {
+    return { success: false, reason: "file_input_not_found" };
+  }
+
+  return { success: true };
+})()`;
+}
+
 export function buildLoginProbeJs() {
   return `(() => {
   const host = location.hostname;
