@@ -1,6 +1,6 @@
 {
   "name": "web-first-ask",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A Codex-first CLI for context-aware web AI delegation, safe task recovery and staged code application through ask-bridge.",
   "type": "module",
   "private": false,

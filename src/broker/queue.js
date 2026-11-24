@@ -4,7 +4,9 @@ function invalid(message) {
   return error;
 }
 
-export function createScheduler({ maxPerProvider = 4, maxTotal = 8, now = () => Date.now() } = {}) {
+// 三方裁决 2026-11-24：native CDP 只有一个共享 Chrome profile / 登录态，
+// 并发 turn 会互相导航并污染页面（真机复现）。默认全局串行；显式传参可放宽。
+export function createScheduler({ maxPerProvider = 1, maxTotal = 1, now = () => Date.now() } = {}) {
   if (!Number.isInteger(maxPerProvider) || maxPerProvider < 1 ||
       !Number.isInteger(maxTotal) || maxTotal < 1 || typeof now !== "function") {
     throw invalid("Invalid scheduler limits");

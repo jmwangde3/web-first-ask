@@ -138,8 +138,14 @@ test("scheduler enforces conversation and global limits while allowing same-prov
   release(scheduler, y);
 });
 
-test("scheduler defaults to 4 per provider and 8 total, and scopes conversation lease by provider", () => {
-  const scheduler = createScheduler();
+test("scheduler defaults to serial (1 per provider / 1 total), and scopes conversation lease by provider", () => {
+  // 三方裁决 2026-11-24：native CDP 共享单 profile，默认全局串行；
+  // 原有 4/8 并发调度逻辑用显式参数保留验证。
+  const defaults = createScheduler();
+  assert.equal(defaults.maxPerProvider, 1);
+  assert.equal(defaults.maxTotal, 1);
+
+  const scheduler = createScheduler({ maxPerProvider: 4, maxTotal: 8 });
   assert.equal(scheduler.maxPerProvider, 4);
   assert.equal(scheduler.maxTotal, 8);
   const turn = (provider, conversationId) => createTurn({ provider, prompt: "hi", conversationId });

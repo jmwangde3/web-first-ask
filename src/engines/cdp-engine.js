@@ -9,6 +9,8 @@ import { WfaError } from "../errors.js";
 import { sleep as defaultSleep } from "../util.js";
 import * as defaultConversationStore from "../browser/conversation-store.js";
 import { DEFAULT_MIN_INTERVAL_MS, enforceCooldown, recordLastTurn } from "../browser/cooldown.js";
+import { acquireTurnLock } from "../broker/turn-lock.js";
+import { pace as defaultPace } from "../browser/pacer.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -263,6 +265,7 @@ export async function runCdpTurn({
   let submitted = false;
   let submittedAt = null;
   let typeRes = null;
+  let turnLock = null;
 
   const withTerminalStatus = (result) => {
     if (result && typeof result.status === "string") {
@@ -272,6 +275,17 @@ export async function runCdpTurn({
   };
 
   try {
+    // 三方裁决 2026-11-24：turn 级互斥，防止多进程共用同一 Chrome profile 时互相导航。
+    // 冲突时排队，超时抛 CONCURRENT_TURN_BUSY（绝不静默抢占/重发）。
+    if (!deps.skipTurnLock) {
+      const acquireFn = deps.acquireTurnLock || acquireTurnLock;
+      turnLock = await acquireFn(effectiveHome, normalizedProvider, {
+        turnId: conversationId || null,
+        sleep: sleepFn,
+        signal,
+      });
+    }
+
     const recovery = await recover({
       home: effectiveHome,
       mode: recoveryMode,
@@ -501,6 +515,8 @@ export async function runCdpTurn({
         const attachFn = driver.attachFiles || defaultDriver.attachFiles;
         try {
           await attachFn(cdp, sessionId, adapter, files, { signal, sleep: sleepFn });
+          // 多附件批量操作后注入 4-6s 批量节奏（三方裁决 2026-11-24），再进入输入。
+          await (deps.pace || defaultPace)("batch", { sleep: sleepFn, signal });
         } catch (attachErr) {
           if (signal?.aborted || attachErr?.code === "CANCELLED") {
             const err = new Error("Operation cancelled");
@@ -547,12 +563,19 @@ export async function runCdpTurn({
         }
       }
 
+      // 三方裁决 2026-11-24：人类操作节奏（日常 1-2s），经 deps 注入便于测试旁路。
+      const paceFn = deps.pace || defaultPace;
+      await paceFn("casual", { sleep: sleepFn, signal });
+
       typeRes = await driver.typePrompt(cdp, sessionId, adapter, prompt);
       if (signal?.aborted) {
         const err = new Error("Operation cancelled");
         err.code = "CANCELLED";
         throw err;
       }
+
+      // 输入完成到提交之间再注入一次日常节奏，杜绝 0 间隔击发。
+      await paceFn("casual", { sleep: sleepFn, signal });
 
       if (!submittedAt) {
         submittedAt = Date.now();
@@ -821,6 +844,11 @@ export async function runCdpTurn({
       }
     }
   } finally {
+    if (turnLock) {
+      try {
+        await turnLock.release();
+      } catch {}
+    }
     try {
       const recorder = deps.recordLastTurn || recordLastTurn;
       await recorder(effectiveHome, normalizedProvider, {

@@ -81,6 +81,9 @@ function createEngineDeps({
     ...(adapters ? { adapters } : {}),
     enforceCooldown: async () => {},
     recordLastTurn: async () => {},
+    // 并发锁与人类节奏在单测中旁路（三方裁决：测试默认关闭，保持毫秒级）
+    skipTurnLock: true,
+    pace: async () => 0,
     recoverBrowser: async () => ({
       action: "ADOPT",
       chrome: { pid: 1234, port: 9222 },
