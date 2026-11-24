@@ -3,7 +3,7 @@ name: web-first
 description: Default web-first reasoning and complete-code delegation workflow for local coding agents. Every nontrivial request — requirements, root cause, architecture, debugging, code design or implementation — goes through the local wfa CLI to web providers. Providers return complete file contents or exact replacement blocks, not a plan or a diff; local agent integrates, verifies, and tests.
 ---
 
-Version: 1.1.0
+Version: 1.2.0
 
 # Web-First Delegation & Native CDP Workflow
 
@@ -33,6 +33,8 @@ Version: 1.1.0
   Provider 输出绝不直接写入目标仓库。native CDP 自动暂存（stage）无破坏性；只有上层显式确认后才可将暂存完整文件落盘到工作区，之后必须检查 `git diff` 并运行本地测试。
 - **严禁短时间大量操作（防风控）**：
   不得在短时间内反复启动浏览器实例、反复发起 `cdp ask`、反复执行 `cdp login` 或反复开关窗口。登录一次开好、探测合并成单一任务书，操作之间保留人类节奏间隔（日常 1-2 秒、批量 4-6 秒随机，禁止 0 间隔，由 pacer 强制执行）。一旦出现"开窗口被关 → 再开 → 又被关"的循环必须立即停止并交由用户手动处理，不得持续重试——短时间大量窗口或请求会触发 Gemini 与 ChatGPT 风控，导致两家同时不可用。
+- **严禁多轮真机 8 并发验收（防风控，硬红线）**：
+  绝不在真机上做"多轮 4+4（8 并发）连续压测/验收"——短时间内 8 个并发请求 × 多轮必然触发两家风控。并发能力的验收采用简单方案（本地 mock CDP 时序测试 + 单次小规模真机抽检），或交给用户手动执行/决策。任何"跑 5 轮 8 并发"的计划都禁止执行。此规则优先于任何裁决文档里写过的"多轮真机验收"条款。
 
 ## 3. 命令速查 (Command Quick Reference)
 

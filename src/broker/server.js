@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import http from "node:http";
 import { acquireInstanceLock, clearBrokerRecord, writeBrokerRecord } from "./lifecycle.js";
-import { createScheduler, release, schedule, snapshot } from "./queue.js";
+import { createScheduler, DEFAULT_MAX_PER_PROVIDER, DEFAULT_MAX_TOTAL, release, schedule, snapshot } from "./queue.js";
 import { createTurn, publicView, TERMINAL_STATES, transition, TURN_STATES } from "./turns.js";
 import * as defaultJournal from "./journal.js";
 import * as defaultResultStore from "./result-store.js";
@@ -79,6 +79,7 @@ async function parseBody(req) {
 }
 
 export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 60000,
+  maxPerProvider = DEFAULT_MAX_PER_PROVIDER, maxTotal = DEFAULT_MAX_TOTAL,
   onIdle = async () => {}, log = () => {}, deps = {} } = {}) {
   if (!["off", "tray"].includes(mode) || !runner || typeof runner.run !== "function" ||
       !Number.isFinite(idleTimeoutMs) || idleTimeoutMs < 1 ||
@@ -94,7 +95,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   const instanceId = lock.instanceId;
   const token = randomUUID();
   const startedAt = new Date().toISOString();
-  const scheduler = createScheduler({ maxPerProvider: 4, maxTotal: 8 });
+  const scheduler = createScheduler({ maxPerProvider, maxTotal, now: deps?.now || Date.now });
   const turns = new Map();
   const requests = new Map();
   const controllers = new Map();

@@ -55,17 +55,17 @@ test("pacer: isPacingEnabled honors explicit option over env", () => {
   assert.equal(isPacingEnabled({ enabled: true }), true);
 });
 
-test("turn-lock: concurrent acquire throws CONCURRENT_TURN_BUSY", async () => {
+test("turn-lock: concurrent acquire on same conversation throws CONCURRENT_TURN_BUSY", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-turnlock-"));
   try {
-    const first = await acquireTurnLock(home, "chatgpt", { timeoutMs: 1000 });
+    const first = await acquireTurnLock(home, "chatgpt", { conversationId: "conv-locked", timeoutMs: 1000 });
     await assert.rejects(
-      () => acquireTurnLock(home, "chatgpt", { timeoutMs: 300, pollIntervalMs: 50 }),
+      () => acquireTurnLock(home, "chatgpt", { conversationId: "conv-locked", timeoutMs: 300, pollIntervalMs: 50 }),
       (err) => err?.code === "CONCURRENT_TURN_BUSY"
     );
     await first.release();
     // 释放后可重新获取
-    const second = await acquireTurnLock(home, "chatgpt", { timeoutMs: 1000 });
+    const second = await acquireTurnLock(home, "chatgpt", { conversationId: "conv-locked", timeoutMs: 1000 });
     await second.release();
   } finally {
     await rm(home, { recursive: true, force: true });
@@ -75,11 +75,13 @@ test("turn-lock: concurrent acquire throws CONCURRENT_TURN_BUSY", async () => {
 test("turn-lock: stale lock (dead pid) is reclaimed", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-turnlock-stale-"));
   try {
-    const dir = path.join(home);
-    const lockPath = path.join(dir, "cdp-turn-chatgpt.lock");
+    // 先正常获取一次以拿到会话级锁文件路径
+    const probe = await acquireTurnLock(home, "chatgpt", { conversationId: "conv-stale", timeoutMs: 1000 });
+    const lockPath = probe.lockPath;
+    await probe.release();
     // 写入一个 pid=999999（必然不存在）的陈旧锁
-    await writeFile(lockPath, JSON.stringify({ pid: 999999, lockId: "stale", provider: "chatgpt", acquiredAt: Date.now() }) + "\n", "utf8");
-    const lock = await acquireTurnLock(home, "chatgpt", { timeoutMs: 1000, pollIntervalMs: 50 });
+    await writeFile(lockPath, JSON.stringify({ pid: 999999, lockId: "stale", provider: "chatgpt", conversationId: "conv-stale", acquiredAt: Date.now() }) + "\n", "utf8");
+    const lock = await acquireTurnLock(home, "chatgpt", { conversationId: "conv-stale", timeoutMs: 1000, pollIntervalMs: 50 });
     const raw = JSON.parse(await readFile(lockPath, "utf8"));
     assert.equal(raw.lockId, lock.lockId, "stale lock must be replaced");
     await lock.release();
@@ -91,9 +93,9 @@ test("turn-lock: stale lock (dead pid) is reclaimed", async () => {
 test("turn-lock: release only removes own lock", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-turnlock-own-"));
   try {
-    const lockPath = path.join(home, "cdp-turn-gemini.lock");
-    const lock = await acquireTurnLock(home, "gemini", { timeoutMs: 1000 });
-    await writeFile(lockPath, JSON.stringify({ pid: process.pid, lockId: "other", provider: "gemini", acquiredAt: Date.now() }) + "\n", "utf8");
+    const lock = await acquireTurnLock(home, "gemini", { conversationId: "conv-own", timeoutMs: 1000 });
+    const lockPath = lock.lockPath;
+    await writeFile(lockPath, JSON.stringify({ pid: process.pid, lockId: "other", provider: "gemini", conversationId: "conv-own", acquiredAt: Date.now() }) + "\n", "utf8");
     await lock.release();
     const raw = JSON.parse(await readFile(lockPath, "utf8"));
     assert.equal(raw.lockId, "other", "release must not delete someone else's lock");

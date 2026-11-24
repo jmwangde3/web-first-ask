@@ -1,7 +1,9 @@
-// Turn 级文件锁（三方裁决 2026-11-24）：防止多个独立 wfa cdp ask 进程
-// 共用同一 native Chrome profile / 登录态时互相导航、污染页面。
-// wx 排他创建 + pid 存活探测 + stale TTL 自愈；冲突排队，超时明确报错，绝不静默抢占。
-import { randomUUID } from "node:crypto";
+// src/broker/turn-lock.js
+// 会话级文件锁（需求6定稿）：
+// 锁粒度：按 (provider, conversationId) 会话级互斥。
+// 同一会话严格串行、不同会话完全并行、跨 provider 互不干扰；无会话 ID 则独立键互不阻塞。
+// wx 排他创建 + pid 存活探测 + stale TTL 自愈；冲突排队，超时明确抛出 CONCURRENT_TURN_BUSY。
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { getBrokerPaths } from "./lifecycle.js";
@@ -16,27 +18,56 @@ function pidAlive(pid) {
   }
 }
 
+function sanitizeKey(str) {
+  return String(str || "").replace(/[^a-z0-9_-]/gi, "_");
+}
+
+function computeLockFileName(provider, conversationId) {
+  const safeProvider = sanitizeKey(provider || "default");
+  if (!conversationId) {
+    // 无 conversationId 的新请求互不阻塞，使用独立 UUID
+    return `cdp-turn-${safeProvider}-new-${randomUUID()}.lock`;
+  }
+  // 存在 conversationId 则按 hash 规整，确保跨平台文件名安全与严格互斥
+  const hash = createHash("sha256").update(String(conversationId)).digest("hex").slice(0, 16);
+  return `cdp-turn-${safeProvider}-${hash}.lock`;
+}
+
 export async function acquireTurnLock(home, provider = "default", {
-  timeoutMs = 120000,
+  timeoutMs = 900000, // 对齐 hardTimeoutMs (900s)
   pollIntervalMs = 200,
   staleTimeoutMs = 15 * 60 * 1000,
   turnId = null,
+  conversationId = null,
+  signal,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  now = Date.now,
 } = {}) {
   const dir = getBrokerPaths(home).home;
-  const lockPath = path.join(dir, `cdp-turn-${String(provider).replace(/[^a-z0-9_-]/gi, "_")}.lock`);
+  // 兼容老调用：若未显式传 conversationId，尝试从 turnId 兜底
+  const convId = conversationId ?? turnId ?? null;
+  const lockFileName = computeLockFileName(provider, convId);
+  const lockPath = path.join(dir, lockFileName);
   await fs.mkdir(dir, { recursive: true });
 
   const lockId = randomUUID();
-  const deadline = Date.now() + timeoutMs;
+  const startTime = now();
+  const deadline = startTime + timeoutMs;
 
-  while (Date.now() < deadline) {
+  while (now() < deadline) {
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled while acquiring turn lock");
+      err.code = "CANCELLED";
+      throw err;
+    }
+
     const payload = JSON.stringify({
       pid: process.pid,
       lockId,
       turnId,
+      conversationId: convId,
       provider,
-      acquiredAt: Date.now(),
+      acquiredAt: now(),
     }) + "\n";
 
     try {
@@ -74,22 +105,22 @@ export async function acquireTurnLock(home, provider = "default", {
         const raw = await fs.readFile(lockPath, "utf8");
         const current = JSON.parse(raw);
         const dead = !pidAlive(current.pid);
-        const expired = Date.now() - (current.acquiredAt || 0) > staleTimeoutMs;
+        const expired = now() - (current.acquiredAt || 0) > staleTimeoutMs;
         if (dead || expired) {
           await fs.rm(lockPath, { force: true });
           continue;
         }
       } catch (readErr) {
         if (readErr?.code === "ENOENT") continue;
-        // 锁文件损坏，清理后重试
         await fs.rm(lockPath, { force: true }).catch(() => {});
         continue;
       }
+
       await sleep(pollIntervalMs);
     }
   }
 
-  const err = new Error(`Provider ${provider} is busy executing another turn`);
+  const err = new Error(`Conversation ${convId || "new"} on provider ${provider} is busy executing another turn`);
   err.code = "CONCURRENT_TURN_BUSY";
   throw err;
 }

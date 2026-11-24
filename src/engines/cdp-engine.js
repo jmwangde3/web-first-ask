@@ -11,6 +11,7 @@ import * as defaultConversationStore from "../browser/conversation-store.js";
 import { DEFAULT_MIN_INTERVAL_MS, enforceCooldown, recordLastTurn } from "../browser/cooldown.js";
 import { acquireTurnLock } from "../broker/turn-lock.js";
 import { pace as defaultPace } from "../browser/pacer.js";
+import { waitForSendSlot as defaultWaitForSendSlot } from "../browser/stagger.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -228,6 +229,7 @@ export async function runCdpTurn({
   };
   const sleepFn = deps.sleep || defaultSleep;
   const enforce = deps.enforceCooldown || enforceCooldown;
+  const waitForSendSlot = deps.waitForSendSlot || defaultWaitForSendSlot;
   await enforce(effectiveHome, normalizedProvider, {
     minIntervalMs,
     now: deps.now || Date.now,
@@ -281,8 +283,10 @@ export async function runCdpTurn({
       const acquireFn = deps.acquireTurnLock || acquireTurnLock;
       turnLock = await acquireFn(effectiveHome, normalizedProvider, {
         turnId: conversationId || null,
+        conversationId: conversationId || null,
         sleep: sleepFn,
         signal,
+        now: deps.now || Date.now,
       });
     }
 
@@ -576,6 +580,16 @@ export async function runCdpTurn({
 
       // 输入完成到提交之间再注入一次日常节奏，杜绝 0 间隔击发。
       await paceFn("casual", { sleep: sleepFn, signal });
+
+      // 三方裁决 2026-11-24：同 provider 发送错峰硬限制（仅新会话），在实际 submit 之前排队 3-5s。
+      // 放在发送时刻而非入口，避免页面加载/输入耗时差异导致"预约错开但实际发送仍重叠"。
+      await waitForSendSlot(normalizedProvider, {
+        isNewConversation: !conversationId,
+        sleep: sleepFn,
+        signal,
+        now: deps.now || Date.now,
+        random: deps.random || Math.random,
+      });
 
       if (!submittedAt) {
         submittedAt = Date.now();

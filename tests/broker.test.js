@@ -138,12 +138,12 @@ test("scheduler enforces conversation and global limits while allowing same-prov
   release(scheduler, y);
 });
 
-test("scheduler defaults to serial (1 per provider / 1 total), and scopes conversation lease by provider", () => {
-  // 三方裁决 2026-11-24：native CDP 共享单 profile，默认全局串行；
-  // 原有 4/8 并发调度逻辑用显式参数保留验证。
+test("scheduler defaults to 4 per provider / 8 total (需求6), and scopes conversation lease by provider", () => {
+  // 需求6裁决：会话级互斥锁保证同会话串行、不同会话并行，默认并发 4/8；
+  // 与 server.js 统一，消除旧版 1/1 vs 4/8 的分裂。
   const defaults = createScheduler();
-  assert.equal(defaults.maxPerProvider, 1);
-  assert.equal(defaults.maxTotal, 1);
+  assert.equal(defaults.maxPerProvider, 4);
+  assert.equal(defaults.maxTotal, 8);
 
   const scheduler = createScheduler({ maxPerProvider: 4, maxTotal: 8 });
   assert.equal(scheduler.maxPerProvider, 4);

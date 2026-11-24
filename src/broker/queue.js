@@ -4,9 +4,12 @@ function invalid(message) {
   return error;
 }
 
-// 三方裁决 2026-11-24：native CDP 只有一个共享 Chrome profile / 登录态，
-// 并发 turn 会互相导航并污染页面（真机复现）。默认全局串行；显式传参可放宽。
-export function createScheduler({ maxPerProvider = 1, maxTotal = 1, now = () => Date.now() } = {}) {
+// 需求6裁决：CDP session 层每 turn 独立（target/session/WebSocket），配合会话级互斥锁，
+// 默认允许每 provider 4 路、全局 8 路并发；与 server.js 显式配置统一，消除 1/1 vs 4/8 分裂。
+export const DEFAULT_MAX_PER_PROVIDER = 4;
+export const DEFAULT_MAX_TOTAL = 8;
+
+export function createScheduler({ maxPerProvider = DEFAULT_MAX_PER_PROVIDER, maxTotal = DEFAULT_MAX_TOTAL, now = () => Date.now() } = {}) {
   if (!Number.isInteger(maxPerProvider) || maxPerProvider < 1 ||
       !Number.isInteger(maxTotal) || maxTotal < 1 || typeof now !== "function") {
     throw invalid("Invalid scheduler limits");
