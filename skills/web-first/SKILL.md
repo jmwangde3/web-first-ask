@@ -31,6 +31,8 @@ Version: 1.1.0
   代码交付必须包含 `FILE: relative/path` 且后随**完整文件内容**（或带精确上下文锚点的 `ANCHOR`/`REPLACE` 块）。严禁 diff-only、省略号、“其余不变”或占位符代码。应用前必须核对行数，若文件未被要求精简却异常缩减，判定为摘要并拒绝接收。
 - **staging 需显式 apply**：
   Provider 输出绝不直接写入目标仓库。native CDP 自动暂存（stage）无破坏性；只有上层显式确认后才可将暂存完整文件落盘到工作区，之后必须检查 `git diff` 并运行本地测试。
+- **严禁短时间大量操作（防风控）**：
+  不得在短时间内反复启动浏览器实例、反复发起 `cdp ask`、反复执行 `cdp login` 或反复开关窗口。登录一次开好、探测合并成单一任务书，操作之间保留人类节奏间隔（日常 1-2 秒、批量 4-6 秒随机，禁止 0 间隔，由 pacer 强制执行）。一旦出现"开窗口被关 → 再开 → 又被关"的循环必须立即停止并交由用户手动处理，不得持续重试——短时间大量窗口或请求会触发 Gemini 与 ChatGPT 风控，导致两家同时不可用。
 
 ## 3. 命令速查 (Command Quick Reference)
 
@@ -64,7 +66,9 @@ wfa cdp status
 - **Markdown 与代码转义污染**：
   部分环境可能将代码块破坏或二次转义（如 LaTeX 格式转义），交付时必须核验语法与字符完整性。
 - **多会话与并发限制**：
-  同一 Chrome Profile 避免并发标签页冲突；Cloudflare 人机校验与 Profile 绑定，须在可见窗口人工完成。
+  同一 Chrome Profile 避免并发标签页冲突；Cloudflare 人机校验与 Profile 绑定，须在可见窗口人工完成。全局串行（maxPerProvider=1/maxTotal=1）+ turn 锁 + pacer 防串扰。
+- **操作频率硬约束（防风控）**：
+  严禁短时间大量启动浏览器 / 密集 ask / 连续 login / 反复开关窗口；两家 provider 与登录态均对高频操作敏感，触发风控后需等待人工解除，期间不得重试。详见第 2 节安全红线。
 - **完整缺陷台账与实验数据**：
   全部已知上游缺陷、详细测例、复现步骤及规避措施，详见 [docs/known-issues.md](../../docs/known-issues.md)（含 U1-U19 深度复现与实测数据）及安全规范 [SECURITY.md](../../SECURITY.md)。
 
