@@ -175,84 +175,29 @@ function printTask(task, json = false, replayed = false) {
 }
 
 function help() {
-  process.stdout.write(`web-first-ask (wfa) — Codex-first web AI delegation
+  process.stdout.write(`web-first-ask (wfa) — native CDP web AI delegation
 
 Commands:
-  wfa ask       Ask the default providers (chatgpt+gemini, serial) in separate batches
-  wfa compare   Ask multiple providers; sequential by default
-  wfa code      Ask for complete replacement code; repository reference by default
-  wfa status    Inspect a task by ID
-  wfa list      List recent tasks, refreshing detached/running states (--no-refresh skips that)
-  wfa wait      Wait for a task; adopt verified results and optionally stage completed code
-  wfa attach    Reattach read-only to saved task status; never resubmit
-  wfa collect   Return a verified saved result; manual get requires --confirm-complete
-  wfa result    Read a saved provider result
-  wfa stage     Stage full-file or exact ANCHOR/REPLACE code for review
-  wfa apply     Apply staged code only after explicit confirmation
-  wfa resolve   Abandon an unresolved provider task after confirming it is no longer running
-  wfa login     Log in to a provider through ask-bridge
-  wfa browser-mode [headless|headful]  Show or save browser mode and Chrome repair status
-  wfa gemini-mode [chat|task]          Show or save default Gemini landing mode (chat or task)
-  wfa doctor    Check Node.js, ask-bridge integration and Chrome startup repair
-  wfa unlock    Clear a task-store lock whose owner is gone (rename first, then unlink)
-  wfa cdp       Native CDP engine (no ask-bridge): ask | login | status
-  wfa broker    Turn queue in front of the CDP engine: start | ask | status | turns | wait | stop
+  wfa cdp ask     Ask a provider via native CDP (--provider chatgpt|gemini)
+  wfa cdp login   Log in to a provider through native CDP
+  wfa cdp status  Show native CDP / browser status
+  wfa broker      Turn queue: start | stop | status | turns | wait
+  wfa doctor      Check Node.js and Chrome environment
   wfa install-skill [--target codex|workbuddy|path]  Install web-first Skill
-  wfa upstream update  Update ask-bridge using its official updater
+  wfa --version   Show version
 
-Common options:
-  --provider chatgpt|gemini|claude
-  --providers chatgpt,gemini[,claude]
-  --workspace <stable-project-key>
+Common options (cdp ask):
+  --provider chatgpt|gemini
   --prompt <text> | --prompt-file <path> | stdin
-  --repo-url <url>     Override the detected Git remote URL
-  --no-repo            Do not add a repository reference
-  --bundle-repo        Inline a directory tree and a bounded selection of tracked sources
-  --bundle-repo=zip    Attach the tracked sources as a zip instead of inlining (no prompt ceiling)
-  --file <path|glob|dir> Repeatable source/document attachment; directories recurse
-  --dir <path>         Alias for recursive directory attachment
-  --image <path|glob>  Repeatable image attachment (not supported by Gemini)
-  --exclude <glob>     Repeatable source or repository bundle exclusions
-  --timeout <seconds>  Default 1200; maximum 7200
-  --stall-timeout <s>  Default 900; 0 disables inactivity watchdog
-  --concurrency <N>    Jobs in flight (1..3); default 1, using separate batches
+  --conversation-id <id>   Resume the same provider conversation
+  --file <path|glob|dir>   Repeatable attachment (native CDP upload)
+  --workspace <dir>        Staging root for code replies
+  --no-stage               Keep full reply instead of slim receipt
+  --mode background|visible|headless
+  --json                   Machine-readable output
 
-  --model <name>       Single-provider request only; add --provider
-  --model-map chatgpt=<name>,gemini=<name>
-  --context <text>     Additional code-generation context
-  --download-images    Download generated images (off by default)
-  --continue-session  Reuse a workspace's previous conversation (opt-in)
-  --new-session        Explicitly request fresh conversation (default)
-  --fresh              Alias for --new-session
-  --followup <id>      Continue exact saved provider conversation
-  --mode full-file|spec Select complete-file delivery or compact implementation specification
-  --brief-file <path>  Explicit project handoff context
-  --no-brief           Disable automatic .wfa/active-brief.md injection
-  --bundle-lines       Bundle selected text files with path:line prefixes
-  --detach             Run background WFA serial worker or ask-bridge with task-specific logs
-  --stage              Stage completed full-file code without applying it
-  --poll-ms <ms>       Polling interval for wait/attach (250..60000; default 2000)
-  --dry-run            Preview repository reference, dirty/unpushed warnings and risks
-  --allow-oversize     Send an inline prompt over 40 KiB anyway (truncation risk; attachments are unaffected)
-  --allow-gemini-attachments  Force native Gemini upload instead of inlining text
-  --gemini-mode chat|task     Override the default Gemini landing mode for this request
-  --allow-sensitive    Explicitly allow sending text flagged by secret scanner
-  --no-bundle-lines     Disable selected-source bundle for wfa code
-  --request-id <id>    Reuse only to recover the exact same logical request
-  --json               Print machine-readable summary
-
-Code mode:
-  wfa code --workspace repo-name --requirement "Implement the new feature"
-  wfa code --requirement "..." --no-repo --file src/a.js
-  wfa code --followup <task-id> --provider chatgpt --bundle-repo --requirement "Complete original implementation"
-
-Safety:
-  Each new task requests a new conversation; ask-bridge may still reuse tabs.
-  Thread mismatches and REPO_UNREADABLE are surfaced, not accepted silently.
-  Dirty/unpushed local state is warned and never silently represented as remote code.
-  Stalled/uncertain tasks remain locked until collection or explicit resolve.
-  Stage/apply reject corrupted LaTeX output and require exact anchor matching.
-  wfa apply --confirm alone writes provider-generated code into the workspace.
+Legacy commands (ask/code/compare/collect/apply/resolve/result/list/wait/
+attach/stage/upstream) have been removed. Use wfa cdp ask + native staging.
 `);
 }
 
@@ -362,6 +307,19 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (Object.prototype.hasOwnProperty.call(options, "reasoning")
     || Object.prototype.hasOwnProperty.call(options, "reasoning-map")) {
     throw new WfaError("REASONING_DISABLED", "Reasoning-strength selection is temporarily disabled. Remove --reasoning/--reasoning-map; WFA now uses each provider's current web UI setting.");
+  }
+  // 三方裁决 2026-11-24：legacy（ask-bridge）路径已移除。
+  // 放在通用参数校验之后，确保 --reasoning 等校验仍生效；真正执行 legacy 命令时明确拦截。
+  const LEGACY_REMOVED = new Set([
+    "ask", "compare", "code", "collect", "apply", "resolve", "result",
+    "list", "wait", "attach", "stage", "upstream", "__batch-worker",
+    "browser-mode", "gemini-mode", "status", "unlock", "login",
+  ]);
+  if (LEGACY_REMOVED.has(command)) {
+    const hint = ["ask", "compare", "code"].includes(command)
+      ? ' Use "wfa cdp ask --provider <provider>" instead.'
+      : ' Native CDP responses are staged automatically; use "wfa cdp" / "wfa broker".';
+    throw new WfaError("LEGACY_COMMAND_REMOVED", `Legacy command "wfa ${command}" was removed.${hint}`);
   }
   const home = getHomeDir();
   const store = new Store(home);

@@ -79,26 +79,6 @@ test("detects repo metadata without source reads and inlines tracked files only 
   assert.doesNotMatch(bundled.content, /not tracked/);
 }));
 
-test("wfa code needs no --file when current repository has a remote", async () => fixture(async ({ root, home }) => {
-  const run = (...args) => spawnSync(process.execPath, [bin, "code", "--requirement", "Improve main.js", "--dry-run", ...args], {
-    cwd: root, env: { ...process.env, WFA_HOME: home }, encoding: "utf8",
-  });
-  const normal = run();
-  assert.equal(normal.status, 0, normal.stderr);
-  const preview = JSON.parse(normal.stdout);
-  assert.equal(preview.repository.available, true);
-  // Both providers by default; the order is asserted in defaults.test.js.
-  assert.deepEqual([...preview.providers].sort(), ["chatgpt", "gemini"]);
-  assert.equal(preview.sessionPolicy, "fresh");
-  assert.equal(preview.filesCount, 0);
-  assert.equal(preview.concurrency, 2);
-  const disabled = run("--no-repo");
-  assert.equal(disabled.status, 1);
-  const bundle = run("--bundle-repo");
-  assert.equal(bundle.status, 0, bundle.stderr);
-  assert.equal(JSON.parse(bundle.stdout).bundleRepo.files, 1);
-}));
-
 test("repo block reaches each provider in isolated single-job batches and fresh sessions", async () => fixture(async ({ root, home }) => {
   const store = new Store(home);
   await store.transaction(({ sessions }) => { sessions.workspaces.x = { chatgpt: "https://chatgpt.com/c/previous" }; });

@@ -68,23 +68,6 @@ test("writeJsonAtomic saves the previous JSON before an overwrite", async () => 
   });
 });
 
-test("CLI prints LEDGER_CORRUPT and backup hint for a corrupt tasks.json", async () => {
-  await withHome(async (home) => {
-    await writeFile(path.join(home, "tasks.json"), "{not-json", "utf8");
-    const bin = fileURLToPath(new URL("../bin/wfa.js", import.meta.url));
-    const result = spawnSync(process.execPath, [bin, "list", "--no-refresh"], {
-      env: { ...process.env, WFA_HOME: home },
-      encoding: "utf8",
-      timeout: 10000,
-    });
-
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /wfa: LEDGER_CORRUPT:/);
-    assert.match(result.stderr, /tasks\.json/);
-    assert.match(result.stderr, /hint:.*\.bak/);
-  });
-});
-
 test("WfaError retains the existing options signature", () => {
   const details = { path: "tasks.json" };
   const error = new WfaError("EXAMPLE", "example", { details });

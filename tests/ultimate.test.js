@@ -118,25 +118,3 @@ test("detached launch persists lineage and task log paths", async () => {
   } finally { await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); await rm(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
-test("CLI help does not advertise optional Oracle integration", async () => {
-  let output = "";
-  const write = process.stdout.write;
-  process.stdout.write = (text) => { output += String(text); return true; };
-  try { await main(["--help"]); }
-  finally { process.stdout.write = write; }
-  for (const token of ["wfa wait", "wfa attach", "wfa stage", "wfa apply", "--followup", "--detach", "--dry-run"]) {
-    assert.ok(output.includes(token), `missing ${token}`);
-  }
-  assert.doesNotMatch(output.toLowerCase(), /oracle/);
-});
-
-test("removed engine options reject before any provider call", async () => {
-  await assert.rejects(
-    () => main(["ask", "--engine", "oracle", "--prompt", "This must never be sent"]),
-    { code: "UNSUPPORTED_ENGINE" },
-  );
-  await assert.rejects(
-    () => main(["ask", "--engine=oracle", "--prompt", "This must never be sent"]),
-    { code: "UNSUPPORTED_ENGINE" },
-  );
-});
