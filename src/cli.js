@@ -178,7 +178,10 @@ function help() {
   process.stdout.write(`web-first-ask (wfa) — native CDP web AI delegation
 
 Commands:
+  wfa send        Submit a provider request and return a non-blocking handle
+  wfa read        Read a conversation or poll a submitted turn
   wfa cdp ask     Ask a provider via native CDP (--provider chatgpt|gemini)
+  wfa cdp read    Read a conversation or poll a submitted turn
   wfa cdp login   Log in to a provider through native CDP
   wfa cdp status  Show native CDP / browser status
   wfa broker      Turn queue: start | stop | status | turns | wait
@@ -290,6 +293,15 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   }
   if (command === "cdp") {
     const res = await runCdpCommand(rest, deps);
+    return res?.code ?? 0;
+  }
+  if (command === "send") {
+    const args = rest.includes("--no-wait") ? rest : [...rest, "--no-wait"];
+    const res = await runCdpCommand(["ask", ...args], deps);
+    return res?.code ?? 0;
+  }
+  if (command === "read") {
+    const res = await runCdpCommand(["read", ...rest], deps);
     return res?.code ?? 0;
   }
   if (command === "broker") {

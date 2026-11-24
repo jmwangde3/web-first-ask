@@ -14,34 +14,116 @@ function buildEvidence(state, lastProgressAgoMs) {
   };
 }
 
-export async function openTab(cdp, url, { timeoutMs = 60000 } = {}) {
-  const targetResult = await cdp.send("Target.createTarget", { url: "about:blank", background: true }, undefined, {
-    timeoutMs,
-  });
-  if (!targetResult || !targetResult.targetId) {
-    throw new WfaError("TARGET_CREATE_FAILED", "Target.createTarget failed to return a targetId");
-  }
-  const { targetId } = targetResult;
+const anchorTargetByBrowser = new Map();
+const anchorCreationByBrowser = new Map();
 
-  const attachResult = await cdp.send("Target.attachToTarget", { targetId, flatten: true }, undefined, {
-    timeoutMs,
-  });
-  if (!attachResult || !attachResult.sessionId) {
+export async function listPageTargets(cdp) {
+  if (!cdp || typeof cdp.send !== "function") {
+    throw new WfaError("CDP_REQUIRED", "A CDP client is required to list page targets");
+  }
+  const result = await cdp.send("Target.getTargets", {});
+  if (!Array.isArray(result?.targetInfos)) {
+    throw new WfaError("TARGET_LIST_FAILED", "Target.getTargets did not return targetInfos");
+  }
+  return result.targetInfos.filter((target) =>
+    target && target.type === "page" && typeof target.targetId === "string"
+  );
+}
+
+export async function ensureAnchorTab(cdp) {
+  if (!cdp || typeof cdp.send !== "function") {
+    throw new WfaError("CDP_REQUIRED", "A CDP client is required to ensure the anchor tab");
+  }
+
+  const browserKey = typeof cdp.wsUrl === "string" && cdp.wsUrl ? cdp.wsUrl : null;
+  const ensure = async () => {
+    const pageTargets = await listPageTargets(cdp);
+    if (browserKey) {
+      const knownTargetId = anchorTargetByBrowser.get(browserKey);
+      if (knownTargetId && pageTargets.some((target) => target.targetId === knownTargetId)) {
+        return { targetId: knownTargetId, created: false };
+      }
+      if (knownTargetId) anchorTargetByBrowser.delete(browserKey);
+    }
+
+    // An existing page is retained as the anchor; never navigate or activate it.
+    // Only an empty page-target set causes creation of a new about:blank target.
+    if (pageTargets.length > 0) {
+      const targetId = pageTargets[0].targetId;
+      if (browserKey) anchorTargetByBrowser.set(browserKey, targetId);
+      return { targetId, created: false };
+    }
+
+    const created = await cdp.send(
+      "Target.createTarget",
+      { url: "about:blank", background: true },
+      undefined,
+      { timeoutMs: 15000 },
+    );
+    if (!created?.targetId) {
+      throw new WfaError("ANCHOR_TARGET_CREATE_FAILED", "Target.createTarget did not return an anchor targetId");
+    }
+    if (browserKey) anchorTargetByBrowser.set(browserKey, created.targetId);
+    return { targetId: created.targetId, created: true };
+  };
+
+  if (!browserKey) return ensure();
+  const pending = anchorCreationByBrowser.get(browserKey);
+  if (pending) return pending;
+
+  const promise = ensure();
+  anchorCreationByBrowser.set(browserKey, promise);
+  try {
+    return await promise;
+  } finally {
+    if (anchorCreationByBrowser.get(browserKey) === promise) {
+      anchorCreationByBrowser.delete(browserKey);
+    }
+  }
+}
+
+export async function attachTab(cdp, targetId, { timeoutMs = 60000 } = {}) {
+  if (!cdp || typeof cdp.send !== "function") {
+    throw new WfaError("CDP_REQUIRED", "A CDP client is required to attach a tab");
+  }
+  if (typeof targetId !== "string" || !targetId) {
+    throw new WfaError("TARGET_ID_REQUIRED", "A targetId is required to attach a tab");
+  }
+
+  const attachResult = await cdp.send(
+    "Target.attachToTarget",
+    { targetId, flatten: true },
+    undefined,
+    { timeoutMs },
+  );
+  if (!attachResult?.sessionId) {
     throw new WfaError("ATTACH_FAILED", `Target.attachToTarget failed to return sessionId for ${targetId}`);
   }
   const { sessionId } = attachResult;
 
   await cdp.send("Page.enable", {}, sessionId);
-  await cdp.send("Runtime.enable", {}, sessionId);
-  // Pin the page timezone before any script runs. Session-scoped so each tab
-  // is isolated; must precede Page.navigate so first-paint code sees Asia/Tokyo.
+  // Runtime.evaluate works without subscribing to the Runtime event domain.
   await cdp.send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" }, sessionId);
-
-  if (url) {
-    await cdp.send("Page.navigate", { url }, sessionId);
-  }
-
   return { targetId, sessionId };
+}
+
+export async function openTab(cdp, url, { timeoutMs = 60000 } = {}) {
+  const targetResult = await cdp.send(
+    "Target.createTarget",
+    { url: "about:blank", background: true },
+    undefined,
+    { timeoutMs },
+  );
+  if (!targetResult?.targetId) {
+    throw new WfaError("TARGET_CREATE_FAILED", "Target.createTarget failed to return a targetId");
+  }
+  const { targetId } = targetResult;
+
+  const tab = await attachTab(cdp, targetId, { timeoutMs });
+  if (url) {
+    await cdp.send("Page.navigate", { url }, tab.sessionId);
+  }
+  return tab;
 }
 
 export async function waitForEditor(cdp, sessionId, adapter, {

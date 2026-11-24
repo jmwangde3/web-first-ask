@@ -58,6 +58,7 @@ export async function recordResult(home, turn) {
     provider: turn.provider ?? null,
     conversationId: turn.conversationId ?? null,
     conversationUrl: turn.conversationUrl ?? null,
+    targetId: turn.targetId ?? null,
     state: turn.state,
     text: turn.text ?? null,
     reason: turn.reason ?? null,

@@ -177,6 +177,7 @@ export async function runCdpTurn({
   hardTimeoutMs = 900000,
   minIntervalMs,
   onWait,
+  onProgress,
   keepBrowser = false,
   signal,
   deps = {},
@@ -264,16 +265,29 @@ export async function runCdpTurn({
   const classifyError = driver.classifyRunError || classifyRunError;
 
   let terminalStatus = "failed";
+  let terminalHasAnswer = false;
+  let targetId = null;
+  let anchorTargetId = null;
+  let conversationUrl = "";
   let submitted = false;
   let submittedAt = null;
   let typeRes = null;
   let turnLock = null;
 
   const withTerminalStatus = (result) => {
-    if (result && typeof result.status === "string") {
+    if (!result || typeof result !== "object") return result;
+    if (typeof result.status === "string") {
       terminalStatus = result.status;
+      terminalHasAnswer = result.status === "completed" &&
+        typeof result.text === "string" && result.text.trim().length > 0;
     }
-    return result;
+    return {
+      ...result,
+      ...(targetId ? { targetId } : {}),
+      ...(result.conversationUrl || conversationUrl
+        ? { conversationUrl: result.conversationUrl || conversationUrl }
+        : {}),
+    };
   };
 
   try {
@@ -334,9 +348,8 @@ export async function runCdpTurn({
     }
 
     let cdp = null;
-    let targetId = null;
     let sessionId = null;
-    let conversationUrl = adapter.url || "";
+    conversationUrl = adapter.url || "";
     let storedSession = null;
     let restoreUrl = null;
     let cleanupTargetUrl = null;
@@ -397,6 +410,13 @@ export async function runCdpTurn({
 
     try {
       cdp = await connect(recovery.chrome.port);
+      const ensureAnchor = typeof driver.ensureAnchorTab === "function"
+        ? driver.ensureAnchorTab
+        : (deps.driver ? null : defaultDriver.ensureAnchorTab);
+      if (typeof ensureAnchor === "function") {
+        const anchor = await ensureAnchor(cdp);
+        anchorTargetId = anchor?.targetId || null;
+      }
       if (signal?.aborted) {
         const err = new Error("Operation cancelled");
         err.code = "CANCELLED";
@@ -408,6 +428,9 @@ export async function runCdpTurn({
       const tab = await driver.openTab(cdp, targetUrl, { timeoutMs: hardTimeoutMs });
       targetId = tab.targetId;
       sessionId = tab.sessionId;
+      if (typeof onProgress === "function") {
+        onProgress({ conversationUrl, targetId });
+      }
       if (signal?.aborted) {
         const err = new Error("Operation cancelled");
         err.code = "CANCELLED";
@@ -665,6 +688,9 @@ export async function runCdpTurn({
       if (finalUrl) {
         conversationUrl = finalUrl;
       }
+      if (typeof onProgress === "function") {
+        onProgress({ conversationUrl, targetId });
+      }
 
       const finalStatus = completionInvalidated ? "failed" : completion.status;
       const finalReason = completionInvalidated
@@ -870,7 +896,14 @@ export async function runCdpTurn({
         elapsedMs: Date.now() - startTime,
       });
     } finally {
-      if (cdp && targetId) {
+      const mayCloseWorkTab =
+        terminalStatus === "completed" &&
+        terminalHasAnswer &&
+        !normalizedConversationId &&
+        keepBrowser === false &&
+        targetId &&
+        targetId !== anchorTargetId;
+      if (cdp && mayCloseWorkTab) {
         try {
           await cdp.send("Target.closeTarget", { targetId });
         } catch {}

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getHomeDir } from "../paths.js";
 import { WfaError } from "../errors.js";
@@ -14,6 +14,7 @@ import { ensureBroker, createTurn, waitForTurn } from "../broker/client.js";
 import { spawnDetachedBroker } from "../broker/cli.js";
 import { stageCdpResponse as defaultStageCdpResponse } from "./cdp-stage.js";
 import { expandAttachmentInputs } from "../attachments.js";
+import { readConversation as defaultReadConversation } from "./cdp-read.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -33,6 +34,10 @@ const VALUE_FLAGS = new Set([
   "request-id",
   "workspace",
   "file",
+  "url",
+  "task-id",
+  "wait",
+  "out",
 ]);
 
 function parseArgs(argv) {
@@ -96,7 +101,10 @@ Commands:
   wfa cdp ask    --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
                  [--mode background|visible|headless] [--conversation-id <id>] [--request-id <id>] [--json]
                  [--timeout <s>] [--settle <ms>] [--min-interval <ms>]
-                 [--file <path|glob|dir>] [--no-stage] [--workspace <dir>]
+                 [--file <path|glob|dir>] [--no-stage] [--no-wait] [--workspace <dir>]
+  wfa cdp read   (--url <conversation-url> | --task-id <id>)
+                 [--provider <chatgpt|gemini>] [--mode background|visible|headless]
+                 [--timeout <s>] [--wait <s>] [--no-reopen] [--json] [--out <path>]
   wfa cdp status [--json]
   wfa cdp login  [--provider <chatgpt|gemini>] [--mode visible|background]
                  [--timeout <seconds>] [--json]
@@ -114,6 +122,12 @@ Options:
   --settle <ms>              Answer stabilization window in milliseconds (default: 4000)
   --min-interval <ms>        Minimum interval between provider turns in milliseconds
   --no-stage                 Disable automatic file staging for code responses
+  --no-wait                  Return the turn handle immediately; poll with wfa read
+  --url <url>                Conversation URL for wfa cdp read
+  --task-id <id>             Broker turn ID for wfa cdp read
+  --wait <seconds>           Read-only observation window (default: 0)
+  --no-reopen                Do not open a missing conversation tab
+  --out <path>               Write captured answer text to a file
   --workspace <dir>          Target workspace root for staging (default: current directory)
   --help, -h                 Show this help message
 `);
@@ -413,6 +427,75 @@ async function handleLogin(argv, deps) {
   }
 }
 
+async function handleRead(argv, deps) {
+  const stdout = deps.stdout || process.stdout;
+  const { positional, options } = parseArgs(argv);
+
+  if (options.help) {
+    printCdpHelp(stdout);
+    return { code: 0 };
+  }
+  if (positional.length) {
+    throw new WfaError("INVALID_ARGUMENT", "wfa cdp read does not accept positional arguments.");
+  }
+  const hasUrl = options.url !== undefined;
+  const hasTaskId = options["task-id"] !== undefined;
+  if (hasUrl === hasTaskId) {
+    throw new WfaError("INVALID_ARGUMENT", "Specify exactly one of --url or --task-id.");
+  }
+
+  const provider = options.provider === undefined ? undefined : String(options.provider).toLowerCase();
+  if (provider !== undefined && !["chatgpt", "gemini"].includes(provider)) {
+    throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt or gemini.`);
+  }
+
+  const mode = options.mode === undefined ? "background" : String(options.mode).toLowerCase();
+  if (!["background", "visible", "headless"].includes(mode)) {
+    throw new WfaError("INVALID_ARGUMENT", `Invalid mode: ${options.mode}. Must be background, visible, or headless.`);
+  }
+
+  const timeoutSeconds = options.timeout === undefined ? 15 : Number(options.timeout);
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 300) {
+    throw new WfaError("INVALID_ARGUMENT", "--timeout must be greater than 0 and at most 300 seconds.");
+  }
+
+  const waitSeconds = options.wait === undefined ? 0 : Number(options.wait);
+  if (!Number.isFinite(waitSeconds) || waitSeconds < 0 || waitSeconds > 7200) {
+    throw new WfaError("INVALID_ARGUMENT", "--wait must be between 0 and 7200 seconds.");
+  }
+
+  const readFn = deps.readConversation || defaultReadConversation;
+  const result = await readFn({
+    home: deps.home || getHomeDir(),
+    ...(hasUrl ? { url: String(options.url) } : { taskId: String(options["task-id"]) }),
+    ...(provider ? { provider } : {}),
+    mode,
+    timeoutMs: timeoutSeconds * 1000,
+    wait: waitSeconds * 1000,
+    noReopen: Boolean(options["no-reopen"]),
+    signal: deps.signal,
+    deps: deps.readDeps || deps,
+  });
+
+  if (options.out !== undefined) {
+    if (typeof result?.text === "string" && result.text.length > 0) {
+      await writeFile(path.resolve(String(options.out)), result.text, "utf8");
+      result.out = path.resolve(String(options.out));
+    }
+  }
+
+  if (options.json) {
+    stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else {
+    stdout.write(`[read] status=${result.status} provider=${result.provider || provider || "unknown"}\n`);
+    if (result.reason) stdout.write(`[read] reason: ${result.reason}\n`);
+    if (result.out) stdout.write(`[read] out: ${result.out}\n`);
+    if (result.text) stdout.write(`${result.text}${result.text.endsWith("\n") ? "" : "\n"}`);
+  }
+
+  return { code: 0, result };
+}
+
 async function handleAsk(argv, deps) {
   const stdout = deps.stdout || process.stdout;
   const stderr = deps.stderr || process.stderr;
@@ -539,7 +622,7 @@ async function handleAsk(argv, deps) {
   });
 
   const created = turnRes?.json;
-  if (turnRes?.status >= 400) {
+  if (turnRes?.status !== undefined && ![200, 202].includes(turnRes.status)) {
     if (options.json) {
       stdout.write(`${JSON.stringify({
         error: created?.error || created?.code || "BROKER_ERROR",
@@ -562,6 +645,22 @@ async function handleAsk(argv, deps) {
   if (!turnId) {
     stderr.write("wfa: BROKER_ERROR: Failed to create turn\n");
     return { code: 1 };
+  }
+
+  if (options["no-wait"]) {
+    const handle = {
+      id: turnId,
+      requestId: created?.requestId ?? requestId,
+      state: created?.state ?? "queued",
+      poll: `wfa read --task-id ${turnId}`,
+      provider,
+    };
+    if (options.json) {
+      stdout.write(`${JSON.stringify(handle, null, 2)}\n`);
+    } else {
+      stdout.write(`Submitted ${handle.id} (${handle.state})\nPoll: ${handle.poll}\n`);
+    }
+    return { code: 0, result: handle };
   }
 
   const waitFn = deps.waitForTurn || waitForTurn;
@@ -684,8 +783,8 @@ export async function runCdpCommand(argv = [], deps = {}) {
   }
 
   const subcmd = argv[0];
-  if (!subcmd || !["ask", "status", "login"].includes(subcmd)) {
-    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|status|login>\n`);
+  if (!subcmd || !["ask", "read", "status", "login"].includes(subcmd)) {
+    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|read|status|login>\n`);
     return { code: 2 };
   }
 
@@ -702,6 +801,7 @@ export async function runCdpCommand(argv = [], deps = {}) {
       const loginFn = deps.runCdpLogin || handleLogin;
       return await loginFn(argv.slice(1), deps);
     }
+    if (subcmd === "read") return await handleRead(argv.slice(1), deps);
     return await handleAsk(argv.slice(1), deps);
   } catch (error) {
     if (error instanceof WfaError) {

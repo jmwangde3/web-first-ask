@@ -40,6 +40,7 @@ function restoreTurnFromResult(record, fallbackCreatedAt) {
     provider: record.provider ?? null,
     conversationId: record.conversationId ?? null,
     conversationUrl: record.conversationUrl ?? null,
+    targetId: record.targetId ?? null,
     mode: "background",
     settleMs: null,
     stallTimeoutMs: null,
@@ -174,6 +175,12 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
           text: result?.text ?? null,
           reason: next === "failed" && status !== "failed" ? "unknown_runner_status" : (result?.reason ?? null),
           evidence: result?.evidence ?? null,
+          ...(result?.conversationUrl != null
+            ? { conversationUrl: result.conversationUrl }
+            : (turns.get(turn.id)?.conversationUrl != null ? { conversationUrl: turns.get(turn.id).conversationUrl } : {})),
+          ...(result?.targetId != null
+            ? { targetId: result.targetId }
+            : (turns.get(turn.id)?.targetId != null ? { targetId: turns.get(turn.id).targetId } : {})),
           ...(result?.sendCommittedAt != null ? { sendCommittedAt: result.sendCommittedAt } : {}),
         });
         const current = turns.get(turn.id);

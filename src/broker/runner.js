@@ -209,6 +209,11 @@ export function createCdpRunner({
         ...(Array.isArray(turn?.files) && turn.files.length > 0 ? { files: turn.files } : {}),
         ...(turn?.minIntervalMs != null ? { minIntervalMs: turn.minIntervalMs } : {}),
         ...(onWait ? { onWait } : {}),
+        onProgress: (patch) => {
+          if (patch && typeof patch === "object" && typeof onProgress === "function") {
+            onProgress(patch);
+          }
+        },
         signal: turnController.signal,
         deps: turnDeps,
       });
@@ -218,6 +223,8 @@ export function createCdpRunner({
           status: "failed",
           reason: "cancelled",
           text: "",
+          ...(result?.conversationUrl != null ? { conversationUrl: result.conversationUrl } : {}),
+          ...(result?.targetId != null ? { targetId: result.targetId } : {}),
           ...(result?.sendCommittedAt != null ? { sendCommittedAt: result.sendCommittedAt } : {}),
         };
       }

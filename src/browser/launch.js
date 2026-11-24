@@ -90,6 +90,10 @@ export async function launchChrome({ profileDir, mode = "headless", chromePath, 
   if (!profileDir) throw new Error("PROFILE_DIR_REQUIRED");
   if (!["headless", "headful", "background", "visible"].includes(mode)) throw new Error("INVALID_BROWSER_MODE");
   const resolveExecutable = deps.resolveChromeExecutable || resolveChromeExecutable;
+  const queryProcessFn = deps.queryProcess || queryProcess;
+  const readActivePortFn = deps.readDevToolsActivePort || readDevToolsActivePort;
+  const cdpProbeFn = deps.cdpProbe || cdpProbe;
+  const terminateProcessFn = deps.terminateProcessAndWait || terminateProcessAndWait;
   const executable = await resolveExecutable(chromePath);
   const userDataDir = path.resolve(profileDir);
   await mkdir(userDataDir, { recursive: true });
@@ -101,7 +105,7 @@ export async function launchChrome({ profileDir, mode = "headless", chromePath, 
   let pid = null;
   const spawnFn = deps.spawn || spawn;
   try {
-    child = spawnFn(executable, args, { detached: false, stdio: "ignore", windowsHide: mode === "headless" });
+    child = spawnFn(executable, args, { detached: true, stdio: "ignore", windowsHide: mode === "headless" });
     await new Promise((resolve, reject) => {
       child.once("spawn", resolve);
       child.once("error", reject);
@@ -112,16 +116,16 @@ export async function launchChrome({ profileDir, mode = "headless", chromePath, 
     const deadline = Date.now() + Math.max(timeoutMs, 15000);
     let info = null;
     while (Date.now() < deadline && !info) {
-      info = await queryProcess(pid);
+      info = await queryProcessFn(pid);
       if (!info?.creationDate || !info?.executablePath) {
         info = null;
         await sleep(100);
       }
     }
     if (!info) throw new Error("CHROME_PROCESS_METADATA_UNAVAILABLE");
-    const active = await readDevToolsActivePort(userDataDir, { timeoutMs: Math.max(0, deadline - Date.now()) });
+    const active = await readActivePortFn(userDataDir, { timeoutMs: Math.max(0, deadline - Date.now()) });
     if (!active) throw new Error("CHROME_ACTIVE_PORT_TIMEOUT");
-    const cdp = await cdpProbe(active.port);
+    const cdp = await cdpProbeFn(active.port);
     if (!cdp.ok) throw new Error(`CHROME_CDP_FAILED:${cdp.error}`);
     return {
       pid,
@@ -133,7 +137,7 @@ export async function launchChrome({ profileDir, mode = "headless", chromePath, 
     };
   } catch (cause) {
     if (Number.isSafeInteger(pid) && pid > 0) {
-      await terminateProcessAndWait(pid).catch(() => {});
+      await terminateProcessFn(pid).catch(() => {});
     }
     const error = new Error(`Chrome startup failed: ${cause?.message ?? String(cause)}`, { cause });
     error.code = "CHROME_START_FAILED";

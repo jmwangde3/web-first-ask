@@ -240,22 +240,18 @@ test("openTab and submitTurn: standard CDP protocol execution", async () => {
   assert.equal(createTargetCall.sessionId, undefined);
   assert.equal(calls.some((call) => call.method === "Target.activateTarget"), false);
 
-  for (const method of ["Page.enable", "Runtime.enable", "Page.navigate"]) {
+  for (const method of ["Page.enable", "Page.navigate"]) {
     const call = calls.find((entry) => entry.method === method);
     assert.ok(call, `${method} must be sent for the new target`);
     assert.equal(call.sessionId, tab.sessionId, `${method} must be scoped to the target session`);
   }
 
-  const runtimeEnableCall = calls.find((call) => call.method === "Runtime.enable");
+  assert.equal(calls.some((call) => call.method === "Runtime.enable"), false, "Runtime.enable must not be sent");
   const timezoneOverrideCall = calls.find((call) => call.method === "Emulation.setTimezoneOverride");
   const navigateCall = calls.find((call) => call.method === "Page.navigate");
   assert.ok(timezoneOverrideCall, "timezone override must be sent for the new target");
   assert.deepEqual(timezoneOverrideCall.params, { timezoneId: "Asia/Tokyo" });
   assert.equal(timezoneOverrideCall.sessionId, tab.sessionId, "timezone override must be scoped to the target session");
-  assert.ok(
-    calls.indexOf(runtimeEnableCall) < calls.indexOf(timezoneOverrideCall),
-    "timezone override must be sent after Runtime.enable"
-  );
   assert.ok(
     calls.indexOf(timezoneOverrideCall) < calls.indexOf(navigateCall),
     "timezone override must be sent before Page.navigate"
