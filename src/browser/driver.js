@@ -280,7 +280,13 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
  * @param {string[]} filePaths 需要附加的绝对文件路径数组
  * @param {object} options
  */
-export async function attachFiles(cdp, sessionId, adapter, filePaths = [], { signal, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
+  signal,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(),
+  attachmentVerifyTimeoutMs = 7000,
+  attachmentVerifyIntervalMs = 200,
+} = {}) {
   if (signal?.aborted) {
     const err = new Error("Operation cancelled");
     err.code = "CANCELLED";
@@ -391,7 +397,40 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], { sig
     throw err;
   }
 
-  // 4. 不在此处重复 waitForEditor：调用方 engine 已在 openTab 后等待过 editor，
+  // 4. 等待并验证附件 chip 出现（2026-11-24 真机证据）：
+  // React 读文件进 state 后清空 input.files，chip 才是真实成功标志；
+  // 它出现前就提交 prompt 会导致 "I don't see an attached file"。
+  // input.files 仅作诊断，绝不参与成功判定。
+  const verifyJs = typeof adapter.buildAttachmentVerifyJs === "function"
+    ? adapter.buildAttachmentVerifyJs(absolutePaths)
+    : null;
+  if (verifyJs) {
+    let diag = null;
+    const deadline = now() + attachmentVerifyTimeoutMs;
+    while (now() < deadline) {
+      if (signal?.aborted) {
+        const err = new Error("Operation cancelled");
+        err.code = "CANCELLED";
+        throw err;
+      }
+      const res = await cdp.send("Runtime.evaluate", {
+        expression: verifyJs,
+        returnByValue: true,
+      }, sessionId);
+      diag = res?.result?.value || null;
+      if (diag?.present) break;
+      await sleep(attachmentVerifyIntervalMs);
+    }
+    if (!diag?.present) {
+      throw new WfaError(
+        "ATTACH_UPLOAD_FAILED",
+        `Attachment chip not visible within ${attachmentVerifyTimeoutMs}ms for ${adapter?.id || "unknown"}. ` +
+          `diagnostics=${JSON.stringify({ inputFiles: diag?.inputFiles ?? null, chipCount: diag?.chipCount ?? 0 })}`
+      );
+    }
+  }
+
+  // 5. 不在此处重复 waitForEditor：调用方 engine 已在 openTab 后等待过 editor，
   // 这里再等一次在 mock/慢渲染下会额外卡 15s，且上传本身不改变 editor 可用性。
 
   return {

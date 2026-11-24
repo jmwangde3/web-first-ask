@@ -39,6 +39,14 @@ test("driver.attachFiles: full successful DOM.setFileInputFiles flow with mock C
         return {};
       }
       if (method === "Runtime.evaluate") {
+        const expression = String(params?.expression || "");
+        // 附件验证表达式（含 chipCount）返回 chip 已出现；inputFiles 为空仍应判成功。
+        if (expression.includes("chipCount")) {
+          return { result: { value: {
+            present: true, sendReady: true, matched: [true], chipCount: 1,
+            chipTexts: ["package.json"], inputFiles: [],
+          } } };
+        }
         return { result: { value: { editorFound: true } } };
       }
       return {};
@@ -47,6 +55,7 @@ test("driver.attachFiles: full successful DOM.setFileInputFiles flow with mock C
 
   const res = await attachFiles(mockCdp, "sess-1", chatgptAdapter, [testFile], {
     sleep: async () => {},
+    now: () => 0,
   });
 
   assert.deepEqual(res.attached, [testFile]);
@@ -76,6 +85,10 @@ test("driver.attachFiles: falls back to backendNodeId when DOM.querySelector fai
         return { nodeId: 0 };
       }
       if (method === "Runtime.evaluate") {
+        const expression = String(params?.expression || "");
+        if (expression.includes("chipCount")) {
+          return { result: { value: { present: true, sendReady: true, matched: [true], chipCount: 1, chipTexts: ["package.json"], inputFiles: [] } } };
+        }
         return { result: { objectId: "obj-99", value: { editorFound: true } } };
       }
       if (method === "DOM.describeNode") {
@@ -90,6 +103,7 @@ test("driver.attachFiles: falls back to backendNodeId when DOM.querySelector fai
 
   const res = await attachFiles(mockCdp, "sess-2", geminiAdapter, [testFile], {
     sleep: async () => {},
+    now: () => 0,
   });
 
   assert.deepEqual(res.attached, [testFile]);
@@ -125,5 +139,75 @@ test("driver.attachFiles: throws CANCELLED on aborted signal", async () => {
     {
       code: "CANCELLED",
     }
+  );
+});
+
+test("driver.attachFiles: chip appears late but within timeout -> success", async () => {
+  const testFile = path.resolve("package.json");
+  let verifyCalls = 0;
+  let fakeNow = 1000;
+  const mockCdp = {
+    send: async (method, params = {}) => {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.querySelector") return { nodeId: 42 };
+      if (method === "Runtime.evaluate" && String(params?.expression || "").includes("chipCount")) {
+        verifyCalls += 1;
+        const present = verifyCalls >= 3;
+        return { result: { value: { present, matched: [present], sendReady: present, chipCount: present ? 1 : 0, chipTexts: present ? ["package.json"] : [], inputFiles: [] } } };
+      }
+      return {};
+    },
+  };
+  const res = await attachFiles(mockCdp, "sess-late", chatgptAdapter, [testFile], {
+    sleep: async () => { fakeNow += 200; },
+    now: () => fakeNow,
+  });
+  assert.deepEqual(res.attached, [testFile]);
+  assert.equal(verifyCalls, 3, "should poll until chip appears");
+});
+
+test("driver.attachFiles: chip never appears -> ATTACH_UPLOAD_FAILED (fail-closed)", async () => {
+  const testFile = path.resolve("package.json");
+  let fakeNow = 1000;
+  const mockCdp = {
+    send: async (method, params = {}) => {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.querySelector") return { nodeId: 42 };
+      if (method === "Runtime.evaluate" && String(params?.expression || "").includes("chipCount")) {
+        return { result: { value: { present: false, matched: [false], chipCount: 0, chipTexts: [], inputFiles: [] } } };
+      }
+      return {};
+    },
+  };
+  await assert.rejects(
+    () => attachFiles(mockCdp, "sess-fail", chatgptAdapter, [testFile], {
+      sleep: async () => { fakeNow += 200; },
+      now: () => fakeNow,
+      attachmentVerifyTimeoutMs: 1000,
+    }),
+    (err) => err?.code === "ATTACH_UPLOAD_FAILED" && /chip not visible/i.test(err.message)
+  );
+});
+
+test("driver.attachFiles: input.files present but no chip -> still fails", async () => {
+  const testFile = path.resolve("package.json");
+  let fakeNow = 1000;
+  const mockCdp = {
+    send: async (method, params = {}) => {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.querySelector") return { nodeId: 42 };
+      if (method === "Runtime.evaluate" && String(params?.expression || "").includes("chipCount")) {
+        return { result: { value: { present: false, matched: [false], chipCount: 0, chipTexts: [], inputFiles: ["package.json"] } } };
+      }
+      return {};
+    },
+  };
+  await assert.rejects(
+    () => attachFiles(mockCdp, "sess-fail2", chatgptAdapter, [testFile], {
+      sleep: async () => { fakeNow += 200; },
+      now: () => fakeNow,
+      attachmentVerifyTimeoutMs: 1000,
+    }),
+    (err) => err?.code === "ATTACH_UPLOAD_FAILED"
   );
 });

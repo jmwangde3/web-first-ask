@@ -64,6 +64,13 @@ export function buildUploadJs() {
 
   const inputReady = await waitFor(() => {
     const input = document.querySelector(${JSON.stringify(fileInputSelector)});
+  const sendBtns = [...document.querySelectorAll(${JSON.stringify(sendSelector)})];
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    return !r || (r.width > 0 && r.height > 0);
+  };
+  const sendReady = sendBtns.some((b) => isVisible(b) && !b.disabled && b.getAttribute("aria-disabled") !== "true");
     return Boolean(input);
   }, 6000);
   if (!inputReady) {
@@ -71,6 +78,28 @@ export function buildUploadJs() {
   }
 
   return { success: true };
+})()`;
+}
+
+
+// 附件成功判据（2026-11-24 真机）：Gemini 上传后出现 div.attachment-preview-wrapper，
+// 其 innerText 常为空（文件名在子结构/异步加载），故以 chip 出现为成功信号，不强求文本匹配。
+// input.files 仅诊断，不作判据。
+export const attachmentChipSelector = '[class*="attachment-preview"], [class*="file-chip"], gem-attachment-chip, [data-testid*="attachment"]';
+export function buildAttachmentVerifyJs(fileNames) {
+  const bases = fileNames.map((fp) => String(fp).split(/[\\/]/).pop());
+  return `(() => {
+  const chips = [...document.querySelectorAll(${JSON.stringify(attachmentChipSelector)})];
+  const texts = chips.map((el) => String((el && (el.innerText || el.textContent)) || "").trim());
+  const input = document.querySelector(${JSON.stringify(fileInputSelector)});
+  return {
+    present: chips.length > 0 && sendReady,
+    matched: bases.map(() => chips.length > 0),
+    chipCount: chips.length,
+    chipTexts: texts.slice(0, 8),
+    sendReady,
+    inputFiles: input && input.files ? [...input.files].map((f) => f.name) : [],
+  };
 })()`;
 }
 

@@ -14,6 +14,38 @@ export function buildUploadJs() {
   return null;
 }
 
+
+// 附件成功判据（2026-11-24 真机）：setFileInputFiles 后 React 读文件进 state 并清空
+// input.files；composer 出现 class 含 composer-attachment 的 chip，innerText 含文件名。
+// 用 chip 判成功，input.files 仅诊断（清空后恒为 0，不可作判据）。
+export const attachmentChipSelector = '[class*="composer-attachment"], [data-testid*="composer-attachment"]';
+export function buildAttachmentVerifyJs(fileNames) {
+  const LF = String.fromCharCode(10);
+  const bases = fileNames.map((fp) => String(fp).split(/[\\/]/).pop());
+  return `(() => {
+  const bases = ${JSON.stringify(bases)};
+  const chips = [...document.querySelectorAll(${JSON.stringify(attachmentChipSelector)})];
+  const texts = chips.map((el) => String((el && (el.innerText || el.textContent)) || "").trim());
+  const matched = bases.map((b) => texts.some((t) => t.includes(b)));
+  const input = document.querySelector(${JSON.stringify(fileInputSelector)});
+  const sendBtns = [...document.querySelectorAll(${JSON.stringify(sendSelector)})];
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    return !r || (r.width > 0 && r.height > 0);
+  };
+  const sendReady = sendBtns.some((b) => isVisible(b) && !b.disabled && b.getAttribute("aria-disabled") !== "true");
+  return {
+    present: chips.length > 0 && matched.every(Boolean) && sendReady,
+    matched,
+    chipCount: chips.length,
+    chipTexts: texts.slice(0, 8),
+    sendReady,
+    inputFiles: input && input.files ? [...input.files].map((f) => f.name) : [],
+  };
+})()`;
+}
+
 export function buildLoginProbeJs() {
   return `(() => (async () => {
   const host = location.hostname;
