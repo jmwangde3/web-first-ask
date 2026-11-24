@@ -324,16 +324,18 @@ test("7. Completed turn persists result before clearing journal; failed result w
   }
 });
 
-test("8. onSendIntent throwing -> result is needs_human / journal_unwritable and driver.typePrompt never called", async () => {
-  let typePromptCalls = 0;
+test("8. onSendIntent throwing -> result is needs_human / journal_unwritable and driver.submitTurn never called", async () => {
+  // onSendIntent 现位于发送门闩内（typePrompt 之后、submit 之前），因此断言核心安全保证
+  // "绝不提交/发送"，而非"绝不输入"（输入草稿但不发送无副作用，且可避免门闩等待期取消误记 intent）。
+  let submitTurnCalls = 0;
   const mockDriver = {
     openTab: async () => ({ targetId: "target-1", sessionId: "session-1" }),
     waitForEditor: async () => true,
     readTurnState: async () => ({ userTurns: 0, answerTurns: 0, loggedOut: false }),
-    typePrompt: async () => {
-      typePromptCalls++;
+    typePrompt: async () => ({ typedChars: 5, replacedChars: 0 }),
+    submitTurn: async () => {
+      submitTurnCalls++;
     },
-    submitTurn: async () => {},
     waitForCompletion: async () => ({ status: "completed", text: "done" }),
   };
 
@@ -356,7 +358,7 @@ test("8. onSendIntent throwing -> result is needs_human / journal_unwritable and
   assert.equal(res.status, "needs_human");
   assert.equal(res.reason, "journal_unwritable");
   assert.match(res.evidence.message, /disk I\/O error/);
-  assert.equal(typePromptCalls, 0, "driver.typePrompt must never be called if onSendIntent throws");
+  assert.equal(submitTurnCalls, 0, "driver.submitTurn must never be called if onSendIntent throws");
 });
 
 test("9. Runner passes onSendIntent into runCdpTurn deps", async () => {

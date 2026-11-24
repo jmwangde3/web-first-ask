@@ -86,6 +86,8 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
       typeof onIdle !== "function" || typeof log !== "function") {
     throw coded("INVALID_ARGUMENT", "Invalid broker options");
   }
+  // Validate scheduler configuration before acquiring the broker instance lock.
+  const scheduler = createScheduler({ maxPerProvider, maxTotal, now: deps?.now || Date.now });
   const lock = await acquireInstanceLock(home);
   if (!lock) throw coded("BROKER_LOCKED", "Another broker owns the instance lock");
 
@@ -95,7 +97,6 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   const instanceId = lock.instanceId;
   const token = randomUUID();
   const startedAt = new Date().toISOString();
-  const scheduler = createScheduler({ maxPerProvider, maxTotal, now: deps?.now || Date.now });
   const turns = new Map();
   const requests = new Map();
   const controllers = new Map();

@@ -1,123 +1,108 @@
-// src/browser/stagger.js
-// 同 provider 发送错峰门禁（硬限制）：
-// 在实际提交 (driver.submitTurn) 之前强制插入 3000-5000ms 随机间隔，
-// 抹除多 Tab 自动化瞬时同击指纹特征。
-// 调度为 Provider 级内存队列，登记完立即出队/释放锁再 sleep，严禁持锁挂起。
+import { performance } from "node:perf_hooks";
+import { setTimeout as delay } from "node:timers/promises";
 
 const providerQueues = new Map();
+const MIN_MS = 3000;
+const MAX_MS = 5000;
 
-/**
- * 产生 [minMs, maxMs] 之间的随机毫秒数，含毫秒级 jitter。
- */
-export function computeStaggerDelay(minMs = 3000, maxMs = 5000, random = Math.random) {
-  const min = Math.max(0, Math.min(minMs, maxMs));
-  const max = Math.max(min, Math.max(minMs, maxMs));
-  const r = typeof random === "function" ? random() : Math.random();
-  const clampedR = Math.max(0, Math.min(1, Number.isFinite(r) ? r : 0));
-  return Math.floor(min + clampedR * (max - min));
+export function computeStaggerDelay(minMs = MIN_MS, maxMs = MAX_MS, random = Math.random) {
+  // 入参防御（Gemini 复核补充）：非有限值的边界回退到默认，避免 NaN 延迟。
+  const safeMinInput = Number.isFinite(minMs) ? minMs : MIN_MS;
+  const safeMaxInput = Number.isFinite(maxMs) ? maxMs : MAX_MS;
+  const min = Math.max(0, Math.min(safeMinInput, safeMaxInput));
+  const max = Math.max(min, Math.max(safeMinInput, safeMaxInput));
+  const value = random();
+  const r = Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
+  return Math.min(max, min + Math.floor(r * (max - min + 1)));
 }
 
-/**
- * 核心门禁：等待当前 provider 的发送槽位。
- * 仅用于新会话（无 conversationId 或新 conversationId）。
- *
- * @param {string} provider
- * @param {object} options
- * @param {boolean} [options.isNewConversation=true] 是否属于新会话
- * @param {number} [options.minMs=3000]
- * @param {number} [options.maxMs=5000]
- * @param {Function} [options.now=Date.now]
- * @param {Function} [options.sleep]
- * @param {Function} [options.random=Math.random]
- * @param {AbortSignal} [options.signal]
- * @returns {Promise<{ waitedMs: number, scheduledAt: number }>}
- */
-export async function waitForSendSlot(provider, {
+function cancelled() {
+  return Object.assign(new Error("Operation cancelled before submit"), { code: "CANCELLED" });
+}
+
+function checkAbort(signal) {
+  if (signal?.aborted) throw cancelled();
+}
+
+async function abortable(promise, signal) {
+  if (!signal) return await promise;
+  if (signal.aborted) {
+    Promise.resolve(promise).catch(() => {});
+    throw cancelled();
+  }
+  let onAbort;
+  const abort = new Promise((_, reject) => {
+    onAbort = () => reject(cancelled());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, abort]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function defaultSleep(ms, signal) {
+  try {
+    await delay(ms, undefined, { signal });
+  } catch (error) {
+    if (signal?.aborted) throw cancelled();
+    throw error;
+  }
+}
+
+// Serialize only the submission attempt, never the generation itself.
+// No future send slots are reserved. The next deadline is measured after the
+// previous attempt settles (including unknown outcomes). Queue insertion is
+// synchronous; no file lock or global mutex is held during the delay.
+export async function withSendSlot(provider, submit, {
   isNewConversation = true,
-  minMs = 3000,
-  maxMs = 5000,
-  now = Date.now,
-  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  now = () => performance.now(),
+  sleep = defaultSleep,
   random = Math.random,
   signal,
 } = {}) {
-  // 仅对新会话实行发车错峰；续聊无需限制
-  if (!isNewConversation) {
-    return { waitedMs: 0, scheduledAt: now() };
+  checkAbort(signal);
+  if (typeof submit !== "function") throw new TypeError("submit must be a function");
+  if (!isNewConversation) return await submit();
+
+  const key = String(provider).toLowerCase();
+  let state = providerQueues.get(key);
+  if (!state) {
+    state = { tail: Promise.resolve(), nextEligibleAt: -Infinity };
+    providerQueues.set(key, state);
   }
 
-  const key = String(provider || "default").toLowerCase();
+  const previous = state.tail;
+  let release;
+  const own = new Promise((resolve) => { release = resolve; });
+  // A cancelled middle ticket must not let its successor overtake an
+  // earlier in-flight submission.
+  state.tail = previous.then(() => own);
 
-  // 获取该 provider 的发车队列（Promise 链）
-  let queueState = providerQueues.get(key);
-  if (!queueState) {
-    queueState = {
-      tail: Promise.resolve(),
-      nextEligibleAt: 0,
-    };
-    providerQueues.set(key, queueState);
-  }
-
-  // 挂载到队列尾部：每个后来者等待前序出队后再计算自己的排期。
-  // 用 Promise 链传递"排期计算资格"，不持有锁 sleep，绝不阻塞其它 provider。
-  const prevTail = queueState.tail;
-  let releaseTail;
-  queueState.tail = new Promise((resolve) => { releaseTail = resolve; });
-
-  // 1. 等待轮到自己获得排期计算资格
-  let currentTime, targetSendTime, waitMs;
   try {
+    await abortable(previous, signal);
+    for (;;) {
+      checkAbort(signal);
+      const remaining = state.nextEligibleAt - now();
+      if (remaining <= 0) break;
+      await abortable(sleep(Math.ceil(remaining), signal), signal);
+    }
+    checkAbort(signal);
+    const spacing = computeStaggerDelay(MIN_MS, MAX_MS, random);
     try {
-      await prevTail;
-    } catch {
-      // 容错：前序 ticket 即使异常被 abort，不阻断后续任务出队
+      // Never race a running submit against abort: its outcome might be
+      // unknown. A successor must wait until the attempt actually settles.
+      return await submit();
+    } finally {
+      state.nextEligibleAt = now() + spacing;
     }
-
-    if (signal?.aborted) {
-      const err = new Error("Operation cancelled before stagger slot assignment");
-      err.code = "CANCELLED";
-      throw err;
-    }
-
-    currentTime = now();
-    const delay = computeStaggerDelay(minMs, maxMs, random);
-
-    // 计算本 turn 发送时间点：基于上一次排期时间或当前时间
-    targetSendTime = Math.max(currentTime, queueState.nextEligibleAt);
-    // 下一次同 provider 发送最早必须在此刻的 delay 之后
-    queueState.nextEligibleAt = targetSendTime + delay;
-
-    // 计算当前 turn 需要等待的毫秒数
-    waitMs = Math.max(0, targetSendTime - currentTime);
   } finally {
-    // 无论成功/取消/异常，都必须放行后续排队请求，绝不持锁等待 sleep
-    releaseTail();
+    release();
   }
-
-  // 2. 释放调度互斥后，自身独立进入 sleep
-  if (waitMs > 0) {
-    if (signal?.aborted) {
-      const err = new Error("Operation cancelled");
-      err.code = "CANCELLED";
-      throw err;
-    }
-    await sleep(waitMs);
-    if (signal?.aborted) {
-      const err = new Error("Operation cancelled");
-      err.code = "CANCELLED";
-      throw err;
-    }
-  }
-
-  return {
-    waitedMs: waitMs,
-    scheduledAt: targetSendTime,
-  };
 }
 
-/**
- * 辅助清理，供测试环境隔离重置使用
- */
+// Test isolation only. Never reset with active submissions in production.
 export function resetStaggerQueues() {
   providerQueues.clear();
 }

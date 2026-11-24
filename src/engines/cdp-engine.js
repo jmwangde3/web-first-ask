@@ -11,7 +11,7 @@ import * as defaultConversationStore from "../browser/conversation-store.js";
 import { DEFAULT_MIN_INTERVAL_MS, enforceCooldown, recordLastTurn } from "../browser/cooldown.js";
 import { acquireTurnLock } from "../broker/turn-lock.js";
 import { pace as defaultPace } from "../browser/pacer.js";
-import { waitForSendSlot as defaultWaitForSendSlot } from "../browser/stagger.js";
+import { withSendSlot as defaultWithSendSlot } from "../browser/stagger.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -229,7 +229,7 @@ export async function runCdpTurn({
   };
   const sleepFn = deps.sleep || defaultSleep;
   const enforce = deps.enforceCooldown || enforceCooldown;
-  const waitForSendSlot = deps.waitForSendSlot || defaultWaitForSendSlot;
+  const withSendSlot = deps.withSendSlot || defaultWithSendSlot;
   await enforce(effectiveHome, normalizedProvider, {
     minIntervalMs,
     now: deps.now || Date.now,
@@ -282,11 +282,11 @@ export async function runCdpTurn({
     if (!deps.skipTurnLock) {
       const acquireFn = deps.acquireTurnLock || acquireTurnLock;
       turnLock = await acquireFn(effectiveHome, normalizedProvider, {
-        turnId: conversationId || null,
-        conversationId: conversationId || null,
+        turnId: normalizedConversationId,
+        conversationId: normalizedConversationId,
         sleep: sleepFn,
         signal,
-        now: deps.now || Date.now,
+        now: deps.lockNow || deps.now,
       });
     }
 
@@ -544,29 +544,6 @@ export async function runCdpTurn({
         }
       }
 
-      if (typeof deps.onSendIntent === "function") {
-        const intentTime = Date.now();
-        try {
-          await deps.onSendIntent({ provider: normalizedProvider, prompt, submittedAt: intentTime });
-          submittedAt = intentTime;
-        } catch (intentErr) {
-          return withTerminalStatus({
-            status: "needs_human",
-            text: "",
-            reason: "journal_unwritable",
-            evidence: { message: intentErr?.message || String(intentErr) },
-            conversationUrl,
-            browser: {
-              pid: recovery.chrome?.pid ?? null,
-              port: recovery.chrome?.port ?? null,
-              mode,
-              reused: recovery.action === "ADOPT",
-            },
-            elapsedMs: Date.now() - startTime,
-          });
-        }
-      }
-
       // 三方裁决 2026-11-24：人类操作节奏（日常 1-2s），经 deps 注入便于测试旁路。
       const paceFn = deps.pace || defaultPace;
       await paceFn("casual", { sleep: sleepFn, signal });
@@ -581,28 +558,75 @@ export async function runCdpTurn({
       // 输入完成到提交之间再注入一次日常节奏，杜绝 0 间隔击发。
       await paceFn("casual", { sleep: sleepFn, signal });
 
-      // 三方裁决 2026-11-24：同 provider 发送错峰硬限制（仅新会话），在实际 submit 之前排队 3-5s。
-      // 放在发送时刻而非入口，避免页面加载/输入耗时差异导致"预约错开但实际发送仍重叠"。
-      await waitForSendSlot(normalizedProvider, {
-        isNewConversation: !conversationId,
-        sleep: sleepFn,
-        signal,
-        now: deps.now || Date.now,
-        random: deps.random || Math.random,
-      });
-
-      if (!submittedAt) {
-        submittedAt = Date.now();
-      }
-      try {
-        await driver.submitTurn(cdp, sessionId, adapter);
-      } catch (submitErr) {
-        if (submitErr?.code !== "SEND_UNCONFIRMED") {
+      // A caller-supplied conversationId is a local key, not proof that a
+      // cloud conversation exists. First use and invalidated replacements
+      // both open a new conversation and must use the send gate.
+      const submission = await withSendSlot(normalizedProvider, async () => {
+        if (signal?.aborted) {
+          const err = new Error("Operation cancelled");
+          err.code = "CANCELLED";
+          throw err;
+        }
+        if (typeof deps.onSendIntent === "function") {
+          const intentTime = Date.now();
+          try {
+            await deps.onSendIntent({ provider: normalizedProvider, prompt, submittedAt: intentTime });
+            submittedAt = intentTime;
+          } catch (intentErr) {
+            return { intentError: intentErr, journalFailed: true };
+          }
+        }
+        if (signal?.aborted) {
           if (typeof deps.onSendAborted === "function") {
             await deps.onSendAborted({ provider: normalizedProvider }).catch(() => {});
           }
+          submittedAt = null;
+          const err = new Error("Operation cancelled");
+          err.code = "CANCELLED";
+          throw err;
         }
-        throw submitErr;
+        if (!submittedAt) submittedAt = Date.now();
+        try {
+          await driver.submitTurn(cdp, sessionId, adapter);
+        } catch (submitErr) {
+          if (["SEND_BUTTON_MISSING", "SEND_BUTTON_DISABLED", "SEND_BUTTON_AMBIGUOUS"].includes(submitErr?.code)) {
+            if (typeof deps.onSendAborted === "function") {
+              await deps.onSendAborted({ provider: normalizedProvider }).catch(() => {});
+            }
+            // These driver errors explicitly prove no click was performed.
+            submittedAt = null;
+            throw submitErr;
+          }
+          if (submitErr?.code === "SEND_UNCONFIRMED") throw submitErr;
+          // An unexpected error after entering submit is not evidence of
+          // non-submission. Keep the journal and require reconciliation.
+          throw Object.assign(new Error("Submit outcome unknown; automatic retry forbidden"), {
+            code: "SEND_UNCONFIRMED", cause: submitErr,
+          });
+        }
+        return { journalFailed: false };
+      }, {
+        isNewConversation: !restoreUrl,
+        signal,
+        now: deps.staggerNow,
+        sleep: deps.staggerSleep,
+        random: deps.random || Math.random,
+      });
+      if (submission.journalFailed) {
+        return withTerminalStatus({
+          status: "needs_human",
+          text: "",
+          reason: "journal_unwritable",
+          evidence: { message: submission.intentError?.message || String(submission.intentError) },
+          conversationUrl,
+          browser: {
+            pid: recovery.chrome?.pid ?? null,
+            port: recovery.chrome?.port ?? null,
+            mode,
+            reused: recovery.action === "ADOPT",
+          },
+          elapsedMs: Date.now() - startTime,
+        });
       }
       submitted = true;
       if (signal?.aborted) {

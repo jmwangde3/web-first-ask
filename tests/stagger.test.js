@@ -1,126 +1,136 @@
-// tests/stagger.test.js
 import assert from "node:assert/strict";
 import test from "node:test";
-import { computeStaggerDelay, resetStaggerQueues, waitForSendSlot } from "../src/browser/stagger.js";
+import { computeStaggerDelay, resetStaggerQueues, withSendSlot } from "../src/browser/stagger.js";
 
-test.beforeEach(() => {
-  resetStaggerQueues();
-});
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => { resolve = r; });
+  return { promise, resolve };
+}
 
-test("stagger: computeStaggerDelay returns uniform jitter between 3000ms and 5000ms", () => {
-  for (let i = 0; i < 50; i++) {
-    const delay = computeStaggerDelay(3000, 5000, Math.random);
-    assert.ok(delay >= 3000 && delay <= 5000, `Delay ${delay} out of range`);
-  }
+function clock() {
+  let value = 10000;
+  return {
+    now: () => value,
+    sleep: async (ms) => { value += ms; },
+    random: () => 0.5,
+  };
+}
+
+test.beforeEach(() => resetStaggerQueues());
+
+test("stagger: inclusive integer range and fixed test samples", () => {
   assert.equal(computeStaggerDelay(3000, 5000, () => 0), 3000);
   assert.equal(computeStaggerDelay(3000, 5000, () => 0.5), 4000);
+  assert.equal(computeStaggerDelay(3000, 5000, () => 0.999999), 5000);
   assert.equal(computeStaggerDelay(3000, 5000, () => 1), 5000);
 });
 
-test("stagger: same provider calls are staggered sequentially by [3s, 5s]", async () => {
-  let virtualTime = 10000;
-  const sleeps = [];
-
-  const fakeNow = () => virtualTime;
-  const fakeSleep = async (ms) => {
-    sleeps.push(ms);
-    virtualTime += ms;
-  };
-
-  // 第 1 个新会话立即放行
-  const p1 = await waitForSendSlot("chatgpt", {
-    isNewConversation: true,
-    now: fakeNow,
-    sleep: fakeSleep,
-    random: () => 0.5, // 4000ms
-  });
-  assert.equal(p1.waitedMs, 0);
-
-  // 第 2 个新会话同 provider 并发，应等待 4000ms
-  const p2 = await waitForSendSlot("chatgpt", {
-    isNewConversation: true,
-    now: fakeNow,
-    sleep: fakeSleep,
-    random: () => 0.5, // 4000ms
-  });
-  assert.equal(p2.waitedMs, 4000);
-  assert.equal(sleeps.length, 1);
-  assert.equal(sleeps[0], 4000);
+test("stagger: concurrent sends wait after actual previous submit, not an old reservation", async () => {
+  const c = clock();
+  const firstEntered = deferred();
+  const firstDone = deferred();
+  const times = [];
+  const a = withSendSlot("chatgpt", async () => {
+    firstEntered.resolve();
+    await firstDone.promise;
+    times.push(c.now());
+  }, c);
+  await firstEntered.promise;
+  const b = withSendSlot("chatgpt", () => times.push(c.now()), c);
+  const d = withSendSlot("chatgpt", () => times.push(c.now()), c);
+  await c.sleep(9000); // first actual click is delayed past any old reservations
+  assert.deepEqual(times, []);
+  firstDone.resolve();
+  await Promise.all([a, b, d]);
+  assert.deepEqual(times, [19000, 23000, 27000]);
 });
 
-test("stagger: different providers run independently without waiting each other", async () => {
-  let virtualTime = 10000;
-  const fakeNow = () => virtualTime;
-  const fakeSleep = async (ms) => { virtualTime += ms; };
-
-  // chatgpt 启动
-  const c1 = await waitForSendSlot("chatgpt", {
-    isNewConversation: true,
-    now: fakeNow,
-    sleep: fakeSleep,
-    random: () => 0.5,
-  });
-  assert.equal(c1.waitedMs, 0);
-
-  // gemini 在同一时间启动，跨 provider 零等待
-  const g1 = await waitForSendSlot("gemini", {
-    isNewConversation: true,
-    now: fakeNow,
-    sleep: fakeSleep,
-    random: () => 0.5,
-  });
-  assert.equal(g1.waitedMs, 0);
+test("stagger: different providers do not share the gate; existing conversation bypasses it", async () => {
+  const c = clock();
+  const entered = deferred();
+  const done = deferred();
+  const first = withSendSlot("chatgpt", async () => {
+    entered.resolve();
+    await done.promise;
+  }, c);
+  await entered.promise;
+  assert.equal(await withSendSlot("gemini", () => c.now(), c), 10000);
+  assert.equal(await withSendSlot("chatgpt", () => c.now(), { ...c, isNewConversation: false }), 10000);
+  done.resolve();
+  await first;
 });
 
-test("stagger: existing conversation bypasses stagger", async () => {
-  let virtualTime = 10000;
-  let slept = false;
-  const res = await waitForSendSlot("chatgpt", {
-    isNewConversation: false, // 续聊
-    now: () => virtualTime,
-    sleep: async () => { slept = true; },
+test("stagger: cancelling a middle queued ticket never lets a successor overtake the active send", async () => {
+  const c = clock();
+  const entered = deferred();
+  const done = deferred();
+  const controller = new AbortController();
+  let sent = false;
+  const first = withSendSlot("gemini", async () => {
+    entered.resolve();
+    await done.promise;
+  }, c);
+  await entered.promise;
+  const second = withSendSlot("gemini", () => assert.fail("cancelled ticket submitted"), {
+    ...c, signal: controller.signal,
   });
-  assert.equal(res.waitedMs, 0);
-  assert.equal(slept, false);
+  const third = withSendSlot("gemini", () => { sent = true; return c.now(); }, c);
+  controller.abort();
+  await assert.rejects(second, { code: "CANCELLED" });
+  assert.equal(sent, false);
+  done.resolve();
+  await first;
+  assert.equal(await third, 14000);
 });
 
-test("stagger: abort signal cancels waiting", async () => {
+test("stagger: abort during head wait releases the gate without creating a new reservation", async () => {
+  const c = clock();
+  const controller = new AbortController();
+  const waiting = deferred();
+  const never = deferred();
+  await withSendSlot("chatgpt", () => null, c);
+  const cancelled = withSendSlot("chatgpt", () => assert.fail("cancelled ticket submitted"), {
+    ...c, signal: controller.signal,
+    sleep: async () => { waiting.resolve(); await never.promise; },
+  });
+  await waiting.promise;
+  const next = withSendSlot("chatgpt", () => c.now(), c);
+  controller.abort();
+  await assert.rejects(cancelled, { code: "CANCELLED" });
+  assert.equal(await next, 14000);
+  never.resolve();
+});
+
+test("stagger: an uncertain submit still imposes spacing, and pre-abort cannot send", async () => {
+  const c = clock();
+  await assert.rejects(withSendSlot("chatgpt", () => {
+    throw Object.assign(new Error("unknown"), { code: "SEND_UNCONFIRMED" });
+  }, c), { code: "SEND_UNCONFIRMED" });
+  assert.equal(await withSendSlot("chatgpt", () => c.now(), c), 14000);
   const controller = new AbortController();
   controller.abort();
-  await assert.rejects(
-    () => waitForSendSlot("chatgpt", {
-      isNewConversation: true,
-      signal: controller.signal,
-      sleep: async () => {},
-    }),
-    (err) => err?.code === "CANCELLED"
-  );
+  await assert.rejects(withSendSlot("chatgpt", () => assert.fail("cancelled ticket submitted"), {
+    ...c, signal: controller.signal,
+  }), { code: "CANCELLED" });
 });
 
-test("stagger: an aborted caller does not jam the provider queue", async () => {
-  let virtualTime = 10000;
-  const fakeNow = () => virtualTime;
-  const fakeSleep = async (ms) => { virtualTime += ms; };
-
-  const aborter = new AbortController();
-  aborter.abort();
-  await assert.rejects(
-    () => waitForSendSlot("gemini", {
-      isNewConversation: true,
-      now: fakeNow,
-      sleep: fakeSleep,
-      random: () => 0.5,
-      signal: aborter.signal,
-    }),
-    (err) => err?.code === "CANCELLED"
-  );
-
-  // 后续同 provider 请求仍能立即排期（队列未被前一个 abort 卡死）
-  const next = await waitForSendSlot("gemini", {
-    isNewConversation: true,
-    now: fakeNow,
-    sleep: fakeSleep,
-    random: () => 0.5,
-  });
-  assert.equal(next.waitedMs, 0);
+test("stagger: abort after submit starts does not release the gate prematurely", async () => {
+  const c = clock();
+  const entered = deferred();
+  const done = deferred();
+  const controller = new AbortController();
+  let sent = false;
+  const first = withSendSlot("chatgpt", async () => {
+    entered.resolve();
+    await done.promise;
+  }, { ...c, signal: controller.signal });
+  await entered.promise;
+  const next = withSendSlot("chatgpt", () => { sent = true; return c.now(); }, c);
+  controller.abort();
+  await Promise.resolve();
+  assert.equal(sent, false);
+  done.resolve();
+  await first;
+  assert.equal(await next, 14000);
 });

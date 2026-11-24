@@ -232,6 +232,9 @@ test("T1: onSendIntent throws -> journal_unwritable, countsForCooldown false", a
     openTab: async () => ({ targetId: "target-1", sessionId: "session-1" }),
     waitForEditor: async () => true,
     readTurnState: async () => ({ userTurns: 0, answerTurns: 0 }),
+    // onSendIntent 现位于发送门闩内（typePrompt 之后、submit 之前）：需提供这两个桩。
+    typePrompt: async () => ({ typedChars: 5, replacedChars: 0 }),
+    submitTurn: async () => {},
   };
 
   const result = await runCdpTurn({
