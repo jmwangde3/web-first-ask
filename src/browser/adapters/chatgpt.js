@@ -4,6 +4,11 @@ export const editorSelector = '#prompt-textarea, div.ProseMirror[contenteditable
 // 真机核实（2026-11-24）：生成中的停止按钮 aria-label 是「停止」（中文 UI），
 // 既没有 data-testid="stop-button" 也不在 <main> 内；旧选择器导致 stopVisible 恒为 false。
 export const stopSelector = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"], button[aria-label="Stop"], button[aria-label="停止"]';
+
+// 三方裁决（2026-11-25，代码任务3 第七轮 3:0）：ChatGPT 的完成必须由正面信号判定。
+// 停止按钮已退出完成判定（实测：生成期 getBoundingClientRect 为 0x0，且回答结束后 45 秒
+// 仍未翻回发送箭头，既不能判完成也不能做活动否决）。
+export const requiresCompletionActions = true;
 export const sendSelector = 'form:has([contenteditable="true"], textarea) button[type="submit"], button[data-testid="send-button"], button[type="submit"][aria-label="发送"], button[type="submit"][aria-label="Send"]';
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
@@ -138,6 +143,23 @@ export function buildReadStateJs() {
     }
   }
 
+  // 正面完成信号（2026-11-25 三方 3:0，含 3 次真机 400ms 逐帧实测）：
+  // 以最后一条 assistant 的 h4 为锚点，检查其文档序之后是否出现动作栏。
+  // - 不判可见性：已完成回答的动作栏实测可为 0x0 或 opacity:0。
+  // - 不用全局计数：用户消息也挂动作栏，提交后约 2 秒即 +1（cp-2 t=2026）。
+  // - 锚点必须排除「你/You」，否则用户自己的动作栏会给出约 1.36 秒的假完成窗口。
+  const actionEls = [
+    ...[...document.querySelectorAll(".turn-action-controls")].filter((el) => el.querySelector("button")),
+    ...document.querySelectorAll('button[data-testid="copy-turn-action-button"]'),
+  ];
+  let answerActionsVisible = null;
+  if (lastH) {
+    answerActionsVisible = actionEls.some((el) => {
+      const rel = lastH.compareDocumentPosition(el);
+      return rel !== 0 && !(rel & Node.DOCUMENT_POSITION_DISCONNECTED) && Boolean(rel & Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+  }
+
   const ed = document.querySelector(${JSON.stringify(editorSelector)});
   const editorEmpty = ed ? ((("value" in ed) ? ed.value : (ed.innerText || ed.textContent || "")).trim() === "") : null;
 
@@ -189,6 +211,7 @@ export function buildReadStateJs() {
     userTurns,
     answerTurns,
     answerText,
+    answerActionsVisible,
     stopVisible,
     editorEmpty,
     title,

@@ -677,12 +677,15 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   const startTime = now();
   let lastProgressAt = startTime;
   let hasAcked = false;
-  let sawCurrentAnswer = false;
+  let lastBelongsToCurrentTurn = false;
   let lastAnswerChars = 0;
   let lastAnswerText = "";
   let lastState = null;
   let stopVisibleSince = null;
   let unresolvedSince = null;
+  // 三方裁决（2026-11-25 第七轮 3:0）：ChatGPT 的完成一律要求正面信号，
+  // 停止按钮不参与完成判定（实测 0x0 且回答结束后长期不翻转）。
+  const requiresActions = adapter.requiresCompletionActions === true;
 
   const challengePattern = adapter.turnChallengeTitlePattern || adapter.challengeTitlePattern || /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
@@ -697,7 +700,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       return {
         status: "needs_human",
         reason: "hard_timeout",
-        text: sawCurrentAnswer ? (lastState?.answerText || "") : "",
+        text: lastBelongsToCurrentTurn ? (lastState?.answerText || "") : "",
         elapsedMs,
         evidence: buildEvidence(lastState, now() - lastProgressAt),
       };
@@ -705,6 +708,20 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 
     const state = await readTurnState(cdp, sessionId, adapter);
     lastState = state;
+
+    // 真机证据（2026-11-24）：续聊时 userTurns 已+1 但 answerTurns 未增，页面唯一文本是上一轮
+    // 旧答案（smoke-actions2: answerTurns=1, 20575 字符旧答案却返回 completed）。
+    // 本轮新答案判定：轮次增加，或（原地覆写时）文本相对基线发生变化。文本必须非空。
+    // 三方 3:0（2026-11-25）：改为每轮采样即时重算，不用粘滞标志；轮次回退或归属不明时
+    // 立即失去候选资格，终态分支不得回退到历史正文。
+    const currentAnswerText = (state.answerText || "").trim();
+    const baseText = String(baselineAnswerText || "").trim();
+    const isNewTurn = state.answerTurns > baselineAnswerTurns;
+    // 仅在显式提供基线文本时才用文本变化判定（覆盖原地覆写）；未提供时不可凭任意非空历史文本判新，
+    // 否则会破坏 pre-ACK 的 rate-limit 快速失败等既有语义。
+    const textChanged = baseText ? currentAnswerText !== baseText : false;
+    const belongs = Boolean(currentAnswerText) && (isNewTurn || textChanged);
+    lastBelongsToCurrentTurn = belongs;
 
     if (state.stopVisible) {
       if (stopVisibleSince === null) stopVisibleSince = now();
@@ -720,30 +737,18 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       return {
         status: "needs_human",
         reason: "human_verification_required",
-        text: sawCurrentAnswer ? (state.answerText || "") : "",
+        text: belongs ? (state.answerText || "") : "",
         elapsedMs: now() - startTime,
         evidence: buildEvidence(state, now() - lastProgressAt),
       };
     }
 
-    const currentAnswerText = (state.answerText || "").trim();
-    // 真机证据（2026-11-24）：续聊时 userTurns 已+1 但 answerTurns 未增，页面唯一文本是上一轮
-    // 旧答案（smoke-actions2: answerTurns=1, 20575 字符旧答案却返回 completed）。
-    // 本轮新答案判定：轮次增加，或（原地覆写时）文本相对基线发生变化。文本必须非空。
-    const baseText = String(baselineAnswerText || "").trim();
-    const isNewTurn = state.answerTurns > baselineAnswerTurns;
-    // 仅在显式提供基线文本时才用文本变化判定（覆盖原地覆写）；未提供时不可凭任意非空历史文本判新，
-    // 否则会破坏 pre-ACK 的 rate-limit 快速失败等既有语义。
-    const textChanged = baseText ? currentAnswerText !== baseText : false;
-    if (currentAnswerText && (isNewTurn || textChanged)) {
-      sawCurrentAnswer = true;
-    }
     // Tier 1 (pre-ACK): only fatal rate-limit fast-fails, to avoid 30s send_unconfirmed dead-wait
-    if (state.pageError?.reason === "provider_rate_limited" && !sawCurrentAnswer) {
+    if (state.pageError?.reason === "provider_rate_limited" && !belongs) {
       return {
         status: "needs_human",
         reason: "provider_rate_limited",
-        text: sawCurrentAnswer ? (state.answerText || "") : "",
+        text: belongs ? (state.answerText || "") : "",
         elapsedMs: now() - startTime,
         evidence: buildEvidence(state, now() - lastProgressAt),
       };
@@ -761,7 +766,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
           return {
             status: "stalled",
         reason: "send_unconfirmed",
-        text: sawCurrentAnswer ? (state.answerText || "") : "",
+        text: belongs ? (state.answerText || "") : "",
             elapsedMs: now() - startTime,
             evidence: buildEvidence(state, now() - lastProgressAt),
           };
@@ -772,11 +777,11 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     }
 
     // Tier 2 (post-ACK): all page errors, still protecting a current-turn answer
-    if (state.pageError && !sawCurrentAnswer) {
+    if (state.pageError && !belongs) {
       return {
         status: "needs_human",
         reason: state.pageError.reason,
-        text: sawCurrentAnswer ? (state.answerText || "") : "",
+        text: belongs ? (state.answerText || "") : "",
         elapsedMs: now() - startTime,
         evidence: buildEvidence(state, now() - lastProgressAt),
       };
@@ -791,49 +796,73 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       unresolvedSince = null;
     }
 
-    if (now() - lastProgressAt >= stallTimeoutMs) {
-      return {
-        status: "stalled",
-        reason: "no_progress",
-        text: sawCurrentAnswer ? (state.answerText || "") : "",
-        elapsedMs: now() - startTime,
-        evidence: buildEvidence(state, now() - lastProgressAt),
-      };
-    }
-
-    const hasAnswer = (state.answerText || "").trim().length > 0;
+    const hasAnswer = currentAnswerText.length > 0;
     const settled = (now() - lastProgressAt) >= settleMs;
     const stopVisibleForMs = stopVisibleSince === null ? 0 : now() - stopVisibleSince;
     const stopGone = !state.stopVisible;
     const stopDegraded = state.stopVisible && stopVisibleForMs >= stopGraceMs;
-    // 若 adapter 提供回答完成标记（如 Gemini 的 message-actions），它必须可见才算完成。
+    // 若 adapter 提供回答完成标记（如 Gemini 的 message-actions / ChatGPT 的动作栏），
+    // 它必须为 true 才算完成。对声明 requiresCompletionActions 的 provider，字段缺失
+    // 一律视为"无正面信号"（不得当作 true，否则等于没有门禁）。
     // 真机证据（2026-11-24）：Gemini 长思考暂停时停止按钮会消失，仅靠 stopGone 会把
     // 只输出了 18 字符的回答判为完成，而完整回答（20575 字符）要几十秒后才继续生成。
-    const actionsDone = state.answerActionsVisible === null || state.answerActionsVisible === undefined
-      ? true
-      : state.answerActionsVisible === true;
-    const actionsGraceMs = 180000;
-    const actionsStale = !actionsDone && (now() - lastProgressAt) >= actionsGraceMs;
+    const actionsDone = requiresActions
+      ? state.answerActionsVisible === true
+      : (state.answerActionsVisible === null || state.answerActionsVisible === undefined
+        ? true
+        : state.answerActionsVisible === true);
+    // 停止按钮只对未声明 requiresCompletionActions 的 provider 参与完成判定。
+    // ChatGPT 实测（2026-11-25，三次 400ms 逐帧）：生成期该按钮 getBoundingClientRect 为 0x0；
+    // 回答结束后 45 秒仍未翻回发送箭头。它既不能判完成，也不能做活动否决。
+    const stopGateSatisfied = requiresActions ? true : (stopGone || stopDegraded);
+
+    if (now() - lastProgressAt >= stallTimeoutMs) {
+      if (!requiresActions) {
+        return {
+          status: "stalled",
+          reason: "no_progress",
+          text: belongs ? (state.answerText || "") : "",
+          elapsedMs: now() - startTime,
+          evidence: buildEvidence(state, now() - lastProgressAt),
+        };
+      }
+      // ChatGPT（三方裁决 B@180，2026-11-25 3:0）：正文为空说明仍在思考，等到 hardTimeout；
+      // 正文非空且已归属本轮、却连续 stallTimeoutMs 仍拿不到正面信号 → 缺信号退出（非成功）。
+      // 绝不因超时把缺信号的正文标成 completed。
+      if (belongs && hasAnswer && !actionsDone) {
+        return {
+          status: "stalled",
+          reason: "no_completion_signal",
+          text: state.answerText || "",
+          elapsedMs: now() - startTime,
+          evidence: {
+            ...buildEvidence(state, now() - lastProgressAt),
+            completionSignalMissing: true,
+          },
+        };
+      }
+    }
 
     // 必须确认本轮产生了新答案，才允许 completed；否则旧答案会从各终态分支泄漏（裁决见 wfa-resume-bug-verdict.md）。
-    if (sawCurrentAnswer && hasAnswer && settled && (stopGone || stopDegraded) && (actionsDone || actionsStale)) {
+    if (belongs && hasAnswer && settled && stopGateSatisfied && actionsDone) {
       return {
         status: "completed",
-        reason: actionsStale
-          ? "completed_actions_unverified"
-          : (stopDegraded ? "completed_stop_signal_unreliable" : "completed"),
+        reason: !requiresActions && stopDegraded ? "completed_stop_signal_unreliable" : "completed",
         text: state.answerText,
         elapsedMs: now() - startTime,
         evidence: {
           ...buildEvidence(state, now() - lastProgressAt),
           stopVisibleForMs,
           stopSignalDegraded: stopDegraded,
-          actionsUnverified: actionsStale,
         },
       };
     }
 
-    const unresolvedCandidate = state.answerTurns > baselineAnswerTurns && stopGone && settled && !hasAnswer;
+    // ChatGPT（三方 3:0）：无正面信号的空正文不得靠 settle+grace 判 MESSAGE_SELECTOR_UNRESOLVED，
+    // 只有已取得本轮动作栏证据、正文仍提取不到时才走该分支。
+    const unresolvedCandidate = requiresActions
+      ? (state.answerTurns > baselineAnswerTurns && actionsDone && settled && !hasAnswer)
+      : (state.answerTurns > baselineAnswerTurns && stopGone && settled && !hasAnswer);
     if (unresolvedCandidate) {
       if (unresolvedSince === null) {
         unresolvedSince = now();
@@ -842,7 +871,14 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
         lastState = confirm;
         const confirmHasAnswer = (confirm.answerText || "").trim().length > 0;
         const confirmStopGone = !confirm.stopVisible;
-        const confirmCandidate = confirm.answerTurns > baselineAnswerTurns && confirmStopGone && confirmHasAnswer === false;
+        const confirmActionsDone = requiresActions
+          ? confirm.answerActionsVisible === true
+          : (confirm.answerActionsVisible === null || confirm.answerActionsVisible === undefined
+            ? true
+            : confirm.answerActionsVisible === true);
+        const confirmCandidate = requiresActions
+          ? (confirm.answerTurns > baselineAnswerTurns && confirmActionsDone && confirmHasAnswer === false)
+          : (confirm.answerTurns > baselineAnswerTurns && confirmStopGone && confirmHasAnswer === false);
         if (confirmCandidate) {
           return {
             status: "failed",

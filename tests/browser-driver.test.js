@@ -362,14 +362,15 @@ test("waitForCompletion: normal completion after settleMs and stop button disapp
         // Poll 3+: Stop button disappeared, text stable
         return {
           result: {
-            value: JSON.stringify({
-              userTurns: 1,
-              answerTurns: 1,
-              answerText: "function hello() { return 'world'; }",
-              stopVisible: false,
-              editorEmpty: true,
-              title: "ChatGPT",
-            }),
+              value: JSON.stringify({
+                userTurns: 1,
+                answerTurns: 1,
+                answerText: "function hello() { return 'world'; }",
+                answerActionsVisible: true,
+                stopVisible: false,
+                editorEmpty: true,
+                title: "ChatGPT",
+              }),
           },
         };
       }
@@ -455,6 +456,7 @@ test("waitForCompletion: continuously outputting does NOT trigger stalled within
               userTurns: 1,
               answerTurns: 1,
               answerText: "x".repeat(chars),
+              answerActionsVisible: true,
               stopVisible: virtualTime < 10000,
               editorEmpty: true,
               title: "ChatGPT",
@@ -482,19 +484,21 @@ test("waitForCompletion: continuously outputting does NOT trigger stalled within
   assert.notEqual(res.status, "stalled");
 });
 
-test("waitForCompletion: stalled with no_progress when text stops growing for stallTimeoutMs", async () => {
+test("waitForCompletion: ChatGPT 缺正面信号时按 B@180 返回 stalled/no_completion_signal", async () => {
   let virtualTime = 0;
 
   const mockCdp = {
     send: async (method) => {
       if (method === "Runtime.evaluate") {
-        // Output stuck, stop visible
+        // 正文冻住、动作栏始终不出现（ChatGPT 实测：停止按钮为 0x0 且结束后不翻转，
+        // 因此这里 stopVisible 无论真假都不参与判定）
         return {
           result: {
             value: JSON.stringify({
               userTurns: 1,
               answerTurns: 1,
               answerText: "Stuck token...",
+              answerActionsVisible: false,
               stopVisible: true,
               editorEmpty: true,
               title: "ChatGPT",
@@ -519,8 +523,79 @@ test("waitForCompletion: stalled with no_progress when text stops growing for st
   });
 
   assert.equal(res.status, "stalled");
-  assert.equal(res.reason, "no_progress");
+  assert.equal(res.reason, "no_completion_signal");
+  assert.equal(res.evidence.completionSignalMissing, true);
   assert.ok(res.elapsedMs >= 6000);
+});
+
+test("waitForCompletion: ChatGPT 停止按钮常驻不影响完成，以正面信号为准", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async () => ({
+      result: {
+        value: JSON.stringify({
+          userTurns: 1,
+          answerTurns: 1,
+          answerText: "Answer is complete.",
+          answerActionsVisible: true,
+          stopVisible: true, // 实测：回答结束后停止方块仍常驻，不得否决完成
+          editorEmpty: true,
+          title: "ChatGPT",
+        }),
+      },
+    }),
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    settleMs: 1000,
+    pollIntervalMs: 100,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "completed");
+  assert.equal(res.reason, "completed");
+  assert.equal(res.text, "Answer is complete.");
+});
+
+test("waitForCompletion: ChatGPT 续聊时轮次未增不得用历史正文判完成", async () => {
+  let virtualTime = 0;
+  const mockCdp = {
+    send: async () => ({
+      result: {
+        value: JSON.stringify({
+          userTurns: 2,
+          answerTurns: 1, // baseline 已是 1：新答案尚未出现
+          answerText: "OLD-ANSWER",
+          answerActionsVisible: true,
+          stopVisible: false,
+          editorEmpty: true,
+          title: "ChatGPT",
+        }),
+      },
+    }),
+  };
+
+  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+    baselineUserTurns: 1,
+    baselineAnswerTurns: 1,
+    settleMs: 500,
+    hardTimeoutMs: 5000,
+    pollIntervalMs: 100,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.notEqual(res.status, "completed");
+  assert.equal(res.status, "needs_human");
+  assert.equal(res.reason, "hard_timeout");
+  assert.equal(res.text, "");
 });
 
 test("waitForCompletion: triggers needs_human on challenges.cloudflare.com detection", async () => {
@@ -572,6 +647,7 @@ test("waitForCompletion: fail-closed with MESSAGE_SELECTOR_UNRESOLVED if answer 
               userTurns: 1,
               answerTurns: 1,
               answerText: "", // Empty text even though answer turn exists
+              answerActionsVisible: true,
               stopVisible: false,
               editorEmpty: true,
               title: "ChatGPT",
@@ -611,6 +687,7 @@ test("waitForCompletion: delayed first token during unresolvedGraceMs completes 
               userTurns: 1,
               answerTurns: 1,
               answerText: hasToken ? "ONE" : "",
+              answerActionsVisible: hasToken,
               stopVisible: false,
               editorEmpty: true,
               title: "ChatGPT",
@@ -656,6 +733,7 @@ test("waitForCompletion: true selector failure past settleMs + unresolvedGraceMs
               userTurns: 1,
               answerTurns: 1,
               answerText: "",
+              answerActionsVisible: true,
               stopVisible: false,
               editorEmpty: true,
               title: "ChatGPT",
@@ -713,7 +791,10 @@ test("waitForCompletion: stopVisible resets unresolvedGraceMs timer", async () =
     },
   };
 
-  const res = await waitForCompletion(mockCdp, "session-1", chatgptAdapter, {
+  // 本用例验证的是「停止按钮参与判定」的旧语义（未声明 requiresCompletionActions 的 provider）。
+  // ChatGPT 已按三方裁决退出该路径，故用同一个 adapter 关掉该标志来保留这条契约。
+  const legacyStopAdapter = { ...chatgptAdapter, requiresCompletionActions: false };
+  const res = await waitForCompletion(mockCdp, "session-1", legacyStopAdapter, {
     baselineUserTurns: 0,
     baselineAnswerTurns: 0,
     settleMs: 2000,
@@ -1061,6 +1142,7 @@ test("ChatGPT state with title 'ChatGPT', hasProseMirror true, hasChallenge true
               userTurns: 1,
               answerTurns: 1,
               answerText: "ChatGPT proceeds",
+              answerActionsVisible: true,
               stopVisible: false,
               editorEmpty: null,
               hasProseMirror: true,
@@ -1405,6 +1487,7 @@ test("waitForCompletion: does not abort on pageError if hasAnswer is already tru
             userTurns: 1,
             answerTurns: 1,
             answerText: "Here is the complete solution.",
+            answerActionsVisible: true,
             stopVisible: false,
             editorEmpty: true,
             pageError: {
@@ -1480,6 +1563,7 @@ test("waitForCompletion: current-turn answer blocks rate-limit fast-fail (answer
           userTurns: 2,
           answerTurns: 2, // baseline was 1, grew to 2 -> current turn answer!
           answerText: "Fresh current turn response",
+          answerActionsVisible: true,
           stopVisible: false,
           editorEmpty: true,
           pageError: {
