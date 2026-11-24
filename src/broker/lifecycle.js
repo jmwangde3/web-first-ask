@@ -91,46 +91,125 @@ export async function isInstanceAlive(record) {
   return false;
 }
 
+// Only ESRCH proves that the recorded process no longer exists.
+// Permission failures and unexpected probe errors do not permit reclamation.
+function instancePidConfirmedDead(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error?.code === "ESRCH";
+  }
+}
+
+// undefined: absent; null: malformed; object: valid owner record.
+async function readInstanceOwner(lockPath) {
+  let raw;
+
+  try {
+    raw = await fs.readFile(lockPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+
+  try {
+    const record = JSON.parse(raw);
+    if (!record ||
+        !Number.isSafeInteger(record.pid) ||
+        record.pid <= 0 ||
+        typeof record.instanceId !== "string" ||
+        !record.instanceId) {
+      return null;
+    }
+    return record;
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+function canReplaceInstanceOwner(owner) {
+  return owner === undefined ||
+    (owner !== null && instancePidConfirmedDead(owner.pid));
+}
+
 export async function acquireInstanceLock(home) {
   const { home: dir } = getBrokerPaths(home);
   const lockPath = path.join(dir, "broker.lock");
+
   await fs.mkdir(dir, { recursive: true });
+
+  // Fast rejection only. An observation made without the guard must
+  // never authorize a write, rename, or removal of the shared pathname.
+  const observed = await readInstanceOwner(lockPath);
+  if (!canReplaceInstanceOwner(observed)) return null;
+
+  // Reuse the existing crash-recoverable bakery protocol.
+  // Import lazily because turn-lock.js imports getBrokerPaths from here.
+  const { acquireTurnLock } = await import("./turn-lock.js");
+
+  let guard;
+  try {
+    guard = await acquireTurnLock(dir, "broker-instance", {
+      conversationId: "broker.lock",
+      timeoutMs: 5000,
+      pollIntervalMs: 10,
+    });
+  } catch (error) {
+    if (error?.code === "CONCURRENT_TURN_BUSY") return null;
+    throw error;
+  }
+
   const instanceId = randomUUID();
+  const temp = `${lockPath}.${process.pid}.${instanceId}.tmp`;
   const payload = JSON.stringify({ pid: process.pid, instanceId }) + "\n";
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const temp = `${lockPath}.${process.pid}.${instanceId}.tmp`;
-    try {
-      await fs.writeFile(temp, payload, { flag: "wx", mode: 0o600 });
-      await fs.link(temp, lockPath);
-      let released = false;
-      return {
-        instanceId,
-        async release() {
-          if (released) return;
-          released = true;
-          try {
-            const stored = JSON.parse(await fs.readFile(lockPath, "utf8"));
-            if (stored.instanceId === instanceId) await fs.rm(lockPath, { force: true });
-          } catch (error) {
-            if (error?.code !== "ENOENT") throw error;
+  try {
+    // The guarded observation is authoritative. Another contender may
+    // have published a live owner after our optimistic observation.
+    const current = await readInstanceOwner(lockPath);
+    if (!canReplaceInstanceOwner(current)) return null;
+
+    // Every contender must hold the same guard before publication.
+    // Therefore the absent/dead owner cannot be replaced by another
+    // contender between this check and the atomic publication.
+    await fs.writeFile(temp, payload, { flag: "wx", mode: 0o600 });
+    await fs.rename(temp, lockPath);
+
+    let released = false;
+
+    return {
+      instanceId,
+
+      async release() {
+        if (released) return;
+        released = true;
+
+        try {
+          const stored = await readInstanceOwner(lockPath);
+          if (stored?.instanceId !== instanceId ||
+              stored?.pid !== process.pid) {
+            return;
           }
-        },
-      };
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      if (attempt === 1) return null;
-      let old;
-      try { old = JSON.parse(await fs.readFile(lockPath, "utf8")); } catch { old = null; }
-      if (old && pidAlive(old.pid)) return null;
-      // A second process may recover the stale lock first; never remove a live successor.
-      let latest;
-      try { latest = JSON.parse(await fs.readFile(lockPath, "utf8")); } catch { latest = null; }
-      if (latest && pidAlive(latest.pid)) return null;
-      await fs.rm(lockPath, { force: true }).catch(() => {});
-    } finally {
+
+          // A conforming contender cannot replace a live owner's record.
+          // Until this unlink completes, our PID prevents reclamation.
+          // Once it completes, this release never touches lockPath again.
+          await fs.rm(lockPath, { force: true });
+        } catch (error) {
+          // Permit an explicit retry after an actual filesystem failure.
+          released = false;
+          throw error;
+        }
+      },
+    };
+  } finally {
+    try {
       await fs.rm(temp, { force: true }).catch(() => {});
+    } finally {
+      await guard.release();
     }
   }
-  return null;
 }
