@@ -766,6 +766,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       answerTurns: 0,
       answerText: "",
       answerActionsVisible: null,
+      pendingCount: 0,
       stopVisible: false,
       editorEmpty: false,
       title: "",
@@ -798,6 +799,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       answerActionsVisible: parsed.answerActionsVisible === null || parsed.answerActionsVisible === undefined
         ? null
         : Boolean(parsed.answerActionsVisible),
+      pendingCount: Number.isInteger(parsed.pendingCount) ? parsed.pendingCount : 0,
       stopVisible: Boolean(parsed.stopVisible),
       editorEmpty: parsed.editorEmpty !== null && parsed.editorEmpty !== undefined ? Boolean(parsed.editorEmpty) : null,
       title: typeof parsed.title === "string" ? parsed.title : "",
@@ -815,6 +817,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       answerTurns: 0,
       answerText: "",
       answerActionsVisible: null,
+      pendingCount: 0,
       stopVisible: false,
       editorEmpty: null,
       title: "",
@@ -846,6 +849,8 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 } = {}) {
   const startTime = now();
   let lastProgressAt = startTime;
+  let lastActivityAt = startTime;
+  let lastPendingCount = 0;
   let hasAcked = false;
   let lastBelongsToCurrentTurn = false;
   let lastAnswerChars = 0;
@@ -929,6 +934,8 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       if (ackConfirmed) {
         hasAcked = true;
         lastProgressAt = now();
+        lastActivityAt = now();
+        lastPendingCount = Number.isInteger(state.pendingCount) ? state.pendingCount : 0;
         lastAnswerText = state.answerText || "";
         lastAnswerChars = lastAnswerText.length;
       } else {
@@ -959,18 +966,33 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 
     const currentText = state.answerText || "";
     const currentChars = currentText.length;
-    if (currentChars > lastAnswerChars || (currentText && currentText !== lastAnswerText)) {
+    const currentPendingCount = !requiresActions && Number.isInteger(state.pendingCount)
+      ? state.pendingCount
+      : 0;
+    const textProgressed = currentChars > lastAnswerChars || (currentText && currentText !== lastAnswerText);
+    const pendingProgressed = !requiresActions && currentPendingCount > 0 && currentPendingCount !== lastPendingCount;
+    if (textProgressed || pendingProgressed) {
       lastProgressAt = now();
-      lastAnswerChars = currentChars;
-      lastAnswerText = currentText;
+      lastActivityAt = now();
+      if (textProgressed) {
+        lastAnswerChars = currentChars;
+        lastAnswerText = currentText;
+      }
       unresolvedSince = null;
     }
+    lastPendingCount = currentPendingCount;
 
-    const hasAnswer = currentAnswerText.length > 0;
-    const settled = (now() - lastProgressAt) >= settleMs;
     const stopVisibleForMs = stopVisibleSince === null ? 0 : now() - stopVisibleSince;
     const stopGone = !state.stopVisible;
     const stopDegraded = state.stopVisible && stopVisibleForMs >= stopGraceMs;
+    if (!requiresActions && (currentPendingCount > 0 || (state.stopVisible && !stopDegraded))) {
+      lastActivityAt = now();
+    }
+
+    const hasAnswer = currentAnswerText.length > 0;
+    const settled = requiresActions
+      ? (now() - lastProgressAt) >= settleMs
+      : (now() - lastActivityAt) >= settleMs;
     // 若 adapter 提供回答完成标记（如 Gemini 的 message-actions / ChatGPT 的动作栏），
     // 它必须为 true 才算完成。对声明 requiresCompletionActions 的 provider，字段缺失
     // 一律视为"无正面信号"（不得当作 true，否则等于没有门禁）。

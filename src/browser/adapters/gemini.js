@@ -190,12 +190,15 @@ export function buildReadStateJs() {
   // 真机核实（2026-11-24）：生成中与思考暂停期间都读不到 message-actions，
   // 回答完整结束后才出现操作栏（copy/thumb/regenerate）。这是比停止按钮可靠的完成信号。
   let answerActionsVisible = null;
+  const pendingCount = last && typeof last.querySelectorAll === "function"
+    ? last.querySelectorAll("span.pending, p.pending").length
+    : 0;
   if (last) {
     const actions = last.querySelector("message-actions");
     if (actions) {
       const ar = typeof actions.getBoundingClientRect === "function" ? actions.getBoundingClientRect() : null;
       answerActionsVisible = ar ? ar.width > 0 && ar.height > 0 : true;
-    } else {
+    } else if (pendingCount > 0) {
       answerActionsVisible = false;
     }
   }
@@ -261,6 +264,7 @@ export function buildReadStateJs() {
     answerTurns,
     answerText,
     answerActionsVisible,
+    pendingCount,
     stopVisible,
     editorEmpty,
     title,
