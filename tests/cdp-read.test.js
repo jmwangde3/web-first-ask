@@ -845,3 +845,136 @@ test("top-level wfa send aliases cdp ask --no-wait and top-level read aliases cd
   assert.equal(readCode, 0);
   assert.equal(JSON.parse(readOut.output).status, "unconfirmed");
 });
+
+test("G3 R2: readConversation resumes stalled turn read-only via conversationUrl and completes with zero type/submit", async () => {
+  const cdp = makeCdp({
+    targets: [{ targetId: "target-stalled-1", type: "page", url: "https://chatgpt.com/c/stalled-resume" }],
+  });
+  let virtualTime = 0;
+  let pollCalls = 0;
+  let typeCalls = 0;
+  let submitCalls = 0;
+  let openCalls = 0;
+
+  const result = await readConversation({
+    home: "/tmp/wfa-read-stalled-resume",
+    taskId: "turn-stalled-resume",
+    wait: 5000,
+    deps: {
+      now: () => virtualTime,
+      sleep: async (ms) => { virtualTime += ms; },
+      resultStore: {
+        readResult: async () => ({
+          turnId: "turn-stalled-resume",
+          provider: "chatgpt",
+          state: "stalled",
+          conversationUrl: "https://chatgpt.com/c/stalled-resume",
+          targetId: "target-stalled-1",
+          text: "partial",
+        }),
+      },
+      discoverBroker: async () => ({ host: "127.0.0.1", port: 1234, token: "token" }),
+      getTurn: async () => ({
+        status: 200,
+        json: {
+          id: "turn-stalled-resume",
+          provider: "chatgpt",
+          state: "stalled",
+          conversationUrl: "https://chatgpt.com/c/stalled-resume",
+          targetId: "target-stalled-1",
+        },
+      }),
+      recoverBrowser: async () => ({ action: "ADOPT", chrome: { port: 9222 } }),
+      connectCdp: async () => cdp,
+      driver: {
+        listPageTargets: defaultDriver.listPageTargets,
+        attachTab: async (_cdp, targetId) => ({ targetId, sessionId: `session-${targetId}` }),
+        openTab: async () => {
+          openCalls += 1;
+          return { targetId: "unexpected-new", sessionId: "unexpected-session" };
+        },
+        typePrompt: async () => {
+          typeCalls += 1;
+          return { typedChars: 0, replacedChars: 0 };
+        },
+        submitTurn: async () => {
+          submitCalls += 1;
+        },
+        readTurnState: async () => {
+          pollCalls += 1;
+          if (pollCalls === 1) {
+            return {
+              userTurns: 1,
+              answerTurns: 1,
+              answerText: "partial",
+              answerActionsVisible: false,
+              stopVisible: true,
+            };
+          }
+          return {
+            userTurns: 1,
+            answerTurns: 1,
+            answerText: "Completed full answer after stalled",
+            answerActionsVisible: true,
+            stopVisible: false,
+          };
+        },
+      },
+    },
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.state, "completed");
+  assert.equal(result.text, "Completed full answer after stalled");
+  assert.equal(typeCalls, 0);
+  assert.equal(submitCalls, 0);
+  assert.equal(openCalls, 0);
+  assert.equal(cdp.calls.some((call) => String(call.method).startsWith("Input.")), false);
+});
+
+test("G3 R2.6: readConversation does not open a tab when stalled turn has conversationUrl but no matching tab", async () => {
+  const cdp = makeCdp({ targets: [] });
+  let openCalls = 0;
+  const result = await readConversation({
+    home: "/tmp/wfa-read-stalled-missing",
+    taskId: "turn-stalled-missing",
+    wait: 5000,
+    deps: {
+      resultStore: {
+        readResult: async () => ({
+          turnId: "turn-stalled-missing",
+          provider: "chatgpt",
+          state: "stalled",
+          conversationUrl: "https://chatgpt.com/c/stalled-missing",
+          targetId: "gone-stalled-target",
+        }),
+      },
+      discoverBroker: async () => ({ host: "127.0.0.1", port: 1234, token: "token" }),
+      getTurn: async () => ({
+        status: 200,
+        json: {
+          id: "turn-stalled-missing",
+          provider: "chatgpt",
+          state: "stalled",
+          conversationUrl: "https://chatgpt.com/c/stalled-missing",
+          targetId: "gone-stalled-target",
+        },
+      }),
+      recoverBrowser: async () => ({ action: "ADOPT", chrome: { port: 9222 } }),
+      connectCdp: async () => cdp,
+      driver: {
+        listPageTargets: defaultDriver.listPageTargets,
+        openTab: async () => {
+          openCalls += 1;
+          return { targetId: "unexpected-new", sessionId: "unexpected-session" };
+        },
+      },
+    },
+  });
+
+  assert.equal(openCalls, 0);
+  assert.equal(result.status, "tab_missing");
+  assert.equal(result.state, "tab_missing");
+  assert.equal(result.reason, "SESSION_TAB_MISSING");
+  assert.equal(cdp.calls.some((call) => call.method === "Target.createTarget"), false);
+});

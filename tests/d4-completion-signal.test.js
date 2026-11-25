@@ -109,6 +109,7 @@ test("gemini pending 存在时不得 completed", async () => {
   const res = await waitForCompletion(mockCdp, "session-1", geminiAdapter, {
     baselineUserTurns: 0,
     baselineAnswerTurns: 0,
+    stallTimeoutMs: 180000,
     pollIntervalMs: 500,
     now: () => virtualTime,
     sleep: async (ms) => {
@@ -140,6 +141,7 @@ test("gemini pending 冻结后 180s 退出 stalled", async () => {
   const res = await waitForCompletion(mockCdp, "session-2", geminiAdapter, {
     baselineUserTurns: 0,
     baselineAnswerTurns: 0,
+    stallTimeoutMs: 180000,
     pollIntervalMs: 500,
     now: () => virtualTime,
     sleep: async (ms) => {
@@ -170,6 +172,7 @@ test("gemini pending 清零后正常完成", async () => {
   const res = await waitForCompletion(mockCdp, "session-3", geminiAdapter, {
     baselineUserTurns: 0,
     baselineAnswerTurns: 0,
+    stallTimeoutMs: 180000,
     pollIntervalMs: 500,
     now: () => virtualTime,
     sleep: async (ms) => {
@@ -202,6 +205,7 @@ test("gemini 快回答（事实 M）", async () => {
   const res = await waitForCompletion(mockCdp, "session-4", geminiAdapter, {
     baselineUserTurns: 0,
     baselineAnswerTurns: 0,
+    stallTimeoutMs: 180000,
     pollIntervalMs: 500,
     now: () => virtualTime,
     sleep: async (ms) => {
@@ -241,6 +245,7 @@ test("gemini pending 变化刷新 stall 计时", async () => {
   const res = await waitForCompletion(mockCdp, "session-5", geminiAdapter, {
     baselineUserTurns: 0,
     baselineAnswerTurns: 0,
+    stallTimeoutMs: 180000,
     pollIntervalMs: 500,
     now: () => virtualTime,
     sleep: async (ms) => {
@@ -272,6 +277,7 @@ test("chatgpt 行为零变化", async () => {
   const res = await waitForCompletion(mockCdp, "session-6", chatgptAdapter, {
     baselineUserTurns: 0,
     baselineAnswerTurns: 0,
+    stallTimeoutMs: 180000,
     pollIntervalMs: 500,
     now: () => virtualTime,
     sleep: async (ms) => {
@@ -301,4 +307,72 @@ test("chatgpt 行为零变化", async () => {
   assert.equal(res.evidence.lastProgressAgoMs, 4000);
   assert.equal(res.evidence.stopVisibleForMs, 4000);
   assert.equal(res.evidence.stopSignalDegraded, false);
+});
+
+test("G3 R2: 长思考正文冻结 5 分钟后恢复增长并出现完成信号 -> completed 且正文完整", async () => {
+  let virtualTime = 0;
+  const fullAnswer = "Initial thinking chunk...\nComplete long-thinking answer after 5 minutes!";
+
+  const mockCdp = createStateCdp(() => {
+    const resumed = virtualTime >= 300000;
+    const done = virtualTime >= 305000;
+    const answerText = done
+      ? fullAnswer
+      : (resumed ? "Initial thinking chunk...\nResuming..." : "Initial thinking chunk...");
+    return {
+      userTurns: 1,
+      answerTurns: 1,
+      answerText,
+      answerActionsVisible: done,
+      pendingCount: 0,
+      stopVisible: !done,
+      editorEmpty: true,
+      title: "ChatGPT",
+    };
+  });
+
+  const res = await waitForCompletion(mockCdp, "session-long-think", chatgptAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    pollIntervalMs: 1000,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "completed");
+  assert.equal(res.reason, "completed");
+  assert.equal(res.text, fullAnswer);
+  assert.equal(res.elapsedMs, 309000);
+});
+
+test("G3 R2: 永久断流正文与 pending 都不动，达到超时前退出 stalled 且不无限挂起", async () => {
+  let virtualTime = 0;
+
+  const mockCdp = createStateCdp(() => ({
+    userTurns: 1,
+    answerTurns: 1,
+    answerText: "Frozen partial stream",
+    answerActionsVisible: null,
+    pendingCount: 12,
+    stopVisible: false,
+    editorEmpty: true,
+    title: "Google Gemini",
+  }));
+
+  const res = await waitForCompletion(mockCdp, "session-perm-stall", geminiAdapter, {
+    baselineUserTurns: 0,
+    baselineAnswerTurns: 0,
+    pollIntervalMs: 1000,
+    now: () => virtualTime,
+    sleep: async (ms) => {
+      virtualTime += ms;
+    },
+  });
+
+  assert.equal(res.status, "stalled");
+  assert.equal(res.reason, "no_progress");
+  assert.equal(res.elapsedMs, 420000);
+  assert.ok(res.elapsedMs <= 900000);
 });

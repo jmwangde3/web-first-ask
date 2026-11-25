@@ -451,7 +451,8 @@ export async function readConversation({
 
       const terminalTurnResult = turnStateResult(lastTurnState, taskId);
       if (terminalTurnResult && terminalTurnResult.status !== "unconfirmed") {
-        if (terminalTurnResult.status === "stalled" || terminalTurnResult.status === "needs_user") {
+        if (terminalTurnResult.status === "needs_user" ||
+            (terminalTurnResult.status === "stalled" && !conversationUrl && !selectedTargetId)) {
           return { ...terminalTurnResult, elapsedMs: nowFn() - startTime };
         }
       }
@@ -483,17 +484,18 @@ export async function readConversation({
       if (cdp && !sessionId) {
         const targets = await listTargetsFn(cdp);
         const target = findMatchingTarget(targets, selectedTargetId, conversationUrl, resolvedProvider);
+        const effectiveNoReopen = noReopen || terminalTurnResult?.status === "stalled";
         if (target) {
           selectedTargetId = target.targetId;
           conversationUrl = conversationUrl || (normalizeConversationUrl(target.url, resolvedProvider) ? target.url : null);
           const attached = await attachTabFn(cdp, target.targetId, { timeoutMs });
           sessionId = attached.sessionId;
-        } else if (!openedOnce && conversationUrl && !noReopen) {
+        } else if (!openedOnce && conversationUrl && !effectiveNoReopen) {
           openedOnce = true;
           const opened = await openTabFn(cdp, conversationUrl, { timeoutMs });
           selectedTargetId = opened.targetId;
           sessionId = opened.sessionId;
-        } else if (noReopen || !conversationUrl) {
+        } else if (effectiveNoReopen || !conversationUrl) {
           return {
             status: "tab_missing",
             state: "tab_missing",

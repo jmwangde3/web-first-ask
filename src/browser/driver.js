@@ -840,7 +840,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   unresolvedGraceMs = 6000,
   stopGraceMs = 60000,
   hardTimeoutMs = 900000,
-  stallTimeoutMs = 180000,
+  stallTimeoutMs = 420000,
   ackTimeoutMs = 30000,
   pollIntervalMs = 500,
   now = () => Date.now(),

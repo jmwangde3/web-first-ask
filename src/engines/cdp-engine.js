@@ -173,7 +173,7 @@ export async function runCdpTurn({
   mode = "background",
   chromePath,
   settleMs = 4000,
-  stallTimeoutMs = 180000,
+  stallTimeoutMs = 420000,
   hardTimeoutMs = 900000,
   minIntervalMs,
   onWait,

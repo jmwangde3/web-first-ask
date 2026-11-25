@@ -553,14 +553,14 @@ async function handleAsk(argv, deps) {
   }
 
   let hardTimeoutMs = 900000;
-  let stallTimeoutMs = 180000;
+  let stallTimeoutMs = 420000;
   if (options.timeout !== undefined) {
     const timeoutSec = Number(options.timeout);
     if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
       throw new WfaError("INVALID_ARGUMENT", `Invalid --timeout: ${options.timeout}`);
     }
     hardTimeoutMs = timeoutSec * 1000;
-    stallTimeoutMs = Math.min(hardTimeoutMs, 180000);
+    stallTimeoutMs = Math.min(hardTimeoutMs, 420000);
   }
 
   let settleMs = 4000;
