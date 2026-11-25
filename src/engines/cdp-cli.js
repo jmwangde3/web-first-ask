@@ -10,7 +10,7 @@ import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
 import { sleep as defaultSleep } from "../util.js";
 import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
-import { ensureBroker, createTurn, waitForTurn } from "../broker/client.js";
+import { ensureBroker, createTurn, waitForTurn, waitForSubmission } from "../broker/client.js";
 import { spawnDetachedBroker } from "../broker/cli.js";
 import { stageCdpResponse as defaultStageCdpResponse } from "./cdp-stage.js";
 import { expandAttachmentInputs } from "../attachments.js";
@@ -122,7 +122,7 @@ Options:
   --settle <ms>              Answer stabilization window in milliseconds (default: 4000)
   --min-interval <ms>        Minimum interval between provider turns in milliseconds
   --no-stage                 Disable automatic file staging for code responses
-  --no-wait                  Return the turn handle immediately; poll with wfa read
+  --no-wait                  Return the turn handle immediately after submission is confirmed; poll with wfa read
   --url <url>                Conversation URL for wfa cdp read
   --task-id <id>             Broker turn ID for wfa cdp read
   --wait <seconds>           Read-only observation window (default: 0)
@@ -648,10 +648,44 @@ async function handleAsk(argv, deps) {
   }
 
   if (options["no-wait"]) {
+    let submittedTurn = created;
+
+    if (submittedTurn?.sendCommittedAt == null) {
+      const waitSubmissionFn = deps.waitForSubmission || waitForSubmission;
+
+      try {
+        submittedTurn = await waitSubmissionFn({
+          record,
+          turnId,
+          home,
+          timeoutMs: deps.submissionTimeoutMs ?? 60000,
+          deps,
+        });
+      } catch (error) {
+        const code = error?.code || "SUBMISSION_NOT_CONFIRMED";
+        const message = error?.message || String(error);
+        stderr.write(
+          `wfa: ${code}: ${message}; inspect with wfa read --task-id ${turnId} before retrying\n`
+        );
+        return { code: 1, error };
+      }
+    }
+
+    if (submittedTurn?.sendCommittedAt == null) {
+      const error = new WfaError(
+        "SUBMISSION_NOT_CONFIRMED",
+        `Turn ${turnId} did not expose sendCommittedAt`
+      );
+      stderr.write(
+        `wfa: ${error.code}: ${error.message}; inspect with wfa read --task-id ${turnId} before retrying\n`
+      );
+      return { code: 1, error };
+    }
+
     const handle = {
       id: turnId,
-      requestId: created?.requestId ?? requestId,
-      state: created?.state ?? "queued",
+      requestId: created?.requestId ?? submittedTurn?.requestId ?? requestId,
+      state: submittedTurn?.state ?? created?.state ?? "queued",
       poll: `wfa read --task-id ${turnId}`,
       provider,
     };

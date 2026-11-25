@@ -6,6 +6,7 @@ import * as defaultDriver from "../browser/driver.js";
 import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
 import * as defaultResultStore from "../broker/result-store.js";
+import * as defaultTurnStore from "../broker/turn-store.js";
 import { discoverBroker as defaultDiscoverBroker, getTurn as defaultGetTurn } from "../broker/client.js";
 import { sleep as defaultSleep } from "../util.js";
 
@@ -241,6 +242,7 @@ export async function readConversation({
 
   const effectiveHome = home || getHomeDir();
   const readResultFn = deps.resultStore?.readResult || deps.readResult || defaultResultStore.readResult;
+  const readTurnRecordFn = deps.turnStore?.readTurn || deps.readTurn || defaultTurnStore.readTurn;
   const discoverBrokerFn = deps.discoverBroker || defaultDiscoverBroker;
   const getTurnFn = deps.getTurn || defaultGetTurn;
   const recoverFn = deps.recoverBrowser || defaultRecoverBrowser;
@@ -254,6 +256,7 @@ export async function readConversation({
   const nowFn = deps.now || (() => Date.now());
 
   let resultRecord = null;
+  let persistedTurnRecord = null;
   let turn = null;
   let brokerRecord = null;
   let resolvedProvider = provider ? String(provider).toLowerCase() : null;
@@ -269,10 +272,18 @@ export async function readConversation({
     resolvedProvider = fromUrl;
   } else {
     resultRecord = await readResultFn(effectiveHome, taskId);
+    persistedTurnRecord = await readTurnRecordFn(effectiveHome, taskId);
+
     if (resolvedProvider && resultRecord?.provider &&
         resolvedProvider !== String(resultRecord.provider).toLowerCase()) {
       throw coded("INVALID_ARGUMENT", `Task ${taskId} belongs to ${resultRecord.provider}, not ${resolvedProvider}`);
     }
+
+    if (resolvedProvider && persistedTurnRecord?.provider &&
+        resolvedProvider !== String(persistedTurnRecord.provider).toLowerCase()) {
+      throw coded("INVALID_ARGUMENT", `Task ${taskId} belongs to ${persistedTurnRecord.provider}, not ${resolvedProvider}`);
+    }
+
     if (resultRecord?.state === "completed" &&
         typeof resultRecord.text === "string" && resultRecord.text.trim()) {
       return directResult(resultRecord);
@@ -283,27 +294,59 @@ export async function readConversation({
       if (brokerRecord) {
         const response = await getTurnFn(brokerRecord, taskId);
         initialTurnLookupDone = true;
+
         if (response?.status === 200 && response.json && typeof response.json === "object") {
           turn = response.json;
+        } else if (response?.status === 404 && persistedTurnRecord) {
+          // The durable record is authoritative for a known task even if a
+          // broker instance has not yet restored it into its in-memory map.
+          turn = persistedTurnRecord;
+        } else if (response?.status === 401 || response?.status >= 500) {
+          throw coded("BROKER_UNREACHABLE", `Broker cannot serve persisted turn ${taskId}`);
         }
       }
-    } catch {
+    } catch (error) {
       brokerRecord = null;
-      // A persisted result record can still provide a conversation locator
-      // after the broker has exited. No new broker is started by read.
+      if (persistedTurnRecord) {
+        throw coded(
+          "BROKER_UNREACHABLE",
+          `Persisted turn ${taskId} exists, but its broker is unreachable`,
+          error
+        );
+      }
     }
 
-    if (!turn && !resultRecord) {
+    if (!brokerRecord && persistedTurnRecord) {
+      throw coded(
+        "BROKER_UNREACHABLE",
+        `Persisted turn ${taskId} exists, but its broker is not running`
+      );
+    }
+
+    if (!turn && persistedTurnRecord && brokerRecord) {
+      turn = persistedTurnRecord;
+    }
+
+    if (!turn && !resultRecord && !persistedTurnRecord) {
       throw coded("TURN_NOT_FOUND", `No broker turn or persisted result exists for ${taskId}`);
     }
-    const taskProvider = turn?.provider || resultRecord?.provider;
+
+    const taskProvider = turn?.provider || persistedTurnRecord?.provider || resultRecord?.provider;
     if (resolvedProvider && taskProvider &&
         resolvedProvider !== String(taskProvider).toLowerCase()) {
       throw coded("INVALID_ARGUMENT", `Task ${taskId} belongs to ${taskProvider}, not ${resolvedProvider}`);
     }
     resolvedProvider = resolvedProvider || taskProvider || null;
-    conversationUrl = turn?.conversationUrl || resultRecord?.conversationUrl || null;
-    targetId = turn?.targetId || resultRecord?.targetId || null;
+    conversationUrl =
+      turn?.conversationUrl ||
+      persistedTurnRecord?.conversationUrl ||
+      resultRecord?.conversationUrl ||
+      null;
+    targetId =
+      turn?.targetId ||
+      persistedTurnRecord?.targetId ||
+      resultRecord?.targetId ||
+      null;
 
     if (!resolvedProvider && conversationUrl) {
       resolvedProvider = providerFromUrl(conversationUrl);
@@ -311,7 +354,6 @@ export async function readConversation({
     if (resolvedProvider && !ADAPTERS[resolvedProvider]) {
       throw coded("INVALID_ARGUMENT", `Unsupported provider: ${resolvedProvider}`);
     }
-
   }
 
   if (!resolvedProvider || !ADAPTERS[resolvedProvider]) {
@@ -332,7 +374,7 @@ export async function readConversation({
   let lastResult = null;
   let lastProgressAt = startTime;
   let lastProgressSignature = "";
-  let lastTurnState = turn || resultRecord;
+  let lastTurnState = turn || persistedTurnRecord || resultRecord;
 
   try {
     while (true) {

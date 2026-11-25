@@ -211,7 +211,7 @@ export function createCdpRunner({
         ...(onWait ? { onWait } : {}),
         onProgress: (patch) => {
           if (patch && typeof patch === "object" && typeof onProgress === "function") {
-            onProgress(patch);
+            return onProgress(patch);
           }
         },
         signal: turnController.signal,

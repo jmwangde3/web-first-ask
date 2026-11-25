@@ -652,6 +652,14 @@ export async function runCdpTurn({
         });
       }
       submitted = true;
+
+      // Publish the submission signal immediately after submitTurn succeeds.
+      // The broker awaits this callback, so the durable turn record contains
+      // sendCommittedAt before answer generation starts.
+      if (typeof onProgress === "function") {
+        await onProgress({ conversationUrl, targetId, sendCommittedAt: submittedAt });
+      }
+
       if (signal?.aborted) {
         const err = new Error("Operation cancelled");
         err.code = "CANCELLED";

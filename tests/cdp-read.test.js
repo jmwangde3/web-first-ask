@@ -741,11 +741,13 @@ test("runCdpTurn retains work tabs for non-completed, empty, resumed, and keepBr
   }
 });
 
-test("wfa cdp ask --no-wait accepts HTTP 202 and returns five fields without waiting or staging", async () => {
+test("wfa cdp ask --no-wait waits for sendCommittedAt before returning five fields", async () => {
   const stdout = stream();
   const stderr = stream();
   let waitCalls = 0;
+  let submissionCalls = 0;
   let stageCalls = 0;
+
   const result = await runCdpCommand([
     "ask", "--provider", "chatgpt", "--prompt", "send once", "--request-id", "req-no-wait", "--no-wait", "--json",
   ], {
@@ -755,6 +757,14 @@ test("wfa cdp ask --no-wait accepts HTTP 202 and returns five fields without wai
       assert.equal(payload.requestId, "req-no-wait");
       return { status: 202, json: { id: "turn-no-wait", requestId: "req-no-wait", state: "queued" } };
     },
+    waitForSubmission: async ({ turnId }) => {
+      submissionCalls++;
+      return {
+        id: turnId,
+        state: "running",
+        sendCommittedAt: 123,
+      };
+    },
     waitForTurn: async () => { waitCalls++; throw new Error("waitForTurn must not be called"); },
     stageCdpResponse: async () => { stageCalls++; throw new Error("staging must not be called"); },
   });
@@ -763,17 +773,18 @@ test("wfa cdp ask --no-wait accepts HTTP 202 and returns five fields without wai
   assert.deepEqual(result.result, {
     id: "turn-no-wait",
     requestId: "req-no-wait",
-    state: "queued",
+    state: "running",
     poll: "wfa read --task-id turn-no-wait",
     provider: "chatgpt",
   });
   assert.deepEqual(Object.keys(JSON.parse(stdout.output)), ["id", "requestId", "state", "poll", "provider"]);
+  assert.equal(submissionCalls, 1);
   assert.equal(waitCalls, 0);
   assert.equal(stageCalls, 0);
   assert.equal(stderr.output, "");
 });
 
-test("wfa cdp ask --no-wait accepts idempotent HTTP 200 without waiting", async () => {
+test("wfa cdp ask --no-wait accepts idempotent HTTP 200 after confirming sendCommittedAt", async () => {
   const stdout = stream();
   const result = await runCdpCommand([
     "ask", "--provider", "gemini", "--prompt", "same request", "--request-id", "same-id", "--no-wait", "--json",
@@ -783,6 +794,11 @@ test("wfa cdp ask --no-wait accepts idempotent HTTP 200 without waiting", async 
     createTurn: async () => ({
       status: 200,
       json: { id: "existing-turn", requestId: "same-id", state: "running" },
+    }),
+    waitForSubmission: async () => ({
+      id: "existing-turn",
+      state: "running",
+      sendCommittedAt: 123,
     }),
     waitForTurn: async () => { throw new Error("must not wait"); },
   });
@@ -803,6 +819,11 @@ test("top-level wfa send aliases cdp ask --no-wait and top-level read aliases cd
     home: "/tmp/wfa-top-send",
     ensureBroker: async () => ({ host: "127.0.0.1", port: 43210, token: "test" }),
     createTurn: async () => ({ status: 202, json: { id: "top-turn", state: "queued" } }),
+    waitForSubmission: async () => ({
+      id: "top-turn",
+      state: "running",
+      sendCommittedAt: 123,
+    }),
     waitForTurn: async () => { throw new Error("send alias must not wait"); },
   });
   assert.equal(sendCode, 0);

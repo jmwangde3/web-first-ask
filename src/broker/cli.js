@@ -16,6 +16,7 @@ import {
   waitForTurn as clientWaitForTurn,
 } from "./client.js";
 import { TURN_STATES } from "./turns.js";
+import { clearBrokerRecord, readBrokerRecord } from "./lifecycle.js";
 import * as defaultJournal from "./journal.js";
 
 const VALUE_FLAGS = new Set(["mode", "state", "timeout", "provider", "prompt", "prompt-file", "request-id"]);
@@ -76,8 +77,28 @@ Options:
 `);
 }
 
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
 export async function spawnDetachedBroker({ home, mode = "background", deps = {}, stdout } = {}) {
   const effectiveHome = home || deps.home || getHomeDir();
+
+  const readRecordFn = deps.readBrokerRecord || readBrokerRecord;
+  const clearRecordFn = deps.clearBrokerRecord || clearBrokerRecord;
+  const checkPidAlive = deps.isPidAlive || pidAlive;
+  const staleRecord = await readRecordFn(effectiveHome).catch(() => null);
+
+  if (staleRecord && !checkPidAlive(staleRecord.pid)) {
+    await clearRecordFn(effectiveHome, staleRecord.instanceId);
+  }
+
   const logsDir = path.join(effectiveHome, "logs");
   await (deps.mkdir || mkdir)(logsDir, { recursive: true });
   const iso = new Date().toISOString().replace(/[:.]/g, "-");
@@ -94,6 +115,11 @@ export async function spawnDetachedBroker({ home, mode = "background", deps = {}
       detached: true,
       windowsHide: true,
       stdio: ["ignore", fd, fd],
+      env: {
+        ...process.env,
+        ...(deps.env || {}),
+        WFA_HOME: effectiveHome,
+      },
     });
     if (child && typeof child.unref === "function") {
       child.unref();

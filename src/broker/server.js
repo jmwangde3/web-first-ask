@@ -6,6 +6,7 @@ import { createTurn, publicView, TERMINAL_STATES, transition, TURN_STATES } from
 import * as defaultJournal from "./journal.js";
 import * as defaultResultStore from "./result-store.js";
 import * as defaultRequestStore from "./request-store.js";
+import * as defaultTurnStore from "./turn-store.js";
 
 function coded(code, message = code) {
   const error = new Error(message);
@@ -62,6 +63,36 @@ function restoreTurnFromResult(record, fallbackCreatedAt) {
   };
 }
 
+function restoreTurnFromStore(record, fallbackCreatedAt) {
+  return {
+    id: record.turnId,
+    requestId: record.requestId ?? null,
+    provider: record.provider,
+    conversationId: record.conversationId ?? null,
+    conversationUrl: record.conversationUrl ?? null,
+    targetId: record.targetId ?? null,
+    mode: record.mode ?? "background",
+    settleMs: null,
+    stallTimeoutMs: null,
+    hardTimeoutMs: null,
+    minIntervalMs: null,
+    chromePath: null,
+    prompt: "",
+    promptPreview: record.promptPreview ?? "",
+    createdAt: record.createdAt ?? fallbackCreatedAt,
+    state: record.state,
+    startedAt: record.startedAt ?? null,
+    finishedAt: record.finishedAt ?? null,
+    cooldownWaitMs: record.cooldownWaitMs ?? null,
+    cooldownWaitAt: record.cooldownWaitAt ?? null,
+    sendCommittedAt: record.sendCommittedAt ?? null,
+    text: null,
+    reason: record.reason ?? null,
+    evidence: record.evidence ?? null,
+    downloads: record.downloads ?? null,
+  };
+}
+
 async function parseBody(req) {
   let size = 0;
   const chunks = [];
@@ -95,6 +126,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   const journal = deps?.journal || defaultJournal;
   const resultStore = deps?.resultStore || defaultResultStore;
   const requestStore = deps?.requestStore || defaultRequestStore;
+  const turnStore = deps?.turnStore || defaultTurnStore;
   const instanceId = lock.instanceId;
   const token = randomUUID();
   const startedAt = new Date().toISOString();
@@ -122,12 +154,26 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     else idleSince ??= Date.now();
   }
 
-  function updateProgress(id, patch) {
+  async function persistTurnSnapshot(turn) {
+    if (!turn || typeof turnStore.recordTurn !== "function") return;
+    try {
+      await turnStore.recordTurn(home, turn);
+    } catch (error) {
+      log("turn_persist_failed", {
+        turnId: turn.id,
+        code: String(error?.code ?? "TURN_WRITE_FAILED"),
+      });
+    }
+  }
+
+  async function updateProgress(id, patch) {
     const current = turns.get(id);
     if (current?.state !== "running" || !patch || typeof patch !== "object" || Array.isArray(patch)) return;
     const { id: _id, state: _state, provider: _provider, prompt: _prompt,
       conversationId: _conversationId, requestId: _requestId, ...fields } = patch;
-    turns.set(id, { ...current, ...fields });
+    const updated = { ...current, ...fields };
+    turns.set(id, updated);
+    await persistTurnSnapshot(updated);
   }
 
   function finish(id, state, patch = {}) {
@@ -197,6 +243,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         release(scheduler, turn);
         controllers.delete(turn.id);
         active.delete(turn.id);
+        await persistTurnSnapshot(turns.get(turn.id));
         await persistTurnResult(turns.get(turn.id));
         if (!closing) drain();
         trackIdle();
@@ -295,6 +342,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         });
       }
       turns.set(turn.id, turn);
+      await persistTurnSnapshot(turn);
       const decision = schedule(scheduler, turn);
       if (decision.accepted) runTurn(turn);
       trackIdle();
@@ -323,6 +371,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         }
         const cancelled = transition(turn, "failed", { reason: "cancelled", finishedAt: new Date().toISOString() });
         turns.set(id, cancelled);
+        await persistTurnSnapshot(cancelled);
         if (turn.state === "running") {
           controllers.get(id)?.abort();
           if (typeof runner.cancel === "function") {
@@ -392,6 +441,18 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   }
 
   try {
+    const persistedTurns = typeof turnStore.readTurns === "function"
+      ? await turnStore.readTurns(home).catch((error) => {
+          log("turn_load_failed", { code: String(error?.code ?? "TURN_LOAD_FAILED") });
+          return [];
+        })
+      : [];
+
+    for (const record of persistedTurns) {
+      if (!record?.turnId || !TURN_STATES.includes(record.state)) continue;
+      turns.set(record.turnId, restoreTurnFromStore(record, startedAt));
+    }
+
     const persistedResults = await resultStore.readResults(home).catch((error) => {
       log("result_load_failed", { code: String(error?.code ?? "RESULT_LOAD_FAILED") });
       return [];
@@ -437,6 +498,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     void Promise.all([
       typeof resultStore.pruneResults === "function" ? resultStore.pruneResults(home).catch(() => {}) : Promise.resolve(),
       typeof requestStore.pruneRequests === "function" ? requestStore.pruneRequests(home).catch(() => {}) : Promise.resolve(),
+      typeof turnStore.pruneTurns === "function" ? turnStore.pruneTurns(home).catch(() => {}) : Promise.resolve(),
     ]);
     idleTimer = setInterval(() => {
       if (mode === "off" && !closing && !idleTriggered && idleSince !== null &&

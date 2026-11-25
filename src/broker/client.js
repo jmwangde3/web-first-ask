@@ -12,6 +12,8 @@ function coded(code, cause) {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const WAIT_DONE_STATES = new Set(["completed", "failed", "stalled", "needs_human", "takeover"]);
 const START_LOCK_STALE_MS = 30000;
+const DEFAULT_SUBMISSION_TIMEOUT_MS = 60000;
+const DEFAULT_SUBMISSION_POLL_INTERVAL_MS = 100;
 
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -191,6 +193,116 @@ export const getStatus = record => request(record, "GET", "/status");
 export const createTurn = (record, payload) => request(record, "POST", "/turns", payload);
 export const getTurn = (record, id) => request(record, "GET", `/turns/${encodeURIComponent(id)}`);
 export const cancelTurn = (record, id) => request(record, "POST", `/turns/${encodeURIComponent(id)}/cancel`);
+
+/**
+ * Wait only until the browser submission signal is visible through the broker.
+ * This is intentionally separate from waitForTurn: no-wait callers must not
+ * wait for answer generation or alter the completion-state contract.
+ */
+export async function waitForSubmission({
+  record,
+  turnId,
+  home,
+  timeoutMs = DEFAULT_SUBMISSION_TIMEOUT_MS,
+  pollIntervalMs = DEFAULT_SUBMISSION_POLL_INTERVAL_MS,
+  deps = {},
+} = {}) {
+  if (!record || typeof turnId !== "string" || !turnId.trim() ||
+      !Number.isFinite(timeoutMs) || timeoutMs <= 0 ||
+      !Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+    throw coded("INVALID_ARGUMENT");
+  }
+
+  const getTurnFn = deps.getTurn || getTurn;
+  const discoverBrokerFn = deps.discoverBroker || discoverBroker;
+  const sleepFn = deps.sleep || sleep;
+  const nowFn = deps.now || (() => Date.now());
+  const effectiveHome = home ?? deps.home;
+  const deadline = nowFn() + timeoutMs;
+
+  let currentRecord = record;
+  let lastConnError = null;
+  let lastTurn = null;
+
+  while (nowFn() < deadline) {
+    if (!currentRecord) {
+      currentRecord = await discoverBrokerFn(effectiveHome).catch(() => null);
+    }
+
+    if (currentRecord) {
+      try {
+        const response = await getTurnFn(currentRecord, turnId);
+
+        if (response?.status === 404) {
+          const error = coded("TURN_NOT_FOUND");
+          error.message = `Turn ${turnId} was not found by the broker`;
+          error.turnId = turnId;
+          throw error;
+        }
+
+        if (response?.status === 401 ||
+            (Number.isFinite(response?.status) && response.status >= 500)) {
+          throw coded("BROKER_UNREACHABLE");
+        }
+
+        if (Number.isFinite(response?.status) && response.status >= 400) {
+          throw coded("BROKER_ERROR");
+        }
+
+        const turn = response?.json;
+        if (response?.status === 200 && turn && typeof turn === "object") {
+          lastTurn = turn;
+
+          if (turn.sendCommittedAt != null) {
+            return turn;
+          }
+
+          if (WAIT_DONE_STATES.has(turn.state)) {
+            const error = coded("SUBMISSION_NOT_CONFIRMED");
+            error.message =
+              `Turn ${turnId} ended with state=${turn.state} before sendCommittedAt was recorded`;
+            error.turnId = turnId;
+            error.turn = turn;
+            throw error;
+          }
+        }
+
+        lastConnError = null;
+      } catch (error) {
+        if (["TURN_NOT_FOUND", "BROKER_ERROR", "SUBMISSION_NOT_CONFIRMED", "INVALID_ARGUMENT"].includes(error?.code)) {
+          throw error;
+        }
+
+        if (error?.code !== "BROKER_TIMEOUT" && error?.code !== "BROKER_UNREACHABLE") {
+          throw error;
+        }
+
+        lastConnError = error;
+        currentRecord = await discoverBrokerFn(effectiveHome).catch(() => null);
+      }
+    }
+
+    const remaining = deadline - nowFn();
+    if (remaining <= 0) break;
+    await sleepFn(Math.min(pollIntervalMs, remaining));
+  }
+
+  const error = coded(
+    lastConnError?.code === "BROKER_UNREACHABLE"
+      ? "BROKER_UNREACHABLE"
+      : "SUBMISSION_TIMEOUT",
+    lastConnError
+  );
+
+  error.turnId = turnId;
+  if (lastTurn) error.turn = lastTurn;
+
+  error.message = lastConnError?.code === "BROKER_UNREACHABLE"
+    ? `BROKER_UNREACHABLE: broker connection was lost while confirming submission for turn ${turnId}`
+    : `SUBMISSION_TIMEOUT: turn ${turnId} did not expose sendCommittedAt within ${timeoutMs}ms`;
+
+  throw error;
+}
 
 export async function waitForTurn({
   record,
