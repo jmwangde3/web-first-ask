@@ -71,15 +71,52 @@ export function buildLoginProbeJs() {
 })())()`;
 }
 
+const ANSWER_BODY_READER_JS = String.raw`  const getAnswerBody = (container) => {
+    if (!container) return null;
+    const collect = (selector) => container && typeof container.querySelectorAll === "function"
+      ? [...container.querySelectorAll(selector)]
+      : [];
+    const contentNodes = collect("[data-message-content]");
+    const markdownNodes = contentNodes.length ? [] : collect(".markdown");
+    const proseNodes = contentNodes.length || markdownNodes.length ? [] : collect(".prose");
+    const bodyNodes = contentNodes.length ? contentNodes : (markdownNodes.length ? markdownNodes : proseNodes);
+    const source = bodyNodes[bodyNodes.length - 1] || container;
+    if (!source || typeof source.cloneNode !== "function") return source;
+    const clone = source.cloneNode(true);
+    clone.querySelectorAll("h4, header, button, [role='button'], .turn-action-controls, [data-testid*='action'], [data-testid*='thought'], [data-testid*='reasoning'], [class*='thought'], [class*='reasoning']").forEach((el) => el.remove());
+    const helperPattern = /^(thought for \d+(?:\.\d+)? seconds?|思考了?\s*\d+\s*秒)$/i;
+    [...clone.querySelectorAll("*")].forEach((el) => {
+      const text = String((el.innerText || el.textContent) || "").trim();
+      if (helperPattern.test(text)) el.remove();
+    });
+    return clone;
+  };`;
+
 export function buildAnswerTextJs() {
   return `(() => {
   const hs = [...document.querySelectorAll("h4")].filter((h) => {
     const t = (h.innerText || h.textContent || "").trim();
     return /(说\\s*[:：]|said\\s*[:：]?)\\s*$/i.test(t) && !/^(你|You)/i.test(t);
   });
-  const h = hs[hs.length - 1];
-  const n = h && h.nextElementSibling;
-  return n ? (n.innerText || n.textContent || "").trim() : "";
+  const lastH = hs[hs.length - 1];
+  const articles = [...document.querySelectorAll('article[data-message-author-role="assistant"]')];
+  const lastArticle = articles[articles.length - 1] || null;
+  const closestAssistant = lastH && typeof lastH.closest === "function"
+    ? lastH.closest('[data-message-author-role="assistant"]')
+    : null;
+  const verifiedClosestAssistant = closestAssistant && typeof closestAssistant.getAttribute === "function"
+    && closestAssistant.getAttribute("data-message-author-role") === "assistant"
+    ? closestAssistant
+    : null;
+${ANSWER_BODY_READER_JS}
+  let body = getAnswerBody(lastArticle || verifiedClosestAssistant);
+  // Locked design T1 safe fallback: only when NO assistant container can be resolved at all.
+  // Never a mid-stream primary source; keeps legacy/unknown DOM shapes from returning "".
+  if (!body && lastH && lastH.nextElementSibling) {
+    const fb = lastH.nextElementSibling;
+    body = typeof fb.cloneNode === "function" ? getAnswerBody(fb) : fb;
+  }
+  return body ? String((body.innerText || body.textContent) || "").trim() : "";
 })()`;
 }
 
@@ -132,16 +169,26 @@ export function buildReadStateJs() {
   };
   let answerText = "";
   const lastH = assistantHs[assistantHs.length - 1];
-  const nextEl = lastH && lastH.nextElementSibling;
-  if (nextEl) {
-    answerText = withCodeFences(nextEl);
-  } else if (answerTurns > 0) {
-    const articles = document.querySelectorAll('article[data-message-author-role="assistant"]');
-    const lastArt = articles[articles.length - 1];
-    if (lastArt) {
-      answerText = withCodeFences(lastArt);
-    }
+  const articles = [...document.querySelectorAll('article[data-message-author-role="assistant"]')];
+  const lastArticle = articles[articles.length - 1] || null;
+  // The h4-to-article relationship is not assumed: use the role-scoped last article,
+  // and only fall back to an explicitly assistant-marked ancestor when no article exists.
+  const closestAssistant = lastH && typeof lastH.closest === "function"
+    ? lastH.closest('[data-message-author-role="assistant"]')
+    : null;
+  const verifiedClosestAssistant = closestAssistant && typeof closestAssistant.getAttribute === "function"
+    && closestAssistant.getAttribute("data-message-author-role") === "assistant"
+    ? closestAssistant
+    : null;
+${ANSWER_BODY_READER_JS}
+  let answerBody = getAnswerBody(lastArticle || verifiedClosestAssistant);
+  // Locked design T1 safe fallback: only when NO assistant container can be resolved at all.
+  if (!answerBody && lastH && lastH.nextElementSibling) {
+    const fb = lastH.nextElementSibling;
+    answerBody = typeof fb.cloneNode === "function" ? getAnswerBody(fb) : fb;
   }
+  // Text remains available for progress observation; waitForCompletion still requires the action-bar signal.
+  if (answerBody) answerText = withCodeFences(answerBody);
 
   // 正面完成信号（2026-11-25 三方 3:0，含 3 次真机 400ms 逐帧实测）：
   // 以最后一条 assistant 的 h4 为锚点，检查其文档序之后是否出现动作栏。

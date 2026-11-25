@@ -571,6 +571,33 @@ export async function runCdpTurn({
       const paceFn = deps.pace || defaultPace;
       await paceFn("casual", { sleep: sleepFn, signal });
 
+      if (typeof driver.waitForComposerReady === "function") {
+        const composerReady = await driver.waitForComposerReady(cdp, sessionId, adapter, {
+          timeoutMs: Math.min(15000, hardTimeoutMs),
+          sleep: sleepFn,
+          signal,
+        });
+        if (!composerReady?.ok) {
+          return withTerminalStatus({
+            status: composerReady?.status || "needs_human",
+            text: "",
+            reason: composerReady?.reason || "composer_not_ready_stop_state",
+            evidence: {
+              message: "Composer did not become ready before typing. The editor must be editable and a visible, enabled send control must be available.",
+              ...(composerReady && typeof composerReady === "object" ? composerReady : {}),
+            },
+            conversationUrl,
+            browser: {
+              pid: recovery.chrome?.pid ?? null,
+              port: recovery.chrome?.port ?? null,
+              mode,
+              reused: recovery.action === "ADOPT",
+            },
+            elapsedMs: Date.now() - startTime,
+          });
+        }
+      }
+
       typeRes = await driver.typePrompt(cdp, sessionId, adapter, prompt);
       if (signal?.aborted) {
         const err = new Error("Operation cancelled");

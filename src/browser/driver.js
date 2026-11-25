@@ -226,6 +226,81 @@ export async function waitForEditor(cdp, sessionId, adapter, {
   throw err;
 }
 
+export async function waitForComposerReady(cdp, sessionId, adapter, {
+  timeoutMs = 15000,
+  pollIntervalMs = 200,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  signal,
+} = {}) {
+  const startTime = now();
+  const expression = `(() => {
+    const editor = document.querySelector(${JSON.stringify(adapter.editorSelector)});
+    const tagName = String((editor && editor.tagName) || "").toLowerCase();
+    const isFormControl = tagName === "textarea" || tagName === "input";
+    const editorEditable = Boolean(editor && !editor.disabled && !editor.readOnly && (
+      editor.isContentEditable || editor.getAttribute("contenteditable") === "true" || isFormControl
+    ));
+    const isVisible = (el) => {
+      if (!el || !el.isConnected) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const sendSelector = ${JSON.stringify(adapter.sendSelector || "")};
+    const stopSelector = ${JSON.stringify(adapter.stopSelector || "")};
+    const sendEls = sendSelector ? [...document.querySelectorAll(sendSelector)] : [];
+    const matchesStop = (el) => Boolean(stopSelector) && el.matches(stopSelector);
+    const usableSend = sendEls.find((el) =>
+      !matchesStop(el) && isVisible(el) && !el.disabled && el.getAttribute("aria-disabled") !== "true"
+    );
+    return {
+      ready: Boolean(editorEditable && usableSend),
+      editorFound: Boolean(editor),
+      editorEditable,
+      sendFound: sendEls.length > 0,
+      sendReady: Boolean(usableSend),
+      stopMatched: sendEls.some(matchesStop),
+    };
+  })()`;
+
+  let lastState = null;
+  while (now() - startTime < timeoutMs) {
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
+    try {
+      const res = await cdp.send("Runtime.evaluate", {
+        expression,
+        returnByValue: true,
+      }, sessionId);
+      const value = res?.result?.value;
+      if (value && typeof value === "object") {
+        lastState = value;
+        if (value.ready === true) {
+          return { ...value, ok: true, status: "ready", elapsedMs: now() - startTime };
+        }
+      }
+    } catch (err) {
+      if (err?.code === "CDP_CLOSED" || err?.code === "CANCELLED") throw err;
+    }
+    const remainingMs = timeoutMs - (now() - startTime);
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(pollIntervalMs, remainingMs));
+  }
+
+  return {
+    ...(lastState || {}),
+    ok: false,
+    status: "needs_human",
+    reason: "composer_not_ready_stop_state",
+    elapsedMs: now() - startTime,
+  };
+}
+
 export function normalizePromptText(str) {
   return String(str ?? "")
     .replace(/\r\n/g, "\n")

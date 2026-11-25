@@ -648,6 +648,7 @@ test("runCdpTurn creates and retains an anchor and closes only a completed one-s
         ...defaultDriver,
         openTab: async () => ({ targetId: "work-target", sessionId: "work-session" }),
         waitForEditor: async () => true,
+        waitForComposerReady: async () => ({ ok: true, status: "ready" }),
         readTurnState: async () => ({
           userTurns: 0, answerTurns: 0, answerText: "", answerActionsVisible: false,
           stopVisible: false, editorEmpty: true, loggedOut: false, pageError: null,
@@ -724,6 +725,7 @@ test("runCdpTurn retains work tabs for non-completed, empty, resumed, and keepBr
           ...defaultDriver,
           openTab: async () => ({ targetId: "work", sessionId: "work-session" }),
           waitForEditor: async () => true,
+          waitForComposerReady: async () => ({ ok: true, status: "ready" }),
           readTurnState: async () => ({
             userTurns: 0, answerTurns: 0, answerText: "", answerActionsVisible: false,
             stopVisible: false, editorEmpty: true, loggedOut: false, pageError: null,
