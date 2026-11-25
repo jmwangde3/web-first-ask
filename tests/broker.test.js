@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createTurn, canTransition, transition, publicView, isSendCommitted, TERMINAL_STATES } from "../src/broker/turns.js";
@@ -615,4 +615,77 @@ test("8 concurrent different turns complete without cross-talk", async t => {
     assert.equal(results[i].state, "completed");
     assert.equal(results[i].text, `reply:${specs[i].provider}:${specs[i].prompt}`);
   }
+});
+
+test("ensureBroker archives corrupt broker-start.lock older than 1000ms when no broker is alive and starts", async t => {
+  const home = await tempHome();
+  let server;
+  t.after(async () => { await server?.close(); await rm(home, { recursive: true, force: true }); });
+  const lockPath = path.join(home, "broker-start.lock");
+  await writeFile(lockPath, "{corrupt-start-lock");
+  const past = new Date(Date.now() - 2500);
+  await utimes(lockPath, past, past);
+
+  let spawned = 0;
+  const record = await ensureBroker({
+    home,
+    timeoutMs: 3000,
+    spawnBroker: async () => {
+      spawned++;
+      server = await startBroker({
+        home,
+        mode: "tray",
+        runner: { run: async () => ({ status: "completed" }), cancel() {} },
+      });
+    },
+  });
+
+  assert.equal(spawned, 1);
+  assert.equal(record.instanceId, server.instanceId);
+  const files = await readdir(home);
+  const archived = files.find((name) => name.startsWith("broker-start.lock.archive-"));
+  assert.ok(archived, "corrupt start lock past 1000ms must be archived");
+  assert.equal(await readFile(path.join(home, archived), "utf8"), "{corrupt-start-lock");
+});
+
+test("ensureBroker throws BROKER_LOCK_CORRUPT immediately when corrupt broker-start.lock mtime is within 1000ms", async t => {
+  const home = await tempHome();
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const lockPath = path.join(home, "broker-start.lock");
+  await writeFile(lockPath, "{corrupt-fresh");
+
+  let spawned = 0;
+  const started = Date.now();
+  await assert.rejects(
+    () => ensureBroker({
+      home,
+      timeoutMs: 30000,
+      spawnBroker: async () => { spawned++; },
+    }),
+    (err) => err?.code === "BROKER_LOCK_CORRUPT" &&
+      err.lockPath === lockPath &&
+      err.message.includes(lockPath),
+  );
+  assert.equal(spawned, 0);
+  assert.ok(Date.now() - started < 1000, "must not wait 1000ms or 30000ms on fresh corrupt lock");
+});
+
+test("ensureBroker waits without deleting valid broker-start.lock held by a live pid", async t => {
+  const home = await tempHome();
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const lockPath = path.join(home, "broker-start.lock");
+  const lockPayload = JSON.stringify({ pid: process.pid, createdAt: Date.now(), lockId: "live-holder" });
+  await writeFile(lockPath, lockPayload);
+
+  let spawned = 0;
+  await assert.rejects(
+    () => ensureBroker({
+      home,
+      timeoutMs: 250,
+      spawnBroker: async () => { spawned++; },
+    }),
+    (err) => err?.code === "BROKER_TIMEOUT",
+  );
+  assert.equal(spawned, 0);
+  assert.equal(await readFile(lockPath, "utf8"), lockPayload);
 });

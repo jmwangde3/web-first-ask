@@ -12,8 +12,10 @@ function coded(code, cause) {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const WAIT_DONE_STATES = new Set(["completed", "failed", "stalled", "needs_human", "takeover"]);
 const START_LOCK_STALE_MS = 30000;
+const START_LOCK_CORRUPT_GRACE_MS = 1000;
 const DEFAULT_SUBMISSION_TIMEOUT_MS = 60000;
 const DEFAULT_SUBMISSION_POLL_INTERVAL_MS = 100;
+const LIVE_PAGE_PROBE_TIMEOUT_MS = 2000;
 
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -25,17 +27,39 @@ function pidAlive(pid) {
   }
 }
 
-function isStartLockStale(entry, now = Date.now()) {
-  if (!entry || typeof entry !== "object") return false;
-  if (!pidAlive(entry.pid)) return true;
-  return !Number.isFinite(entry.createdAt) || (now - entry.createdAt > START_LOCK_STALE_MS);
+function isValidStartLockEntry(entry) {
+  return Boolean(
+    entry &&
+    typeof entry === "object" &&
+    !Array.isArray(entry) &&
+    Number.isSafeInteger(entry.pid) &&
+    entry.pid > 0 &&
+    Number.isFinite(entry.createdAt) &&
+    (entry.lockId === undefined || (typeof entry.lockId === "string" && entry.lockId.length > 0))
+  );
 }
 
-async function readStartLock(lockPath) {
+function isStartLockStale(entry, now = Date.now()) {
+  if (!isValidStartLockEntry(entry)) return false;
+  if (!pidAlive(entry.pid)) return true;
+  return now - entry.createdAt > START_LOCK_STALE_MS;
+}
+
+async function readStartLockStatus(lockPath) {
+  let raw;
   try {
-    return JSON.parse(await fs.readFile(lockPath, "utf8"));
+    raw = await fs.readFile(lockPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { status: "missing", entry: null };
+    return { status: "corrupt", entry: null };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return isValidStartLockEntry(parsed)
+      ? { status: "ok", entry: parsed }
+      : { status: "corrupt", entry: null };
   } catch {
-    return null;
+    return { status: "corrupt", entry: null };
   }
 }
 
@@ -46,7 +70,7 @@ async function acquireStartLock(home) {
   const lockId = randomUUID();
   const payload = JSON.stringify({ pid: process.pid, createdAt: Date.now(), lockId }) + "\n";
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     let handle;
     try {
       handle = await fs.open(lockPath, "wx", 0o600);
@@ -75,32 +99,66 @@ async function acquireStartLock(home) {
         if (error?.code !== "EEXIST") await fs.rm(lockPath, { force: true }).catch(() => {});
       }
       if (error?.code !== "EEXIST") throw error;
-      if (attempt === 2) return null;
 
-      let old = await readStartLock(lockPath);
-      if (!old) {
-        await sleep(25);
-        old = await readStartLock(lockPath);
-        if (!old) {
-          try {
-            const st = await fs.stat(lockPath);
-            if (Date.now() - st.mtimeMs <= START_LOCK_STALE_MS) return null;
-          } catch (statErr) {
-            if (statErr?.code === "ENOENT") continue;
-            return null;
-          }
-          await fs.rm(lockPath, { force: true }).catch(() => {});
-          continue;
-        }
-      }
-      if (!isStartLockStale(old)) return null;
-
-      const latest = await readStartLock(lockPath);
-      if (latest && (!isStartLockStale(latest) || latest.pid !== old.pid ||
-          latest.createdAt !== old.createdAt || latest.lockId !== old.lockId)) {
+      let lockState = await readStartLockStatus(lockPath);
+      if (lockState.status === "missing") {
+        if (attempt < 3) continue;
         return null;
       }
-      await fs.rm(lockPath, { force: true }).catch(() => {});
+      if (lockState.status === "corrupt") {
+        await sleep(25);
+        lockState = await readStartLockStatus(lockPath);
+        if (lockState.status === "missing") {
+          if (attempt < 3) continue;
+          return null;
+        }
+        if (lockState.status === "corrupt") {
+          let st;
+          try {
+            st = await fs.stat(lockPath);
+          } catch (statErr) {
+            if (statErr?.code === "ENOENT") {
+              if (attempt < 3) continue;
+              return null;
+            }
+            const err = coded("BROKER_LOCK_CORRUPT", statErr);
+            err.lockPath = lockPath;
+            err.message = `BROKER_LOCK_CORRUPT: ${lockPath}`;
+            throw err;
+          }
+          if (Date.now() - st.mtimeMs <= START_LOCK_CORRUPT_GRACE_MS) {
+            const err = coded("BROKER_LOCK_CORRUPT");
+            err.lockPath = lockPath;
+            err.message = `BROKER_LOCK_CORRUPT: corrupt start lock at ${lockPath}`;
+            throw err;
+          }
+          if (await discoverBroker(home)) return null;
+          const archived = `${lockPath}.archive-${Date.now()}-${randomUUID()}`;
+          try {
+            await fs.rename(lockPath, archived);
+          } catch (archiveErr) {
+            if (archiveErr?.code !== "ENOENT") throw archiveErr;
+          }
+          if (attempt < 3) continue;
+          return null;
+        }
+      }
+
+      const old = lockState.entry;
+      if (!isStartLockStale(old)) return null;
+
+      const latestState = await readStartLockStatus(lockPath);
+      if (latestState.status === "ok") {
+        const latest = latestState.entry;
+        if (!isStartLockStale(latest) || latest.pid !== old.pid ||
+            latest.createdAt !== old.createdAt || latest.lockId !== old.lockId) {
+          return null;
+        }
+        await fs.rm(lockPath, { force: true }).catch(() => {});
+      } else if (latestState.status === "corrupt") {
+        if (attempt < 3) continue;
+        return null;
+      }
     }
   }
   return null;
