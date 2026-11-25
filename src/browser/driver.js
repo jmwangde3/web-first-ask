@@ -239,29 +239,38 @@ export async function waitForComposerReady(cdp, sessionId, adapter, {
     const tagName = String((editor && editor.tagName) || "").toLowerCase();
     const isFormControl = tagName === "textarea" || tagName === "input";
     const editorEditable = Boolean(editor && !editor.disabled && !editor.readOnly && (
-      editor.isContentEditable || editor.getAttribute("contenteditable") === "true" || isFormControl
+      editor.isContentEditable || (typeof editor.getAttribute === "function" && editor.getAttribute("contenteditable") === "true") || isFormControl
     ));
     const isVisible = (el) => {
       if (!el || !el.isConnected) return false;
       const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
+      if (!style || style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      const rect = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+      return Boolean(rect && rect.width > 0 && rect.height > 0);
     };
-    const sendSelector = ${JSON.stringify(adapter.sendSelector || "")};
+    const editorVisible = isVisible(editor);
+    const editorRaw = !editor
+      ? null
+      : (typeof editor.value === "string"
+        ? editor.value
+        : (typeof editor.innerText === "string"
+          ? editor.innerText
+          : (typeof editor.textContent === "string" ? editor.textContent : null)));
+    const editorChars = typeof editorRaw === "string" ? editorRaw.trim().length : -1;
     const stopSelector = ${JSON.stringify(adapter.stopSelector || "")};
-    const sendEls = sendSelector ? [...document.querySelectorAll(sendSelector)] : [];
-    const matchesStop = (el) => Boolean(stopSelector) && el.matches(stopSelector);
-    const usableSend = sendEls.find((el) =>
-      !matchesStop(el) && isVisible(el) && !el.disabled && el.getAttribute("aria-disabled") !== "true"
+    const stopEls = stopSelector ? [...document.querySelectorAll(stopSelector)] : [];
+    const stopActive = stopEls.some((el) =>
+      Boolean(el) && !el.disabled && (typeof el.getAttribute !== "function" || el.getAttribute("aria-disabled") !== "true")
     );
+    const ready = Boolean(editorEditable && editorVisible && !stopActive);
     return {
-      ready: Boolean(editorEditable && usableSend),
+      ready,
       editorFound: Boolean(editor),
       editorEditable,
-      sendFound: sendEls.length > 0,
-      sendReady: Boolean(usableSend),
-      stopMatched: sendEls.some(matchesStop),
+      editorVisible,
+      editorChars,
+      stopActive,
+      stopMatched: stopActive,
     };
   })()`;
 
@@ -273,15 +282,19 @@ export async function waitForComposerReady(cdp, sessionId, adapter, {
       throw err;
     }
     try {
+      const remainingBefore = timeoutMs - (now() - startTime);
       const res = await cdp.send("Runtime.evaluate", {
         expression,
         returnByValue: true,
-      }, sessionId);
+      }, sessionId, { timeoutMs: Math.max(1, remainingBefore) });
       const value = res?.result?.value;
       if (value && typeof value === "object") {
         lastState = value;
         if (value.ready === true) {
-          return { ...value, ok: true, status: "ready", elapsedMs: now() - startTime };
+          if (now() - startTime < timeoutMs) {
+            return { ...value, ok: true, status: "ready", elapsedMs: now() - startTime };
+          }
+          break;
         }
       }
     } catch (err) {
@@ -296,7 +309,7 @@ export async function waitForComposerReady(cdp, sessionId, adapter, {
     ...(lastState || {}),
     ok: false,
     status: "needs_human",
-    reason: "composer_not_ready_stop_state",
+    reason: lastState?.stopActive ? "composer_stop_state" : "composer_not_ready_timeout",
     elapsedMs: now() - startTime,
   };
 }

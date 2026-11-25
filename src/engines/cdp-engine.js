@@ -583,7 +583,7 @@ export async function runCdpTurn({
             text: "",
             reason: composerReady?.reason || "composer_not_ready_stop_state",
             evidence: {
-              message: "Composer did not become ready before typing. The editor must be editable and a visible, enabled send control must be available.",
+              message: "Composer did not become ready before typing. It must be editable and visible, with no active stop control.",
               ...(composerReady && typeof composerReady === "object" ? composerReady : {}),
             },
             conversationUrl,

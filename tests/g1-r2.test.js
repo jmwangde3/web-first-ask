@@ -114,26 +114,59 @@ test("G1 R2 ChatGPT code fences retain the existing pre/code-block reconstructio
   assert.equal(evaluateAdapter(chatgptAdapter.buildAnswerTextJs(), document), `Example\nJavaScript\n${code}`);
 });
 
-function makeComposerCdp(getSendElements) {
-  const editor = {
+function makeEditor({
+  editable = true,
+  visible = true,
+  innerText = "",
+  rect = visible ? { width: 320, height: 48 } : { width: 0, height: 0 },
+} = {}) {
+  return {
     tagName: "DIV",
-    isContentEditable: true,
+    isConnected: true,
+    isContentEditable: editable,
     disabled: false,
     readOnly: false,
-    getAttribute(name) { return name === "contenteditable" ? "true" : null; },
+    innerText,
+    getAttribute(name) {
+      return name === "contenteditable" ? (editable ? "true" : "false") : null;
+    },
+    getBoundingClientRect() {
+      return rect;
+    },
   };
+}
+
+function makeStopButton({
+  disabled = false,
+  ariaDisabled = null,
+  rect = { width: 32, height: 32 },
+  isConnected = true,
+} = {}) {
+  return {
+    isConnected,
+    disabled,
+    getAttribute: (name) => (name === "aria-disabled" ? ariaDisabled : null),
+    getBoundingClientRect: () => rect,
+  };
+}
+
+function makeComposerCdp({
+  getEditor = () => makeEditor(),
+  getStopElements = () => [],
+  computedStyle = { display: "block", visibility: "visible", opacity: "1" },
+} = {}) {
   const document = {
     querySelector(selector) {
       assert.equal(selector, chatgptAdapter.editorSelector);
-      return editor;
+      return getEditor();
     },
     querySelectorAll(selector) {
-      assert.equal(selector, chatgptAdapter.sendSelector);
-      return getSendElements();
+      assert.equal(selector, chatgptAdapter.stopSelector);
+      return getStopElements();
     },
   };
   const window = {
-    getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+    getComputedStyle: () => computedStyle,
   };
   return {
     async send(method, params) {
@@ -144,23 +177,10 @@ function makeComposerCdp(getSendElements) {
   };
 }
 
-function makeSendButton(isStop) {
-  return {
-    isConnected: true,
-    disabled: false,
-    getAttribute: () => null,
-    matches: (selector) => isStop && selector === chatgptAdapter.stopSelector,
-    getBoundingClientRect: () => ({ width: 32, height: 32 }),
-  };
-}
-
-test("G1 R2 composer pre-gate ignores the stop control and waits for a usable send control", async () => {
-  const stopButton = makeSendButton(true);
-  const sendButton = makeSendButton(false);
-  let calls = 0;
-  const cdp = makeComposerCdp(() => {
-    calls += 1;
-    return calls === 1 ? [stopButton] : [stopButton, sendButton];
+test("G1 R2 composer pre-gate is ready when editor is editable and visible with no stop control", async () => {
+  const cdp = makeComposerCdp({
+    getEditor: () => makeEditor({ innerText: "  hello  " }),
+    getStopElements: () => [],
   });
   let virtualTime = 0;
 
@@ -171,17 +191,29 @@ test("G1 R2 composer pre-gate ignores the stop control and waits for a usable se
     sleep: async (ms) => { virtualTime += ms; },
   });
 
-  assert.equal(calls, 2);
   assert.equal(result.ok, true);
   assert.equal(result.status, "ready");
+  assert.equal(result.ready, true);
+  assert.equal(result.editorFound, true);
   assert.equal(result.editorEditable, true);
-  assert.equal(result.sendReady, true);
-  assert.equal(result.stopMatched, true);
+  assert.equal(result.editorVisible, true);
+  assert.equal(result.editorChars, 5);
+  assert.equal(result.stopActive, false);
+  assert.equal(result.stopMatched, false);
+  assert.equal("sendFound" in result, false);
+  assert.equal("sendReady" in result, false);
 });
 
-test("G1 R2 composer pre-gate times out while the send selector still resolves only to stop", async () => {
-  const stopButton = makeSendButton(true);
-  const cdp = makeComposerCdp(() => [stopButton]);
+test("G1 R2 composer pre-gate treats 0x0 active stop control as blocking and times out with composer_stop_state", async () => {
+  const zeroRectStop = makeStopButton({
+    disabled: false,
+    ariaDisabled: null,
+    rect: { width: 0, height: 0 },
+  });
+  const cdp = makeComposerCdp({
+    getEditor: () => makeEditor({ innerText: "" }),
+    getStopElements: () => [zeroRectStop],
+  });
   let virtualTime = 0;
 
   const result = await waitForComposerReady(cdp, "session-1", chatgptAdapter, {
@@ -193,10 +225,64 @@ test("G1 R2 composer pre-gate times out while the send selector still resolves o
 
   assert.equal(result.ok, false);
   assert.equal(result.status, "needs_human");
-  assert.equal(result.reason, "composer_not_ready_stop_state");
+  assert.equal(result.reason, "composer_stop_state");
+  assert.equal(result.ready, false);
   assert.equal(result.editorEditable, true);
-  assert.equal(result.sendReady, false);
+  assert.equal(result.editorVisible, true);
+  assert.equal(result.editorChars, 0);
+  assert.equal(result.stopActive, true);
   assert.equal(result.stopMatched, true);
+});
+
+test("G1 R2 composer pre-gate treats aria-disabled=true or disabled=true stop controls as inactive", async () => {
+  for (const stopBtn of [
+    makeStopButton({ disabled: false, ariaDisabled: "true" }),
+    makeStopButton({ disabled: true, ariaDisabled: null }),
+  ]) {
+    const cdp = makeComposerCdp({
+      getEditor: () => makeEditor(),
+      getStopElements: () => [stopBtn],
+    });
+    let virtualTime = 0;
+
+    const result = await waitForComposerReady(cdp, "session-1", chatgptAdapter, {
+      timeoutMs: 100,
+      pollIntervalMs: 10,
+      now: () => virtualTime,
+      sleep: async (ms) => { virtualTime += ms; },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.status, "ready");
+    assert.equal(result.ready, true);
+    assert.equal(result.stopActive, false);
+    assert.equal(result.stopMatched, false);
+  }
+});
+
+test("G1 R2 composer pre-gate blocks 0x0 editor and times out with composer_not_ready_timeout when no stop is active", async () => {
+  const cdp = makeComposerCdp({
+    getEditor: () => makeEditor({ visible: false, rect: { width: 0, height: 0 } }),
+    getStopElements: () => [],
+  });
+  let virtualTime = 0;
+
+  const result = await waitForComposerReady(cdp, "session-1", chatgptAdapter, {
+    timeoutMs: 25,
+    pollIntervalMs: 10,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "needs_human");
+  assert.equal(result.reason, "composer_not_ready_timeout");
+  assert.equal(result.ready, false);
+  assert.equal(result.editorFound, true);
+  assert.equal(result.editorEditable, true);
+  assert.equal(result.editorVisible, false);
+  assert.equal(result.stopActive, false);
+  assert.equal(result.stopMatched, false);
 });
 
 test("G1 R2 engine returns needs_human before typePrompt when composer readiness times out", async () => {
@@ -236,11 +322,13 @@ test("G1 R2 engine returns needs_human before typePrompt when composer readiness
           return {
             ok: false,
             status: "needs_human",
-            reason: "composer_not_ready_stop_state",
+            reason: "composer_stop_state",
+            ready: false,
             editorFound: true,
             editorEditable: true,
-            sendFound: true,
-            sendReady: false,
+            editorVisible: true,
+            editorChars: 0,
+            stopActive: true,
             stopMatched: true,
           };
         },
@@ -257,7 +345,9 @@ test("G1 R2 engine returns needs_human before typePrompt when composer readiness
   });
 
   assert.equal(result.status, "needs_human");
-  assert.equal(result.reason, "composer_not_ready_stop_state");
+  assert.equal(result.reason, "composer_stop_state");
+  assert.equal(result.evidence.editorChars, 0);
+  assert.equal(result.evidence.stopActive, true);
   assert.deepEqual(events, ["composer-gate"]);
 });
 
@@ -321,4 +411,54 @@ test("G1 R2 completion still requires actions and still tolerates a persistent s
   );
   assert.equal(withSignal.status, "completed");
   assert.equal(withSignal.text, "Final answer");
+});
+
+test("G1 R2 composer pre-gate rejects ready:true when cdp.send exceeds timeoutMs deadline", async () => {
+  let virtualTime = 0;
+  let capturedSendOpts = null;
+  const cdp = {
+    async send(method, _params, _sessionId, opts) {
+      assert.equal(method, "Runtime.evaluate");
+      capturedSendOpts = opts;
+      virtualTime += 100;
+      return { result: { value: { ready: true, stopActive: false } } };
+    },
+  };
+
+  const result = await waitForComposerReady(cdp, "session-1", chatgptAdapter, {
+    timeoutMs: 50,
+    pollIntervalMs: 10,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+
+  assert.equal(capturedSendOpts?.timeoutMs, 50);
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "needs_human");
+  assert.equal(result.reason, "composer_not_ready_timeout");
+});
+
+test("G1 R2 composer pre-gate still returns ok:true when ready:true arrives within timeoutMs", async () => {
+  let virtualTime = 0;
+  let capturedSendOpts = null;
+  const cdp = {
+    async send(method, _params, _sessionId, opts) {
+      assert.equal(method, "Runtime.evaluate");
+      capturedSendOpts = opts;
+      virtualTime += 10;
+      return { result: { value: { ready: true, stopActive: false } } };
+    },
+  };
+
+  const result = await waitForComposerReady(cdp, "session-1", chatgptAdapter, {
+    timeoutMs: 50,
+    pollIntervalMs: 10,
+    now: () => virtualTime,
+    sleep: async (ms) => { virtualTime += ms; },
+  });
+
+  assert.equal(capturedSendOpts?.timeoutMs, 50);
+  assert.equal(result.ok, true);
+  assert.equal(result.status, "ready");
+  assert.equal(result.ready, true);
 });
