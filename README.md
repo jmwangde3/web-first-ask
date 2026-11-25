@@ -411,6 +411,12 @@ hanging, and `wfa cdp login` logs in inside our own `chrome-profile` so the tain
 If a profile does get challenged, `wfa cdp login --provider chatgpt` shows the interstitial in a visible window
 where it can be solved by hand; the cookies then persist for later runs.
 
+`docs/backlog.md` is the wfa-side list of open defects and planned work: `--no-wait` turns losing their broker,
+first read after reopening a tab returning `unconfirmed`, attachment uploads reported as successful when nothing
+was attached, long answers truncated to the first line, Gemini's multi-minute background pauses, and the planned
+Gemini Task-mode support. Each item carries a reproduction, the file to change and an acceptance test, so an
+outside contributor can pick one up without other context.
+
 ## Local data and privacy
 
 By default, state is stored in:
