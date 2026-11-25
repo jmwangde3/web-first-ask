@@ -11,6 +11,7 @@ import {
   discoverBroker,
   ensureBroker,
   createTurn,
+  diagnoseBrokerUnreachable,
   getStatus,
   request,
   waitForTurn as clientWaitForTurn,
@@ -505,8 +506,13 @@ async function handleWait(argv, deps) {
   const discover = deps.discoverBroker || discoverBroker;
   const record = await discover(home);
   if (!record) {
-    stderr.write("wfa: BROKER_UNREACHABLE: Broker is not running\n");
-    return { code: 1 };
+    const diag = await diagnoseBrokerUnreachable({ home, turnId, deps });
+    const err = Object.assign(
+      new Error(`BROKER_UNREACHABLE: Broker is not running (submissionState=${diag.submissionState}, safeToResend=${diag.safeToResend})`),
+      { code: "BROKER_UNREACHABLE", turnId, ...diag }
+    );
+    stderr.write(`wfa: ${err.message}\n`);
+    return { code: 1, error: err };
   }
 
   return await waitForTurn({

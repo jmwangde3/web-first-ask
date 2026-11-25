@@ -7,7 +7,12 @@ import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
 import * as defaultResultStore from "../broker/result-store.js";
 import * as defaultTurnStore from "../broker/turn-store.js";
-import { discoverBroker as defaultDiscoverBroker, getTurn as defaultGetTurn } from "../broker/client.js";
+import * as defaultJournal from "../broker/journal.js";
+import {
+  diagnoseBrokerUnreachable,
+  discoverBroker as defaultDiscoverBroker,
+  getTurn as defaultGetTurn,
+} from "../broker/client.js";
 import { sleep as defaultSleep } from "../util.js";
 
 const ADAPTERS = Object.freeze({ chatgpt: chatgptAdapter, gemini: geminiAdapter });
@@ -243,6 +248,7 @@ export async function readConversation({
   const effectiveHome = home || getHomeDir();
   const readResultFn = deps.resultStore?.readResult || deps.readResult || defaultResultStore.readResult;
   const readTurnRecordFn = deps.turnStore?.readTurn || deps.readTurn || defaultTurnStore.readTurn;
+  const readCommitFn = deps.readCommit || deps.journal?.readCommit || defaultJournal.readCommit;
   const discoverBrokerFn = deps.discoverBroker || defaultDiscoverBroker;
   const getTurnFn = deps.getTurn || defaultGetTurn;
   const recoverFn = deps.recoverBrowser || defaultRecoverBrowser;
@@ -257,6 +263,7 @@ export async function readConversation({
 
   let resultRecord = null;
   let persistedTurnRecord = null;
+  let journalRecord = null;
   let turn = null;
   let brokerRecord = null;
   let resolvedProvider = provider ? String(provider).toLowerCase() : null;
@@ -273,6 +280,7 @@ export async function readConversation({
   } else {
     resultRecord = await readResultFn(effectiveHome, taskId);
     persistedTurnRecord = await readTurnRecordFn(effectiveHome, taskId);
+    journalRecord = await Promise.resolve().then(() => readCommitFn(effectiveHome, taskId)).catch(() => null);
 
     if (resolvedProvider && resultRecord?.provider &&
         resolvedProvider !== String(resultRecord.provider).toLowerCase()) {
@@ -307,31 +315,55 @@ export async function readConversation({
       }
     } catch (error) {
       brokerRecord = null;
-      if (persistedTurnRecord) {
-        throw coded(
+      if (persistedTurnRecord || journalRecord) {
+        const diag = await diagnoseBrokerUnreachable({
+          home: effectiveHome,
+          turnId: taskId,
+          lastTurn: persistedTurnRecord,
+          deps,
+        });
+        const unreachable = coded(
           "BROKER_UNREACHABLE",
-          `Persisted turn ${taskId} exists, but its broker is unreachable`,
+          `Persisted turn ${taskId} exists, but its broker is unreachable (submissionState=${diag.submissionState}, safeToResend=${diag.safeToResend})`,
           error
         );
+        unreachable.turnId = taskId;
+        unreachable.submissionState = diag.submissionState;
+        unreachable.safeToResend = diag.safeToResend;
+        unreachable.livePage = diag.livePage;
+        unreachable.details = diag;
+        throw unreachable;
       }
     }
 
-    if (!brokerRecord && persistedTurnRecord) {
-      throw coded(
+    if (!brokerRecord && (persistedTurnRecord || journalRecord)) {
+      const diag = await diagnoseBrokerUnreachable({
+        home: effectiveHome,
+        turnId: taskId,
+        lastTurn: persistedTurnRecord,
+        deps,
+      });
+      const unreachable = coded(
         "BROKER_UNREACHABLE",
-        `Persisted turn ${taskId} exists, but its broker is not running`
+        `Persisted turn ${taskId} exists, but its broker is not running (submissionState=${diag.submissionState}, safeToResend=${diag.safeToResend})`
       );
+      unreachable.turnId = taskId;
+      unreachable.submissionState = diag.submissionState;
+      unreachable.safeToResend = diag.safeToResend;
+      unreachable.livePage = diag.livePage;
+      unreachable.details = diag;
+      throw unreachable;
     }
 
     if (!turn && persistedTurnRecord && brokerRecord) {
       turn = persistedTurnRecord;
     }
 
-    if (!turn && !resultRecord && !persistedTurnRecord) {
+    if (!turn && !resultRecord && !persistedTurnRecord && !journalRecord) {
       throw coded("TURN_NOT_FOUND", `No broker turn or persisted result exists for ${taskId}`);
     }
 
-    const taskProvider = turn?.provider || persistedTurnRecord?.provider || resultRecord?.provider;
+    const taskProvider = turn?.provider || persistedTurnRecord?.provider || resultRecord?.provider || journalRecord?.provider;
     if (resolvedProvider && taskProvider &&
         resolvedProvider !== String(taskProvider).toLowerCase()) {
       throw coded("INVALID_ARGUMENT", `Task ${taskId} belongs to ${taskProvider}, not ${resolvedProvider}`);

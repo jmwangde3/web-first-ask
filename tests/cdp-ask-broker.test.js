@@ -82,7 +82,7 @@ test("cdp ask routes through ensureBroker -> createTurn -> waitForTurn with real
   assert.equal(parsed.conversationId, "conv-alpha");
 });
 
-test("cdp ask with existing orphan succeeds without requestId and enforces requestId idempotency/conflict", async (t) => {
+test("cdp ask with existing orphan returns 409 previously_submitted_uncertain without running and enforces requestId idempotency/conflict", async (t) => {
   const home = await mkdtemp(path.join(os.tmpdir(), "wfa-cdp-idem-"));
   let runnerCalls = 0;
   const server = await startBroker({
@@ -106,13 +106,17 @@ test("cdp ask with existing orphan succeeds without requestId and enforces reque
     promptSha256: hashPrompt("duplicate risky prompt"),
   });
 
-  // Same prompt without explicit --request-id succeeds (auto-generated UUID)
+  // Same prompt with unresolved orphan journal -> 409 previously_submitted_uncertain
+  const orphanOut = createMockStream();
   const r0 = await runCdpCommand(
     ["ask", "--provider", "gemini", "--prompt", "duplicate risky prompt", "--json"],
-    { home, stdout: createMockStream(), stderr: createMockStream() },
+    { home, stdout: orphanOut, stderr: createMockStream() },
   );
-  assert.equal(r0.code, 0);
-  assert.equal(runnerCalls, 1);
+  assert.equal(r0.code, 1);
+  const parsedOrphan = JSON.parse(orphanOut.output);
+  assert.equal(parsedOrphan.error, "previously_submitted_uncertain");
+  assert.equal(parsedOrphan.status, 409);
+  assert.equal(runnerCalls, 0);
 
   // Explicit --request-id replays idempotently
   const r1 = await runCdpCommand(
@@ -126,7 +130,7 @@ test("cdp ask with existing orphan succeeds without requestId and enforces reque
   assert.equal(r1.code, 0);
   assert.equal(r2.code, 0);
   assert.equal(r1.result.id, r2.result.id);
-  assert.equal(runnerCalls, 2);
+  assert.equal(runnerCalls, 1);
 
   // Same --request-id with different prompt -> 409 REQUEST_ID_CONFLICT
   const conflictOut = createMockStream();
@@ -138,7 +142,7 @@ test("cdp ask with existing orphan succeeds without requestId and enforces reque
   const parsedConflict = JSON.parse(conflictOut.output);
   assert.equal(parsedConflict.error, "REQUEST_ID_CONFLICT");
   assert.equal(parsedConflict.status, 409);
-  assert.equal(runnerCalls, 2);
+  assert.equal(runnerCalls, 1);
 });
 
 test("cdp ask allows same-provider parallel execution for different conversations while serializing same conversation", async (t) => {

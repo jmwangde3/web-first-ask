@@ -10,6 +10,9 @@ import { acquireInstanceLock, clearBrokerRecord, getBrokerPaths, isInstanceAlive
   readBrokerRecord, writeBrokerRecord } from "../src/broker/lifecycle.js";
 import { startBroker } from "../src/broker/server.js";
 import { discoverBroker, ensureBroker, request, createTurn as remoteCreateTurn, getTurn, waitForTurn } from "../src/broker/client.js";
+import { hashPrompt, recordCommit } from "../src/broker/journal.js";
+import { recordRequest } from "../src/broker/request-store.js";
+import { recordTurn } from "../src/broker/turn-store.js";
 
 const tempHome = () => mkdtemp(path.join(os.tmpdir(), "wfa-broker-test-"));
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -688,4 +691,189 @@ test("ensureBroker waits without deleting valid broker-start.lock held by a live
   );
   assert.equal(spawned, 0);
   assert.equal(await readFile(lockPath, "utf8"), lockPayload);
+});
+
+test("waitForTurn BROKER_UNREACHABLE reports committed / safeToResend=false when journal exists and includes livePage", async t => {
+  const home = await tempHome();
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const turnId = "00000000-0000-4000-8000-000000000101";
+
+  await recordCommit(home, {
+    turnId,
+    provider: "chatgpt",
+    promptSha256: hashPrompt("committed prompt"),
+  });
+  await recordTurn(home, {
+    id: turnId,
+    provider: "chatgpt",
+    prompt: "committed prompt",
+    state: "running",
+    conversationUrl: "https://chatgpt.com/c/live-probe-1",
+    targetId: "tab-live-1",
+  });
+
+  let nowMs = 0;
+  await assert.rejects(
+    () => waitForTurn({
+      record: { host: "127.0.0.1", port: 41991, token: "dead" },
+      turnId,
+      home,
+      timeoutMs: 1000,
+      deps: {
+        now: () => nowMs,
+        sleep: async (ms) => { nowMs += ms; },
+        discoverBroker: async () => null,
+        getTurn: async () => {
+          throw Object.assign(new Error("unreachable"), { code: "BROKER_UNREACHABLE" });
+        },
+        readDevToolsActivePort: async () => ({ port: 9222, wsPath: "/devtools/browser/test" }),
+        connectCdp: async () => ({ close() {} }),
+        driver: {
+          listPageTargets: async () => [
+            { targetId: "tab-live-1", type: "page", url: "https://chatgpt.com/c/live-probe-1" },
+          ],
+          attachTab: async () => ({ targetId: "tab-live-1", sessionId: "s-live-1" }),
+          readTurnState: async () => ({
+            answerText: "Partial live text",
+            answerActionsVisible: false,
+            pendingCount: 3,
+            stopVisible: true,
+            editorEmpty: true,
+          }),
+        },
+      },
+    }),
+    (err) => err?.code === "BROKER_UNREACHABLE" &&
+      err.submissionState === "committed" &&
+      err.safeToResend === false &&
+      err.livePage?.answerChars === "Partial live text".length &&
+      err.livePage?.answerActionsVisible === false &&
+      err.livePage?.pendingCount === 3 &&
+      err.livePage?.stopVisible === true &&
+      err.livePage?.editorEmpty === true,
+  );
+});
+
+test("waitForTurn BROKER_UNREACHABLE reports not_submitted / safeToResend=true when no journal and state=queued", async t => {
+  const home = await tempHome();
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const turnId = "00000000-0000-4000-8000-000000000102";
+
+  await recordTurn(home, {
+    id: turnId,
+    provider: "gemini",
+    prompt: "queued prompt",
+    state: "queued",
+  });
+
+  let nowMs = 0;
+  await assert.rejects(
+    () => waitForTurn({
+      record: { host: "127.0.0.1", port: 41992, token: "dead" },
+      turnId,
+      home,
+      timeoutMs: 1000,
+      deps: {
+        now: () => nowMs,
+        sleep: async (ms) => { nowMs += ms; },
+        discoverBroker: async () => null,
+        getTurn: async () => {
+          throw Object.assign(new Error("unreachable"), { code: "BROKER_UNREACHABLE" });
+        },
+      },
+    }),
+    (err) => err?.code === "BROKER_UNREACHABLE" &&
+      err.submissionState === "not_submitted" &&
+      err.safeToResend === true &&
+      err.livePage === null,
+  );
+});
+
+test("requestId replay returns 200 instead of 409 when turn is in orphan state; returns 409 only when turn cannot be replayed", async t => {
+  const home = await tempHome();
+  let server;
+  let runs = 0;
+  t.after(async () => { await server?.close(); await rm(home, { recursive: true, force: true }); });
+
+  const turnId = "00000000-0000-4000-8000-000000000201";
+  const prompt = "orphan replay prompt";
+  const requestId = "req-orphan-replay-1";
+  const promptSha256 = hashPrompt(prompt);
+
+  // Simulate a committed turn whose result was never recorded (orphan journal + turn snapshot + request record)
+  await recordCommit(home, {
+    turnId,
+    provider: "chatgpt",
+    promptSha256,
+  });
+  await recordTurn(home, {
+    id: turnId,
+    requestId,
+    provider: "chatgpt",
+    prompt,
+    state: "running",
+  });
+
+  const { createHash } = await import("node:crypto");
+  const requestHash = createHash("sha256")
+    .update(JSON.stringify(["chatgpt", promptSha256, null, "background", null, null, null, null]))
+    .digest("hex");
+  await recordRequest(home, {
+    requestId,
+    requestHash,
+    turnId,
+    createdAt: new Date().toISOString(),
+  });
+
+  const missingTurnId = "00000000-0000-4000-8000-000000000202";
+  const missingPrompt = "orphan missing turn prompt";
+  const missingRequestId = "req-orphan-missing-turn-1";
+  const missingPromptSha = hashPrompt(missingPrompt);
+  const missingRequestHash = createHash("sha256")
+    .update(JSON.stringify(["chatgpt", missingPromptSha, null, "background", null, null, null, null]))
+    .digest("hex");
+  await recordCommit(home, {
+    turnId: missingTurnId,
+    provider: "chatgpt",
+    promptSha256: missingPromptSha,
+  });
+  await recordRequest(home, {
+    requestId: missingRequestId,
+    requestHash: missingRequestHash,
+    turnId: missingTurnId,
+    createdAt: new Date().toISOString(),
+  });
+
+  server = await startBroker({
+    home,
+    mode: "tray",
+    runner: {
+      run: async () => {
+        runs++;
+        return { status: "completed", text: "should not re-run" };
+      },
+      cancel() {},
+    },
+  });
+  const record = await discoverBroker(home);
+
+  const replay = await remoteCreateTurn(record, {
+    provider: "chatgpt",
+    prompt,
+    requestId,
+  });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.json.id, turnId);
+  assert.equal(replay.json.requestId, requestId);
+  assert.equal(replay.json.state, "running");
+
+  const unresolvedMissing = await remoteCreateTurn(record, {
+    provider: "chatgpt",
+    prompt: missingPrompt,
+    requestId: missingRequestId,
+  });
+  assert.equal(unresolvedMissing.status, 409);
+  assert.equal(unresolvedMissing.json.code, "PREVIOUSLY_SUBMITTED_UNCERTAIN");
+  assert.equal(unresolvedMissing.json.error, "previously_submitted_uncertain");
+  assert.equal(runs, 0);
 });

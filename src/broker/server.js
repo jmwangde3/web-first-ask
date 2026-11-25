@@ -303,9 +303,12 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         ...(body.minIntervalMs !== undefined ? { minIntervalMs: body.minIntervalMs } : {}),
         ...(body.chromePath !== undefined ? { chromePath: body.chromePath } : {}),
       });
+      const promptSha256 = journal.hashPrompt(turn.prompt);
+      let requestHash = null;
+      let existingReq = null;
       if (turn.requestId !== null) {
-        const requestHash = computeRequestHash(turn, journal.hashPrompt(turn.prompt));
-        const existingReq = requests.get(turn.requestId);
+        requestHash = computeRequestHash(turn, promptSha256);
+        existingReq = requests.get(turn.requestId) ?? null;
         if (existingReq) {
           if (existingReq.requestHash !== requestHash) {
             send(res, 409, {
@@ -321,14 +324,32 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
             send(res, 200, publicView(existingTurn));
             return;
           }
-          send(res, 200, {
-            id: existingReq.turnId,
-            requestId: turn.requestId,
-            state: "failed",
-            reason: "turn_result_unavailable",
-          });
-          return;
         }
+      }
+      const unresolved = await journal.findCommitted(home, {
+        provider: turn.provider,
+        promptSha256,
+      }).catch(() => null);
+      if (unresolved) {
+        send(res, 409, {
+          code: "PREVIOUSLY_SUBMITTED_UNCERTAIN",
+          error: "previously_submitted_uncertain",
+          orphan: unresolved,
+          turnId: unresolved.turnId,
+          hint: `This prompt was submitted before a result was recorded (turn ${unresolved.turnId}). Inspect the provider tab or run \`wfa broker clear-orphan ${unresolved.turnId}\` before resending.`,
+        });
+        return;
+      }
+      if (existingReq) {
+        send(res, 200, {
+          id: existingReq.turnId,
+          requestId: turn.requestId,
+          state: "failed",
+          reason: "turn_result_unavailable",
+        });
+        return;
+      }
+      if (turn.requestId !== null) {
         const reqRecord = {
           schema: 1,
           requestId: turn.requestId,

@@ -129,16 +129,16 @@ test("4. Truncated JSON file in journal dir is skipped, not thrown", async () =>
   }
 });
 
-test("5. POST /turns with same prompt and no requestId succeeds twice with distinct turnIds even if an orphan exists", async () => {
+test("5. POST /turns rejects unresolved journal match with 409 previously_submitted_uncertain; clean prompt without orphan succeeds twice with distinct turnIds", async () => {
   const tmp = await tempHome();
   let runnerCalls = 0;
   let broker;
   try {
-    const promptText = "same prompt without requestId";
+    const riskyPrompt = "same prompt without requestId";
     await recordCommit(tmp, {
       turnId: "turn-orphan-legacy",
       provider: "chatgpt",
-      promptSha256: hashPrompt(promptText),
+      promptSha256: hashPrompt(riskyPrompt),
       submittedAt: "2026-11-23T09:00:00.000Z",
     });
 
@@ -155,15 +155,27 @@ test("5. POST /turns with same prompt and no requestId succeeds twice with disti
       runner: mockRunner,
     });
 
+    const blocked = await fetch(`http://127.0.0.1:${broker.port}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-wfa-token": broker.token },
+      body: JSON.stringify({ provider: "chatgpt", prompt: riskyPrompt }),
+    });
+    assert.equal(blocked.status, 409);
+    const blockedBody = await blocked.json();
+    assert.equal(blockedBody.error, "previously_submitted_uncertain");
+    assert.equal(blockedBody.orphan?.turnId, "turn-orphan-legacy");
+    assert.equal(runnerCalls, 0);
+
+    const cleanPrompt = "clean repeated prompt without orphan";
     const res1 = await fetch(`http://127.0.0.1:${broker.port}/turns`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-wfa-token": broker.token },
-      body: JSON.stringify({ provider: "chatgpt", prompt: promptText }),
+      body: JSON.stringify({ provider: "chatgpt", prompt: cleanPrompt }),
     });
     const res2 = await fetch(`http://127.0.0.1:${broker.port}/turns`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-wfa-token": broker.token },
-      body: JSON.stringify({ provider: "chatgpt", prompt: promptText }),
+      body: JSON.stringify({ provider: "chatgpt", prompt: cleanPrompt }),
     });
 
     assert.equal(res1.status, 202);

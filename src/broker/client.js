@@ -2,6 +2,17 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { clearBrokerRecord, getBrokerPaths, isInstanceAlive, readBrokerRecord } from "./lifecycle.js";
+import { readCommit } from "./journal.js";
+import { readTurn } from "./turn-store.js";
+import { readResult } from "./result-store.js";
+import { getBrowserPaths } from "../browser/paths.js";
+import { readDevToolsActivePort } from "../browser/launch.js";
+import { connectCdp } from "../browser/cdp.js";
+import * as defaultDriver from "../browser/driver.js";
+import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
+import * as geminiAdapter from "../browser/adapters/gemini.js";
+
+const ADAPTERS = Object.freeze({ chatgpt: chatgptAdapter, gemini: geminiAdapter });
 
 function coded(code, cause) {
   const error = new Error(code, cause ? { cause } : undefined);
@@ -162,6 +173,144 @@ async function acquireStartLock(home) {
     }
   }
   return null;
+}
+
+function normalizeUrlForMatch(value, provider) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:") return null;
+  const host = parsed.hostname.toLowerCase();
+  const actualProvider = (host === "chatgpt.com" || host === "www.chatgpt.com")
+    ? "chatgpt"
+    : (host === "gemini.google.com" ? "gemini" : null);
+  if (!actualProvider || (provider && actualProvider !== provider)) return null;
+  const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+  return `${host}${pathname}${parsed.hash}`;
+}
+
+function findMatchingLiveTarget(targets, targetId, conversationUrl, provider) {
+  if (targetId) {
+    const exact = targets.find((target) => target.targetId === targetId);
+    if (exact) return exact;
+  }
+  const expected = normalizeUrlForMatch(conversationUrl, provider);
+  if (!expected) return null;
+  return targets.find((target) =>
+    normalizeUrlForMatch(target.url, provider) === expected
+  ) || null;
+}
+
+async function probeLivePage({ home, provider, conversationUrl, targetId, deps = {} } = {}) {
+  if (typeof deps.probeLivePage === "function") {
+    try {
+      return await deps.probeLivePage({ home, provider, conversationUrl, targetId });
+    } catch {
+      return null;
+    }
+  }
+  const normalizedProvider = typeof provider === "string" ? provider.toLowerCase() : null;
+  const adapter = normalizedProvider ? ADAPTERS[normalizedProvider] : null;
+  if (!adapter || (!targetId && !conversationUrl)) return null;
+
+  let port = Number.isInteger(deps.chromePort) ? deps.chromePort : null;
+  if (!port && home) {
+    const readActivePort = deps.readDevToolsActivePort || readDevToolsActivePort;
+    const active = await readActivePort(getBrowserPaths(home).profileDir, { timeoutMs: 0 }).catch(() => null);
+    port = active?.port ?? null;
+  }
+  if (!port) return null;
+
+  const connectFn = deps.connectCdp || connectCdp;
+  const driver = deps.driver || defaultDriver;
+  const listTargetsFn = driver.listPageTargets || defaultDriver.listPageTargets;
+  const attachTabFn = driver.attachTab || defaultDriver.attachTab;
+  const readStateFn = driver.readTurnState || defaultDriver.readTurnState;
+
+  let cdp = null;
+  let timer = null;
+  const runProbe = async () => {
+    cdp = await connectFn(port);
+    const targets = await listTargetsFn(cdp);
+    const target = findMatchingLiveTarget(targets, targetId, conversationUrl, normalizedProvider);
+    if (!target) return null;
+    const attached = await attachTabFn(cdp, target.targetId, { timeoutMs: LIVE_PAGE_PROBE_TIMEOUT_MS });
+    const pageState = await readStateFn(cdp, attached.sessionId, adapter);
+    return {
+      targetId: target.targetId,
+      url: target.url || conversationUrl || null,
+      answerChars: (pageState?.answerText || "").length,
+      answerActionsVisible: pageState?.answerActionsVisible ?? null,
+      pendingCount: Number.isInteger(pageState?.pendingCount) ? pageState.pendingCount : 0,
+      stopVisible: Boolean(pageState?.stopVisible),
+      editorEmpty: pageState?.editorEmpty ?? null,
+    };
+  };
+
+  try {
+    return await Promise.race([
+      runProbe(),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), LIVE_PAGE_PROBE_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (cdp && typeof cdp.close === "function") {
+      try { cdp.close(); } catch {}
+    }
+  }
+}
+
+export async function diagnoseBrokerUnreachable({ home, turnId, lastTurn = null, deps = {} } = {}) {
+  const readCommitFn = deps.readCommit || deps.journal?.readCommit || readCommit;
+  const readTurnFn = deps.readTurn || deps.turnStore?.readTurn || readTurn;
+  const readResultFn = deps.readResult || deps.resultStore?.readResult || readResult;
+
+  const [journalRecord, turnRecord, resultRecord] = (home && turnId)
+    ? await Promise.all([
+        Promise.resolve().then(() => readCommitFn(home, turnId)).catch(() => null),
+        Promise.resolve().then(() => readTurnFn(home, turnId)).catch(() => null),
+        Promise.resolve().then(() => readResultFn(home, turnId)).catch(() => null),
+      ])
+    : [null, null, null];
+
+  const effectiveTurn = lastTurn || turnRecord || resultRecord || null;
+  const hasSendCommitted = Boolean(
+    journalRecord != null ||
+    lastTurn?.sendCommittedAt != null ||
+    turnRecord?.sendCommittedAt != null ||
+    resultRecord?.sendCommittedAt != null
+  );
+
+  let submissionState;
+  let safeToResend;
+  if (hasSendCommitted) {
+    submissionState = "committed";
+    safeToResend = false;
+  } else if (effectiveTurn?.state === "queued") {
+    submissionState = "not_submitted";
+    safeToResend = true;
+  } else {
+    submissionState = "uncertain";
+    safeToResend = false;
+  }
+
+  const livePage = await probeLivePage({
+    home,
+    provider: effectiveTurn?.provider || journalRecord?.provider || null,
+    conversationUrl: effectiveTurn?.conversationUrl || turnRecord?.conversationUrl || resultRecord?.conversationUrl || null,
+    targetId: effectiveTurn?.targetId || turnRecord?.targetId || resultRecord?.targetId || null,
+    deps,
+  });
+
+  return { submissionState, safeToResend, livePage };
 }
 
 export async function discoverBroker(home) {
@@ -345,19 +494,29 @@ export async function waitForSubmission({
     await sleepFn(Math.min(pollIntervalMs, remaining));
   }
 
+  const isUnreachable = lastConnError?.code === "BROKER_UNREACHABLE";
   const error = coded(
-    lastConnError?.code === "BROKER_UNREACHABLE"
-      ? "BROKER_UNREACHABLE"
-      : "SUBMISSION_TIMEOUT",
+    isUnreachable ? "BROKER_UNREACHABLE" : "SUBMISSION_TIMEOUT",
     lastConnError
   );
 
   error.turnId = turnId;
   if (lastTurn) error.turn = lastTurn;
 
-  error.message = lastConnError?.code === "BROKER_UNREACHABLE"
-    ? `BROKER_UNREACHABLE: broker connection was lost while confirming submission for turn ${turnId}`
-    : `SUBMISSION_TIMEOUT: turn ${turnId} did not expose sendCommittedAt within ${timeoutMs}ms`;
+  if (isUnreachable) {
+    const diag = await diagnoseBrokerUnreachable({
+      home: effectiveHome,
+      turnId,
+      lastTurn,
+      deps,
+    });
+    error.submissionState = diag.submissionState;
+    error.safeToResend = diag.safeToResend;
+    error.livePage = diag.livePage;
+    error.message = `BROKER_UNREACHABLE: broker connection was lost while confirming submission for turn ${turnId} (submissionState=${diag.submissionState}, safeToResend=${diag.safeToResend})`;
+  } else {
+    error.message = `SUBMISSION_TIMEOUT: turn ${turnId} did not expose sendCommittedAt within ${timeoutMs}ms`;
+  }
 
   throw error;
 }
@@ -388,6 +547,7 @@ export async function waitForTurn({
   let consecutiveFailures = 0;
   let backoffMs = 500;
   let lastConnError = null;
+  let lastTurn = null;
 
   while (nowFn() < deadline) {
     // After an UNREACHABLE error, re-discover before polling again: the old
@@ -410,6 +570,9 @@ export async function waitForTurn({
       lastConnError = null;
 
       const turn = res?.json;
+      if (turn && typeof turn === "object") {
+        lastTurn = turn;
+      }
       if (turn && WAIT_DONE_STATES.has(turn.state)) {
         return turn;
       }
@@ -441,8 +604,19 @@ export async function waitForTurn({
   }
 
   if (lastConnError) {
+    const diag = await diagnoseBrokerUnreachable({
+      home: effectiveHome,
+      turnId,
+      lastTurn,
+      deps,
+    });
     const err = coded("BROKER_UNREACHABLE", lastConnError);
-    err.message = `BROKER_UNREACHABLE: lost connection while waiting for turn ${turnId}`;
+    err.turnId = turnId;
+    if (lastTurn) err.turn = lastTurn;
+    err.submissionState = diag.submissionState;
+    err.safeToResend = diag.safeToResend;
+    err.livePage = diag.livePage;
+    err.message = `BROKER_UNREACHABLE: lost connection while waiting for turn ${turnId} (submissionState=${diag.submissionState}, safeToResend=${diag.safeToResend})`;
     throw err;
   }
   throw coded("TIMEOUT");

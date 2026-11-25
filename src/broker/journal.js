@@ -54,6 +54,24 @@ export async function clearCommit(home, turnId) {
   }
 }
 
+export async function readCommit(home, turnId) {
+  if (!turnId || typeof turnId !== "string" ||
+      turnId.includes("/") || turnId.includes("\\") || turnId.includes("..")) {
+    return null;
+  }
+  const target = path.join(getJournalDir(home), `${turnId}.json`);
+  try {
+    const content = await readFile(target, "utf8");
+    const record = JSON.parse(content);
+    if (record?.schema === 1 && record?.turnId === turnId && record?.provider && record?.promptSha256 && record?.submittedAt) {
+      return record;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export async function listOrphans(home) {
   const dir = getJournalDir(home);
   let files;
