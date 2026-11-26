@@ -170,6 +170,14 @@ three checkpoints. Still awaiting live verification on Windows (no logged-in Chr
 on the Linux VM); the post-submit `user-query` filename rendering is the step most
 in need of a real-DOM check.
 
+**Neon alignment (2026-11-26, branch `fix/neon-hotfix-align`, from neon `5676132`):**
+muse already forwarded `files` through `POST /turns` (`src/broker/server.js:353`,
+`src/broker/turns.js`); ported only the missing parts — `createTurn` now validates
+`files` as absolute paths, max 20 (`MAX_TURN_FILES`), and the request hash includes
+`files` (conditionally, so no-files hashes stay byte-identical and stored orphans
+still replay). `wfa broker ask` still has no `--file` support (follow-up, not
+covered by neon either).
+
 **Symptom.** `wfa cdp ask --file <archive>` passes the attachment check, the prompt is submitted, but the
 provider receives no file. Gemini answers `REPO_UNREADABLE`; ChatGPT has historically answered
 "No file is attached".
@@ -332,6 +340,14 @@ it stays. Without that, any change is guesswork.
 navigates the tab to `about:blank` and reports `parked` in all three driver decision
 points (`src/browser/driver.js`). A failed park never masks the
 `human_verification_required` report.
+
+**Neon alignment (2026-11-26, branch `fix/neon-hotfix-align`, from neon `5676132`):**
+`waitForEditor` now also fast-fails on Google `/sorry` URLs
+(`sorryUrlPattern = /\/sorry(?:\/|$|\?)/i` on the probe's `location.href`,
+same 2-consecutive-polls threshold, same `parkChallengedTab` to `about:blank`
+with `HUMAN_VERIFICATION_REQUIRED`) instead of waiting out `hardTimeoutMs`.
+Cloudflare/title/password handling unchanged. Awaiting live verification: do
+not loop-retry Gemini while the interstitial persists.
 
 **Symptom.** When a Chrome profile is challenged, `chatgpt.com` serves a `请稍候…` page with an empty body. The
 engine reports `human_verification_required`, but the challenged tab is left in place.
