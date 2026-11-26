@@ -285,6 +285,29 @@ in while restoring zero historical tabs.
 
 ---
 
+### D11 — `wfa cdp cleanup` opens one new tab per conversation (P1, 2026-11-26)
+
+**Symptom.** Bulk cleanup of wfa-created conversations opens a fresh tab for every URL
+(`handleCleanup` → `driver.openTab(cdp, targetUrl)`), evaluates the delete script, then closes it. Deleting N
+conversations therefore creates N transient tabs. That is not how a real user deletes chats, and it produces a
+large number of useless tabs while the batch runs.
+
+**Expected.** A bulk mode should open one provider tab (conversation list / sidebar) and perform the deletions
+sequentially inside that same tab, with randomized 4–6 s spacing between actions and a longer pause between
+batches. It must still delete only conversations created by wfa (`createdByWfa === true`) and never touch
+pre-existing chats.
+
+**Code fact (2026-11-26).** `src/engines/cdp-cli.js` `handleCleanup` supports only `--task-id` or `--url`; there is
+no batch/`--all` mode. The F7 status row above and the Skill line mention `--all` / `--keep-unfinished` /
+`--keep-named`, but those flags are not implemented in the current `neon` tree — verify before relying on them.
+
+**Evidence.** Live cleanup test on 2026-11-26: each `wfa cdp cleanup --url ...` opened a new tab, returned
+`status=attempted`, and the conversation was gone afterwards (read-back `userTurns=0`). Candidate list for a full
+cleanup: 109 Gemini + 113 ChatGPT wfa conversations.
+`reverdict/live-tests/20261126-cleanup-batch1/` (candidate list, pacing script, logs).
+
+---
+
 ## Planned work
 
 ### F1 — Gemini "Task" mode over CDP (P1)
