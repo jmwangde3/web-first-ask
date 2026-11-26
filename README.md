@@ -376,17 +376,18 @@ Known limits of this path: only ChatGPT and Gemini adapters exist; Claude is sti
 itself confirms a session, then closes Chrome cleanly so the profile is written out. It is the only command
 that should be used for authentication on this path.
 
-ChatGPT does not use a persistent session cookie. Its session is `oai-asli` on `chatgpt.com` with
-`is_persistent = 0`, so a browser that shuts down normally would drop it. Chrome keeps such cookies across a
-restart only when it is **started with `--restore-last-session`**, which is why `launch.js` passes that switch
-on every launch, in every mode. Measured on Windows 11 with Chrome 158: log in, close the product tab, close
-Chrome via `Browser.close` (`profile.exit_type` becomes `Normal`), relaunch with the switch, and
-`fetch('/api/auth/session')` still returns the user. A crash exit behaves the same way, because Chrome
-preserves session cookies whenever the last exit was unclean as well.
+ChatGPT login does not depend on the non-persistent `oai-asli` cookie on `chatgpt.com`, and it does not
+depend on `--restore-last-session`. That switch used to be passed on every launch on the assumption that the
+cookie only survives a restart with it — but measured live on 2026-11-26, a manually launched Chrome WITHOUT
+the switch, with the startup setting NOT "Continue where you left off" and NO `oai-asli` cookie in the
+profile, still shows chatgpt.com logged in. The switch was removed from `launch.js` on 2026-11-26 (backlog
+D10): besides being unnecessary for login, restoring every historical tab on launch — one launch restored 19
+tabs, 9 of them Gemini, all loading concurrently — can trigger Google `/sorry` and block live testing until
+Google's risk control clears. Launches now start with a clean tab set; the session persists in the profile.
 
 Do not hand-edit `Default/Preferences` to set `session.restore_on_startup`. On Windows that preference is
-covered by `Secure Preferences` and the HMAC is invalidated, so Chrome resets it on load. The command-line
-switch is the supported mechanism.
+covered by `Secure Preferences` and the HMAC is invalidated, so Chrome resets it on load. There is no switch
+to restore sessions; launches start with a clean tab set by design (see above).
 
 `wfa cdp login` reports success only when the product origin answers with a real user:
 
@@ -396,8 +397,7 @@ switch is the supported mechanism.
 - if the tab stays on the identity provider for 45 s, the command navigates it back to the product once, at
   most twice per run.
 
-If the profile is ever launched **without** the switch, Chrome deletes the non-persistent cookies at startup
-and the next `wfa cdp ask` returns `login_required`. Re-run `wfa cdp login`; the identity provider's
+If a later `wfa cdp ask` ever returns `login_required`, re-run `wfa cdp login`; the identity provider's
 persistent cookie usually makes that a few seconds without retyping a password.
 
 ## Known issues
