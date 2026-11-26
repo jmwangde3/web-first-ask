@@ -9,7 +9,13 @@ import * as defaultDriver from "../browser/driver.js";
 import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
 import * as claudeAdapter from "../browser/adapters/claude.js";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
 import { archiveRepository } from "../repository-archive.js";
+
+const execFileAsync = promisify(execFileCb);
+export const CODE_TASK_VERIFY_DIRECTIVE =
+  "\n\n[Verification requirement] Use the attached repository bundle to verify your patch: run `git apply --check` and full `npm test`, and report the exact pass/fail results before returning the final patch.";
 import { sleep as defaultSleep } from "../util.js";
 import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
 import { ensureBroker, createTurn, waitForTurn, waitForSubmission } from "../broker/client.js";
@@ -108,10 +114,11 @@ function printCdpHelp(stdout = process.stdout) {
   stdout.write(`web-first-ask (wfa) — CDP Browser Kernel Engine
 
 Commands:
-  wfa cdp ask    --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
-                 [--mode background|visible|headless] [--conversation-id <id>] [--request-id <id>] [--json]
+  wfa cdp ask    [--provider <chatgpt|gemini|claude> | --providers chatgpt,gemini] (--prompt <text> | --prompt-file <path> | stdin)
+                 [--mode background|visible|headless] [--gemini-mode task|chat] [--conversation-id <id>] [--request-id <id>] [--json]
                  [--timeout <s>] [--settle <ms>] [--min-interval <ms>]
-                 [--file <path|glob|dir>] [--no-stage] [--no-wait] [--workspace <dir>]
+                 [--code-task] [--file <path|glob|dir>] [--download-dir <dir>] [--cleanup | --no-cleanup] [--fallback-bundle]
+                 [--no-stage] [--no-wait] [--workspace <dir>]
   wfa cdp read   (--url <conversation-url> | --task-id <id>)
                  [--provider <chatgpt|gemini>] [--mode background|visible|headless]
                  [--timeout <s>] [--wait <s>] [--no-reopen] [--json] [--out <path>]
@@ -125,6 +132,12 @@ Options:
   --provider <name>          chatgpt or gemini
   --prompt <text>            Prompt string
   --prompt-file <path>       Path to prompt file
+  --code-task                Auto-attach repo git bundle (or zip fallback) and append git apply --check + npm test directive
+  --providers <list>         Comma-separated providers to run concurrently (default: chatgpt,gemini when --provider omitted)
+  --artifact-dir <dir>       Output directory for multi-provider artifacts
+  --download-dir <dir>       Directory to capture provider-generated downloads with SHA-256 verification
+  --cleanup / --no-cleanup   Auto-delete newly created one-shot conversations (default on for one-shot, off for named)
+  --fallback-bundle          Auto-bundle repo and resubmit once if provider returns terminal REPO_UNREADABLE
   --file <path|glob|dir>     Repeatable attachment; native CDP uploads via DOM.setFileInputFiles
   --mode <mode>              background (default for ask, visible for login), visible, or headless
   --gemini-mode <chat|task>  Optional Gemini web UI mode (chat or task)
@@ -655,6 +668,30 @@ async function handleAsk(argv, deps) {
     const rawFiles = Array.isArray(options.file) ? options.file : [options.file];
     const expanded = await expandAttachmentInputs({ files: rawFiles, cwd: process.cwd() });
     attachedFiles = expanded.files || [];
+  }
+  if (options["code-task"]) {
+    const workspaceRoot = options.workspace ? path.resolve(String(options.workspace)) : (deps.cwd || process.cwd());
+    const bundleDir = path.join(home, "code-task-bundles");
+    await mkdir(bundleDir, { recursive: true });
+    let bundlePath = null;
+    if (typeof deps.createCodeTaskBundle === "function") {
+      bundlePath = await deps.createCodeTaskBundle({ workspaceRoot, bundleDir });
+    } else {
+      const gitBundlePath = path.join(bundleDir, `repo-${Date.now()}-${randomUUID().slice(0, 8)}.bundle`);
+      try {
+        await execFileAsync("git", ["bundle", "create", gitBundlePath, "HEAD"], { cwd: workspaceRoot, timeout: 15000 });
+        bundlePath = gitBundlePath;
+      } catch {
+        const arc = await (deps.archiveRepository || archiveRepository)({ cwd: workspaceRoot, outDir: bundleDir });
+        bundlePath = arc?.archivePath || arc?.path || null;
+      }
+    }
+    if (bundlePath && !attachedFiles.includes(bundlePath)) {
+      attachedFiles.push(bundlePath);
+    }
+    if (!prompt.includes("git apply --check") || !prompt.includes("npm test")) {
+      prompt = `${prompt}${CODE_TASK_VERIFY_DIRECTIVE}`;
+    }
   }
 
   let mode = "background";
