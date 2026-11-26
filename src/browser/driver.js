@@ -15,6 +15,24 @@ function buildEvidence(state, lastProgressAgoMs) {
   };
 }
 
+// D5 fix (2026-11-26): whether the page shows a positive completion
+// signal. For providers that require one, the field must be literally
+// true. For the rest, a missing field counts as "done" ONLY when nothing
+// is pending: the real Gemini adapter reports null exactly when
+// pendingCount is 0 and no actions element exists, so a null seen together
+// with pending nodes in flight must not count as a completion signal. The
+// old loop masked this because a present pendingCount also held `settled`
+// false; with that presence refresh removed (see waitForCompletion), the
+// null-with-pending shape would otherwise complete a still-streaming turn.
+function isActionsDone(state, requiresActions) {
+  if (requiresActions) return state?.answerActionsVisible === true;
+  if (state?.answerActionsVisible === true) return true;
+  if (state?.answerActionsVisible === null || state?.answerActionsVisible === undefined) {
+    return !(Number.isInteger(state?.pendingCount) && state.pendingCount > 0);
+  }
+  return false;
+}
+
 const anchorTargetByBrowser = new Map();
 const anchorCreationByBrowser = new Map();
 
@@ -926,6 +944,8 @@ export async function readTurnState(cdp, sessionId, adapter, { targetId } = {}) 
       answerText: "",
       answerActionsVisible: null,
       pendingCount: 0,
+      modelTextChars: 0,
+      answerTextFull: "",
       stopVisible: false,
       editorEmpty: false,
       title: "",
@@ -965,6 +985,11 @@ export async function readTurnState(cdp, sessionId, adapter, { targetId } = {}) 
         ? null
         : Boolean(parsed.answerActionsVisible),
       pendingCount: Number.isInteger(parsed.pendingCount) ? parsed.pendingCount : 0,
+      // D5 fix: page-level full-text signals from the Gemini adapter
+      // (textContent-based; absent — e.g. older mocks or other providers —
+      // means "no full-text signal", never a claim of text).
+      modelTextChars: Number.isInteger(parsed.modelTextChars) ? parsed.modelTextChars : 0,
+      answerTextFull: typeof parsed.answerTextFull === "string" ? parsed.answerTextFull : "",
       stopVisible: Boolean(parsed.stopVisible),
       editorEmpty: parsed.editorEmpty !== null && parsed.editorEmpty !== undefined ? Boolean(parsed.editorEmpty) : null,
       title: typeof parsed.title === "string" ? parsed.title : "",
@@ -999,6 +1024,8 @@ export async function readTurnState(cdp, sessionId, adapter, { targetId } = {}) 
       answerText: "",
       answerActionsVisible: null,
       pendingCount: 0,
+      modelTextChars: 0,
+      answerTextFull: "",
       stopVisible: false,
       editorEmpty: null,
       title: "",
@@ -1046,11 +1073,30 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   // D5 fix: extra sink for stall decisions, in addition to the pause
   // tracker. Best-effort; a throwing sink must never break the wait.
   onStallDecision = null,
+  // D5 fix (2026-11-26, REPORT-02360b8c run1): stale-pending completion.
+  // A completed Gemini reply can sit unfinalised in a background tab with
+  // pendingCount stuck > 0 and no stop button while the page already holds
+  // the full answer. `stalePendingMs` is how long the pending count AND
+  // the page-level full text must both stay frozen before that state
+  // counts as completion; it defaults to the stall boundary
+  // (stallTimeoutMs, 420 s — NOT raised as the fix). `stalePendingMinChars`
+  // is the floor for "full answer text present": observed genuine thinking
+  // pauses all stuck at 18-25 chars of emitted text, so a frozen full
+  // text below this floor never completes through this path.
+  stalePendingMs = stallTimeoutMs,
+  stalePendingMinChars = 1000,
 } = {}) {
   const startTime = now();
   let lastProgressAt = startTime;
   let lastActivityAt = startTime;
   let lastPendingCount = 0;
+  let lastModelTextChars = 0;
+  // D5 fix: when each in-flight signal last changed. A merely present
+  // pendingCount is not activity (see the deleted refresh below); only a
+  // change restarts these clocks.
+  let pendingStableSince = startTime;
+  let modelTextStableSince = startTime;
+  let stalePendingConfirmDone = false;
   let hasAcked = false;
   let lastBelongsToCurrentTurn = false;
   let lastAnswerChars = 0;
@@ -1061,6 +1107,13 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   // 三方裁决（2026-11-25 第七轮 3:0）：ChatGPT 的完成一律要求正面信号，
   // 停止按钮不参与完成判定（实测 0x0 且回答结束后长期不翻转）。
   const requiresActions = adapter.requiresCompletionActions === true;
+
+  if (!Number.isFinite(stalePendingMs) || stalePendingMs <= 0) {
+    throw new Error("INVALID_STALE_PENDING_MS");
+  }
+  if (!Number.isFinite(stalePendingMinChars) || stalePendingMinChars < 0) {
+    throw new Error("INVALID_STALE_PENDING_MIN_CHARS");
+  }
 
   // D5 fix: alive/dead stall policy. Decisions flow into the pause tracker
   // (recordDecision) so they land in the same opt-in pause-event log, and
@@ -1179,6 +1232,11 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
         lastPendingCount = Number.isInteger(state.pendingCount) ? state.pendingCount : 0;
         lastAnswerText = state.answerText || "";
         lastAnswerChars = lastAnswerText.length;
+        // D5 fix: ACK establishes the baselines for the stale-pending
+        // clocks too — pre-ACK silence must not count as a frozen page.
+        lastModelTextChars = Number.isInteger(state.modelTextChars) ? state.modelTextChars : 0;
+        pendingStableSince = now();
+        modelTextStableSince = now();
       } else {
         if (now() - startTime >= ackTimeoutMs) {
           return {
@@ -1210,9 +1268,16 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     const currentPendingCount = !requiresActions && Number.isInteger(state.pendingCount)
       ? state.pendingCount
       : 0;
+    const currentModelTextChars = Number.isInteger(state.modelTextChars) ? state.modelTextChars : 0;
     const textProgressed = currentChars > lastAnswerChars || (currentText && currentText !== lastAnswerText);
     const pendingProgressed = !requiresActions && currentPendingCount > 0 && currentPendingCount !== lastPendingCount;
-    if (textProgressed || pendingProgressed) {
+    // D5 fix: the page-level full text (textContent) growing is progress
+    // too — during run1's early phase text streamed into pending spans
+    // while the extractor's innerText stayed frozen at 43 chars. Any
+    // change counts: growth, or a shrink from a replaced response.
+    const modelTextProgressed = currentModelTextChars !== lastModelTextChars;
+    const pendingChanged = currentPendingCount !== lastPendingCount;
+    if (textProgressed || pendingProgressed || modelTextProgressed) {
       lastProgressAt = now();
       lastActivityAt = now();
       // D5 fix: progress ends the silence episode, so a later silence gets
@@ -1224,14 +1289,28 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       }
       unresolvedSince = null;
     }
+    // D5 fix: the stability clocks restart only when the value actually
+    // changes — a frozen count is not activity, however large it is.
+    if (pendingChanged) pendingStableSince = now();
+    if (modelTextProgressed) {
+      modelTextStableSince = now();
+      lastModelTextChars = currentModelTextChars;
+    }
     lastPendingCount = currentPendingCount;
 
     const stopVisibleForMs = stopVisibleSince === null ? 0 : now() - stopVisibleSince;
     const stopGone = !state.stopVisible;
     const stopDegraded = state.stopVisible && stopVisibleForMs >= stopGraceMs;
-    if (!requiresActions && (currentPendingCount > 0 || (state.stopVisible && !stopDegraded))) {
-      lastActivityAt = now();
-    }
+    // D5 fix (2026-11-26, REPORT-02360b8c run1): the old refresh below
+    // treated a merely present pendingCount as activity, so with pending
+    // stuck at 666 `lastActivityAt` was refreshed on every poll and
+    // `settled` could never become true — the turn sat "paused" for 13.8
+    // min until the hard timeout even though nothing had changed. Removed:
+    // activity now means a change (text, pending count, or page-level full
+    // text — see the progress branch above). The stop button keeps its own
+    // gate: `stopGateSatisfied` still requires it gone, or visible for
+    // >= stopGraceMs. ChatGPT is unaffected: this block never ran when
+    // requiresActions is true.
 
     const hasAnswer = currentAnswerText.length > 0;
     const settled = requiresActions
@@ -1242,15 +1321,101 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     // 一律视为"无正面信号"（不得当作 true，否则等于没有门禁）。
     // 真机证据（2026-11-24）：Gemini 长思考暂停时停止按钮会消失，仅靠 stopGone 会把
     // 只输出了 18 字符的回答判为完成，而完整回答（20575 字符）要几十秒后才继续生成。
-    const actionsDone = requiresActions
-      ? state.answerActionsVisible === true
-      : (state.answerActionsVisible === null || state.answerActionsVisible === undefined
-        ? true
-        : state.answerActionsVisible === true);
+    const actionsDone = isActionsDone(state, requiresActions);
     // 停止按钮只对未声明 requiresCompletionActions 的 provider 参与完成判定。
     // ChatGPT 实测（2026-11-25，三次 400ms 逐帧）：生成期该按钮 getBoundingClientRect 为 0x0；
     // 回答结束后 45 秒仍未翻回发送箭头。它既不能判完成，也不能做活动否决。
     const stopGateSatisfied = requiresActions ? true : (stopGone || stopDegraded);
+
+    // D5 fix (2026-11-26, REPORT-02360b8c run1): stale-pending
+    // completion. A page that proves completion is not a stall, so this
+    // runs before the stall classification below. All of these must hold
+    // for the whole stale window, and the candidate is confirmed with one
+    // fresh read (which also re-activates the tab, D8 — a throttled
+    // background tab can unfreeze its finalisation pass on activation)
+    // before the turn completes:
+    //   - no stop control (stopGone);
+    //   - pendingCount frozen above zero (no streaming activity);
+    //   - the full answer text present and frozen (modelTextChars, the
+    //     textContent length of the last model-response, at or above
+    //     stalePendingMinChars);
+    //   - no positive completion signal yet (otherwise the normal
+    //     completion below fires with reason "completed").
+    // The returned text is the page-level full text (answerTextFull), not
+    // the extractor's frozen innerText — run1 would otherwise "complete"
+    // with 43 chars while the page holds 29,970.
+    // Residual risk, recorded not hidden: a genuine long thinking pause
+    // after a long partial answer, with the stop button already gone,
+    // would also satisfy this after stalePendingMs of silence. The
+    // observed genuine pauses all stuck at 18-25 chars of emitted text
+    // (2026-11-25: pending 378, chars 18-25, then completed at 7,803),
+    // i.e. below stalePendingMinChars, and the window defaults to the
+    // 420 s stall boundary — but a pause past 420 s with a long partial
+    // answer cannot be told apart from a completed-but-unfinalised one
+    // from this data, so a completion through this path is labelled
+    // `completed_stale_pending` with the counts in evidence.
+    const stalePendingCandidate = !requiresActions
+      && belongs && hasAnswer && stopGone && !actionsDone
+      && currentPendingCount > 0
+      && (now() - pendingStableSince) >= stalePendingMs
+      && (now() - modelTextStableSince) >= stalePendingMs
+      && currentModelTextChars >= stalePendingMinChars;
+    if (stalePendingCandidate) {
+      if (!stalePendingConfirmDone) {
+        stalePendingConfirmDone = true;
+        let confirmed = null;
+        try {
+          if (targetId) {
+            try { await activateTab(cdp, targetId); } catch {}
+          }
+          confirmed = await readTurnState(cdp, sessionId, adapter, targetId ? { targetId } : {});
+        } catch {}
+        if (confirmed) {
+          lastState = confirmed;
+          const confirmText = (confirmed.answerText || "").trim();
+          const confirmBelongs = Boolean(confirmText)
+            && (confirmed.answerTurns > baselineAnswerTurns || (baseText ? confirmText !== baseText : false));
+          const confirmModelTextChars = Number.isInteger(confirmed.modelTextChars) ? confirmed.modelTextChars : 0;
+          const confirmPendingCount = !requiresActions && Number.isInteger(confirmed.pendingCount)
+            ? confirmed.pendingCount
+            : 0;
+          const confirmActionsDone = isActionsDone(confirmed, requiresActions);
+          if (confirmBelongs && !confirmed.stopVisible && !confirmActionsDone
+              && confirmPendingCount > 0 && confirmPendingCount === currentPendingCount
+              && confirmModelTextChars === currentModelTextChars
+              && confirmModelTextChars >= stalePendingMinChars) {
+            const fullText = (confirmed.answerTextFull || "").trim();
+            return {
+              status: "completed",
+              reason: "completed_stale_pending",
+              text: fullText || confirmed.answerText || "",
+              elapsedMs: now() - startTime,
+              evidence: {
+                ...buildEvidence(confirmed, now() - lastProgressAt),
+                stopVisibleForMs,
+                stopSignalDegraded: stopDegraded,
+                stalePending: true,
+                answerTextFullUsed: fullText.length > 0,
+                // The gap that diagnosed run1: extractor chars (43) vs the
+                // full text present on the page (29,970), with pending stuck.
+                modelTextChars: confirmModelTextChars,
+                pendingCount: confirmPendingCount,
+                pendingStableMs: now() - pendingStableSince,
+                modelTextStableMs: now() - modelTextStableSince,
+                ...(aliveStallPolicy.decisions().length
+                  ? { stallDecisions: aliveStallPolicy.decisions() }
+                  : {}),
+              },
+            };
+          }
+          // Confirm did not hold (or the fresh read showed progress or a
+          // signal): keep polling on the current data. A later progress
+          // resets the confirm flag via the candidate going false below.
+        }
+      }
+    } else {
+      stalePendingConfirmDone = false;
+    }
 
     if (now() - lastProgressAt >= stallTimeoutMs) {
       if (!requiresActions) {
@@ -1328,9 +1493,17 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 
     // ChatGPT（三方 3:0）：无正面信号的空正文不得靠 settle+grace 判 MESSAGE_SELECTOR_UNRESOLVED，
     // 只有已取得本轮动作栏证据、正文仍提取不到时才走该分支。
+    // D5 fix: the Gemini branch additionally requires pendingCount 0. The
+    // old `settled` was false while pending nodes were reported (the
+    // presence refresh kept lastActivityAt fresh), so a stuck-pending page
+    // could never reach this branch; with that refresh removed, `settled`
+    // alone no longer proves the provider finished — a pending count still
+    // in flight means generation (or a stale-pending completion) is the
+    // question, not an unresolved selector. The stall / stale-pending
+    // paths above own the pending > 0 shape.
     const unresolvedCandidate = requiresActions
       ? (state.answerTurns > baselineAnswerTurns && actionsDone && settled && !hasAnswer)
-      : (state.answerTurns > baselineAnswerTurns && stopGone && settled && !hasAnswer);
+      : (state.answerTurns > baselineAnswerTurns && stopGone && settled && !hasAnswer && currentPendingCount === 0);
     if (unresolvedCandidate) {
       if (unresolvedSince === null) {
         unresolvedSince = now();
@@ -1339,14 +1512,13 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
         lastState = confirm;
         const confirmHasAnswer = (confirm.answerText || "").trim().length > 0;
         const confirmStopGone = !confirm.stopVisible;
-        const confirmActionsDone = requiresActions
-          ? confirm.answerActionsVisible === true
-          : (confirm.answerActionsVisible === null || confirm.answerActionsVisible === undefined
-            ? true
-            : confirm.answerActionsVisible === true);
+        const confirmActionsDone = isActionsDone(confirm, requiresActions);
+        const confirmPendingCount = !requiresActions && Number.isInteger(confirm.pendingCount)
+          ? confirm.pendingCount
+          : 0;
         const confirmCandidate = requiresActions
           ? (confirm.answerTurns > baselineAnswerTurns && confirmActionsDone && confirmHasAnswer === false)
-          : (confirm.answerTurns > baselineAnswerTurns && confirmStopGone && confirmHasAnswer === false);
+          : (confirm.answerTurns > baselineAnswerTurns && confirmStopGone && confirmHasAnswer === false && confirmPendingCount === 0);
         if (confirmCandidate) {
           return {
             status: "failed",
