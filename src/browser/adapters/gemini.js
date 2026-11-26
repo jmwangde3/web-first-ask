@@ -64,13 +64,6 @@ export function buildUploadJs() {
 
   const inputReady = await waitFor(() => {
     const input = document.querySelector(${JSON.stringify(fileInputSelector)});
-  const sendBtns = [...document.querySelectorAll(${JSON.stringify(sendSelector)})];
-  const isVisible = (el) => {
-    if (!el) return false;
-    const r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
-    return !r || (r.width > 0 && r.height > 0);
-  };
-  const sendReady = sendBtns.some((b) => isVisible(b) && !b.disabled && b.getAttribute("aria-disabled") !== "true");
     return Boolean(input);
   }, 6000);
   if (!inputReady) {
@@ -82,21 +75,59 @@ export function buildUploadJs() {
 }
 
 
-// 附件成功判据（2026-11-24 真机）：Gemini 上传后出现 div.attachment-preview-wrapper，
-// 其 innerText 常为空（文件名在子结构/异步加载），故以 chip 出现为成功信号，不强求文本匹配。
-// input.files 仅诊断，不作判据。
-export const attachmentChipSelector = '[class*="attachment-preview"], [class*="file-chip"], gem-attachment-chip, [data-testid*="attachment"]';
+// 附件成功判据（2026-11-26 真机 D3 采证）：
+// 注入后 0.02s 出现的 div.attachment-preview-wrapper 为 0 高度空壳，绝不能当作上传成功；
+// 真实芯片结构为 uploader-file-preview.file-preview-chip / gem-attachment，
+// 文件名由 span.gem-attachment-text + span.gem-attachment-extension-label 组成。
+export const attachmentChipSelector = 'uploader-file-preview.file-preview-chip, gem-attachment, [class*="file-chip"], gem-attachment-chip';
 export function buildAttachmentVerifyJs(fileNames) {
   const bases = fileNames.map((fp) => String(fp).split(/[\\/]/).pop());
   return `(() => {
-  const chips = [...document.querySelectorAll(${JSON.stringify(attachmentChipSelector)})];
-  const texts = chips.map((el) => String((el && (el.innerText || el.textContent)) || "").trim());
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    if (r && (r.width <= 0 || r.height <= 0)) return false;
+    return true;
+  };
+  const norm = (s) => String(s || "").toLowerCase().replace(/\\s+/g, " ").trim();
+  const extractChipName = (el) => {
+    const stemEl = typeof el.querySelector === "function" ? el.querySelector("span.gem-attachment-text, .gem-attachment-text") : null;
+    const extEl = typeof el.querySelector === "function" ? el.querySelector("span.gem-attachment-extension-label, .gem-attachment-extension-label") : null;
+    const stem = norm(stemEl && (stemEl.innerText || stemEl.textContent));
+    const ext = norm(extEl && (extEl.innerText || extEl.textContent)).replace(/^\\.+/, "");
+    if (stem) return ext ? (stem.endsWith("." + ext) ? stem : stem + "." + ext) : stem;
+    const raw = norm(el.innerText || el.textContent || (typeof el.getAttribute === "function" ? (el.getAttribute("aria-label") || el.getAttribute("title")) : ""));
+    return raw;
+  };
+  const allChips = [...document.querySelectorAll(${JSON.stringify(attachmentChipSelector)})];
+  const visibleChips = allChips.filter((el) => {
+    if (!isVisible(el)) return false;
+    const hasChildren = typeof el.childElementCount === "number" ? el.childElementCount > 0 : true;
+    const name = extractChipName(el);
+    return hasChildren || name.length > 0;
+  });
+  const chipNames = visibleChips.map(extractChipName).filter(Boolean);
+  const bases = ${JSON.stringify(bases)}.map(norm);
+  const matchesBase = (base, chipName) => {
+    if (!base || !chipName) return false;
+    if (chipName === base || chipName.includes(base)) return true;
+    const dot = base.lastIndexOf(".");
+    if (dot > 0) {
+      const stem = base.slice(0, dot);
+      const ext = base.slice(dot + 1);
+      if (chipName.includes(stem) && chipName.includes(ext)) return true;
+    }
+    return false;
+  };
+  const matched = bases.map((base) => chipNames.some((cn) => matchesBase(base, cn)));
+  const sendBtns = [...document.querySelectorAll(${JSON.stringify(sendSelector)})];
+  const sendReady = sendBtns.length === 0 || sendBtns.some((b) => isVisible(b) && !b.disabled && (typeof b.getAttribute !== "function" || b.getAttribute("aria-disabled") !== "true"));
   const input = document.querySelector(${JSON.stringify(fileInputSelector)});
   return {
-    present: chips.length > 0 && sendReady,
-    matched: bases.map(() => chips.length > 0),
-    chipCount: chips.length,
-    chipTexts: texts.slice(0, 8),
+    present: matched.length > 0 && matched.every(Boolean) && sendReady,
+    matched,
+    chipCount: visibleChips.length,
+    chipTexts: chipNames.slice(0, 8),
     sendReady,
     inputFiles: input && input.files ? [...input.files].map((f) => f.name) : [],
   };
@@ -160,14 +191,23 @@ export function buildReadStateJs() {
   const LF = String.fromCharCode(10);
   const CODE_SEL = "pre, code-block, code[class*=block]";
   const LABEL_RE = /^(代码|CODE|Code|code|[A-Za-z0-9+#._-]{1,20})$/;
+  const hasCollapsedWrapper = (root) => Boolean(
+    root && typeof root.querySelector === "function" && root.querySelector("div.collapsible-content-wrapper")
+  );
   const withCodeFences = (root) => {
-    let text = String((root && (root.innerText || root.textContent)) || "").trim();
+    const inner = String((root && root.innerText) || "").trim();
+    const raw = String((root && root.textContent) || "").trim();
+    const useTextContent = raw.length > inner.length &&
+      (hasCollapsedWrapper(root) || (inner.length > 0 && raw.length >= inner.length * 2));
+    let text = useTextContent ? raw : (inner || raw);
     const blocks = root && typeof root.querySelectorAll === "function"
       ? [...root.querySelectorAll(CODE_SEL)].filter((el) => !el.parentElement || !el.parentElement.closest(CODE_SEL))
       : [];
     let searchFrom = 0;
     for (const el of blocks) {
-      const code = String((el.innerText || el.textContent) || "").trim();
+      const elInner = String((el && el.innerText) || "").trim();
+      const elRaw = String((el && el.textContent) || "").trim();
+      const code = (useTextContent ? (elRaw || elInner) : (elInner || elRaw)).trim();
       if (!code) continue;
       const idx = text.indexOf(code, searchFrom);
       if (idx === -1) continue;
@@ -181,9 +221,11 @@ export function buildReadStateJs() {
     return text;
   };
   let answerText = "";
+  let collapsed = false;
   const last = modelResponses[modelResponses.length - 1];
   if (last) {
     const body = last.querySelector("message-content, .markdown") ?? last;
+    collapsed = hasCollapsedWrapper(last) || hasCollapsedWrapper(body);
     answerText = withCodeFences(body).replace(/^(Gemini|Bard)\\s*(said|说)\\s*[:：]?\\s*/i, "").trim();
   }
 
@@ -198,7 +240,7 @@ export function buildReadStateJs() {
     if (actions) {
       const ar = typeof actions.getBoundingClientRect === "function" ? actions.getBoundingClientRect() : null;
       answerActionsVisible = ar ? ar.width > 0 && ar.height > 0 : true;
-    } else if (pendingCount > 0) {
+    } else if (pendingCount > 0 && !collapsed) {
       answerActionsVisible = false;
     }
   }
@@ -265,6 +307,7 @@ export function buildReadStateJs() {
     answerText,
     answerActionsVisible,
     pendingCount,
+    collapsed,
     stopVisible,
     editorEmpty,
     title,

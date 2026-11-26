@@ -767,6 +767,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       answerText: "",
       answerActionsVisible: null,
       pendingCount: 0,
+      collapsed: false,
       stopVisible: false,
       editorEmpty: false,
       title: "",
@@ -800,6 +801,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
         ? null
         : Boolean(parsed.answerActionsVisible),
       pendingCount: Number.isInteger(parsed.pendingCount) ? parsed.pendingCount : 0,
+      collapsed: Boolean(parsed.collapsed),
       stopVisible: Boolean(parsed.stopVisible),
       editorEmpty: parsed.editorEmpty !== null && parsed.editorEmpty !== undefined ? Boolean(parsed.editorEmpty) : null,
       title: typeof parsed.title === "string" ? parsed.title : "",
@@ -818,6 +820,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       answerText: "",
       answerActionsVisible: null,
       pendingCount: 0,
+      collapsed: false,
       stopVisible: false,
       editorEmpty: null,
       title: "",
@@ -966,7 +969,8 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 
     const currentText = state.answerText || "";
     const currentChars = currentText.length;
-    const currentPendingCount = !requiresActions && Number.isInteger(state.pendingCount)
+    const collapsedPendingFrozen = Boolean(state.collapsed) && !state.stopVisible && currentAnswerText.length > 0;
+    const currentPendingCount = !requiresActions && !collapsedPendingFrozen && Number.isInteger(state.pendingCount)
       ? state.pendingCount
       : 0;
     const textProgressed = currentChars > lastAnswerChars || (currentText && currentText !== lastAnswerText);

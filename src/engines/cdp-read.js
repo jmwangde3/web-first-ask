@@ -219,6 +219,7 @@ export async function readConversation({
   mode = "background",
   timeoutMs = 15000,
   wait = 0,
+  reopenHydrateTimeoutMs = 10000,
   noReopen = false,
   signal,
   deps = {},
@@ -495,6 +496,30 @@ export async function readConversation({
           const opened = await openTabFn(cdp, conversationUrl, { timeoutMs });
           selectedTargetId = opened.targetId;
           sessionId = opened.sessionId;
+          const hydrateCapMs = Math.max(0, Math.min(reopenHydrateTimeoutMs, timeoutMs));
+          if (hydrateCapMs > 0) {
+            const hydrateDeadline = nowFn() + hydrateCapMs;
+            const hydrateInterval = 500;
+            while (nowFn() < hydrateDeadline) {
+              if (signal?.aborted) {
+                throw coded("CANCELLED", "Read operation cancelled");
+              }
+              try {
+                const probe = await readStateFn(cdp, sessionId, adapter);
+                lastPageState = probe;
+                const hydrated =
+                  (probe?.userTurns ?? 0) > 0 ||
+                  (probe?.answerTurns ?? 0) > 0 ||
+                  Boolean((probe?.answerText || "").trim());
+                if (hydrated) break;
+              } catch {
+                // Retry until hydration deadline; main loop handles persistent read errors.
+              }
+              const remaining = hydrateDeadline - nowFn();
+              if (remaining <= 0) break;
+              await sleepFn(Math.min(hydrateInterval, remaining));
+            }
+          }
         } else if (effectiveNoReopen || !conversationUrl) {
           return {
             status: "tab_missing",

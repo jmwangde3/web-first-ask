@@ -145,8 +145,16 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
 
   function hasWork() {
+    if (active.size > 0) return true;
     const state = snapshot(scheduler);
-    return state.runningTotal > 0 || state.queued.length > 0;
+    if (state.runningTotal > 0 || state.queued.length > 0) return true;
+    for (const turn of turns.values()) {
+      if (turn && !TERMINAL_STATES.includes(turn.state) &&
+          turn.state !== "needs_human" && turn.state !== "takeover") {
+        return true;
+      }
+    }
+    return false;
   }
 
   function trackIdle() {
@@ -522,6 +530,11 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
       typeof turnStore.pruneTurns === "function" ? turnStore.pruneTurns(home).catch(() => {}) : Promise.resolve(),
     ]);
     idleTimer = setInterval(() => {
+      if (hasWork()) {
+        idleSince = null;
+        idleTriggered = false;
+        return;
+      }
       if (mode === "off" && !closing && !idleTriggered && idleSince !== null &&
           Date.now() - idleSince >= idleTimeoutMs) {
         void (async () => {
