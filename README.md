@@ -397,6 +397,9 @@ switch is the supported mechanism.
   the identity provider signed in and the product signed out.
 - if the tab stays on the identity provider for 45 s, the command navigates it back to the product once, at
   most twice per run.
+- that 45 s redirect is meant for automated logins. It interrupts a human sign-in that legitimately spends more
+  than 45 s on the identity provider (password manager, 2FA, phone approval); tracked as D12 in
+  `docs/backlog.md`. Manual login should not be subject to the redirect.
 
 Earlier revisions of this document claimed that launching without the switch drops the non-persistent
 `oai-asli` cookie and forces `login_required`. That was tested on 2026-11-26 and disproven for this profile:
