@@ -63,6 +63,11 @@ export async function recordResult(home, turn) {
     text: turn.text ?? null,
     reason: turn.reason ?? null,
     evidence: turn.evidence ?? null,
+    // F1/F4: same round-trip as the turn record — a completed turn restored
+    // after a broker restart still reports the mode it ran in and where its
+    // downloads were captured.
+    geminiMode: turn.geminiMode ?? null,
+    downloadDir: turn.downloadDir ?? null,
     sendCommittedAt: turn.sendCommittedAt ?? null,
     createdAt: turn.createdAt ?? null,
     startedAt: turn.startedAt ?? null,

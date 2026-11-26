@@ -20,8 +20,9 @@ import { TURN_STATES } from "./turns.js";
 import { clearBrokerRecord, readBrokerRecord } from "./lifecycle.js";
 import * as defaultJournal from "./journal.js";
 import { loadConfig } from "../config.js";
+import { normalizeGeminiMode } from "../engines/cdp-engine.js";
 
-const VALUE_FLAGS = new Set(["mode", "state", "timeout", "provider", "prompt", "prompt-file", "request-id"]);
+const VALUE_FLAGS = new Set(["mode", "state", "timeout", "provider", "prompt", "prompt-file", "request-id", "gemini-mode", "download-dir"]);
 
 function parseArgs(argv) {
   const positional = [];
@@ -63,9 +64,12 @@ Commands:
   wfa broker wait <id> [--timeout <s>] [--json]
   wfa broker ask --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
                  [--mode <background|visible|headless>] [--request-id <id>] [--wait] [--timeout <s>] [--json]
+                 [--gemini-mode <chat|task>] [--download-dir <dir>]
 
 Options:
   --mode <mode>           Runner browser mode: background (default), visible, or headless
+  --gemini-mode <mode>    Gemini page mode: chat (default) or task; task only applies to --provider gemini
+  --download-dir <dir>    Directory for provider-produced downloads, captured after a completed turn
   --detach                Run broker in the background
   --json                  Output machine-readable JSON
   --state <state>         Filter turns by state
@@ -577,6 +581,33 @@ async function handleBrokerAsk(argv, deps) {
     }
   }
 
+  // F1/F4: `wfa broker ask` used to have no such flags at all, so the values
+  // could never reach the broker even after the server allowlist fix.
+  // Validation mirrors `wfa cdp ask` (same messages): task only for gemini,
+  // download-dir a non-empty path resolved like the CDP path does.
+  let geminiMode = "chat";
+  if (options["gemini-mode"] !== undefined) {
+    geminiMode = normalizeGeminiMode(options["gemini-mode"]);
+    if (geminiMode === null) {
+      stderr.write(`wfa: INVALID_ARGUMENT: Invalid --gemini-mode: ${options["gemini-mode"]}. Must be chat or task.\n`);
+      return { code: 2 };
+    }
+    if (geminiMode === "task" && provider !== "gemini") {
+      stderr.write("wfa: INVALID_ARGUMENT: --gemini-mode task only applies to --provider gemini.\n");
+      return { code: 2 };
+    }
+  }
+
+  let downloadDir = null;
+  if (options["download-dir"] !== undefined) {
+    const raw = String(options["download-dir"]).trim();
+    if (!raw) {
+      stderr.write("wfa: INVALID_ARGUMENT: Option --download-dir must be a non-empty path.\n");
+      return { code: 2 };
+    }
+    downloadDir = path.resolve(raw);
+  }
+
   let requestId;
   if (options["request-id"] !== undefined) {
     requestId = String(options["request-id"]).trim();
@@ -631,6 +662,10 @@ async function handleBrokerAsk(argv, deps) {
       prompt,
       requestId,
       ...(mode ? { mode } : {}),
+      // F1/F4: forwarded (only when set) so the broker turn carries them
+      // to runCdpTurn; same shape as `wfa cdp ask`.
+      ...(geminiMode !== "chat" ? { geminiMode } : {}),
+      ...(typeof downloadDir === "string" && downloadDir.trim() ? { downloadDir } : {}),
     });
   } catch (err) {
     stderr.write(`wfa: ${err?.code || "BROKER_UNREACHABLE"}: ${err?.message || String(err)}\n`);

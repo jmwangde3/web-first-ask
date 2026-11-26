@@ -816,7 +816,7 @@ test("requestId replay returns 200 instead of 409 when turn is in orphan state; 
 
   const { createHash } = await import("node:crypto");
   const requestHash = createHash("sha256")
-    .update(JSON.stringify(["chatgpt", promptSha256, null, "background", null, null, null, null]))
+    .update(JSON.stringify(["chatgpt", promptSha256, null, "background", null, null, null, null, null, null]))
     .digest("hex");
   await recordRequest(home, {
     requestId,
@@ -830,7 +830,7 @@ test("requestId replay returns 200 instead of 409 when turn is in orphan state; 
   const missingRequestId = "req-orphan-missing-turn-1";
   const missingPromptSha = hashPrompt(missingPrompt);
   const missingRequestHash = createHash("sha256")
-    .update(JSON.stringify(["chatgpt", missingPromptSha, null, "background", null, null, null, null]))
+    .update(JSON.stringify(["chatgpt", missingPromptSha, null, "background", null, null, null, null, null, null]))
     .digest("hex");
   await recordCommit(home, {
     turnId: missingTurnId,
