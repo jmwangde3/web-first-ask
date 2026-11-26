@@ -26,6 +26,30 @@ F5 was code-reviewed only (no conformance bugs found; all Claude selectors still
 Everything below was reproduced on a real Chrome with logged-in ChatGPT and Gemini accounts unless marked
 otherwise. Items marked *(unverified)* were reported but not re-confirmed with a controlled experiment.
 
+## Live verification — muse @ `3f59c5f` (2026-11-26 13:30, Windows 11 / Node 26.13.1 / Chrome 158)
+
+Recorded on this branch only (the shared catalogue is on `main`; `neon` keeps its own copy).
+
+`npm test` = **709/709** with `node --test --test-concurrency=1 --test-timeout=20000` (142 s).
+The default `node --test` (parallel) **hangs** on this machine (>22 min, no output) — a test-infrastructure
+problem, not a product failure; file-by-file runs all exit 0.
+
+| Item | Live result | Detail |
+|---|---|---|
+| D1 | **pass** | `--no-wait`; broker pid 29816 unchanged at t+35 s; `read --task-id` returned `completed` ("R"). |
+| D2 | **pass** | target tab absent → first `read --url` returned `completed` in 7.5 s, 976 chars, `userTurns=2`. |
+| D3 | **pass (fail-closed)** | `--file d3-probe.zip` → `ATTACH_UPLOAD_FAILED` in 8.2 s, `chipCount=1`, no submission (`sendCommittedAt` absent). Meets the second acceptable outcome. |
+| D4 | not run this round | last run on 2026-11-26 11:2x passed (11,909 chars from Gemini). |
+| D5 | **fail — reproduced** | run1: page finished at **29,970 chars** (title "分布式链路追踪解析与实战"), `stopVisible=false`, but the CLI waited to the **900 s** hard timeout and printed `TIMEOUT`. run2 hit Google `/sorry` and was stopped. `WFA_PAUSE_EVENTS_DIR` produced **no files**. |
+| F1 | **fail** | `geminiMode: "task"` now reaches the turn record, but twice failed at ~0.7–3 s with `gemini_mode_failed: task_mode_control_not_found`. DOM probe on the same browser shows the selector is correct (`gem-segmented-button-row[role=group]` exists, Chat/Task buttons present) — the control renders **after** `waitForEditor`, and `ensureProviderMode` checks only once. Needs a 3–5 s bounded poll. |
+| F4 | **pass** | `--download-dir` captured `sample.csv` (6 B); turn record carries `downloads[]` with path, size, sha256, provider, downloadedAt. CLI stdout does not print the field. |
+| F7 | **pass** | `wfa cdp cleanup --dry-run --json` listed 35 sessions / 2 candidates; filtered dry-run (`--provider gemini --conversation-id d9-muse-20261126`) listed exactly 1; real run deleted it in 2.7 s. |
+| F5 / F8 / F9 | not re-run this round | unchanged from the previous round. |
+
+**Gemini bot-check recurrence**: run2 was redirected to `https://www.google.com/sorry/...` after run1's
+900 s session. See `reverdict/GEMINI-BOT-CHECK-ANALYSIS.md` — long-task runs must be spaced (≥30 min), and
+the restored-tab pile-up must be cleared before each run.
+
 ## How to validate a fix
 
 ```bash
