@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
+
+// Neon hotfix alignment (D3): a broker turn carries at most 20 attachment
+// paths, all absolute — a relative path is meaningless to the broker
+// runner, which resolves files against its own cwd.
+const MAX_TURN_FILES = 20;
 
 export const TURN_STATES = Object.freeze([
   "queued", "running", "completed", "needs_human", "takeover", "stalled", "failed",
@@ -58,7 +64,8 @@ export function createTurn({
       (chromePath !== null && (typeof chromePath !== "string" || !chromePath.trim())) ||
       (geminiMode !== null && geminiMode !== "chat" && geminiMode !== "task") ||
       (downloadDir !== null && (typeof downloadDir !== "string" || !downloadDir.trim())) ||
-      (!Array.isArray(files) || files.some((f) => typeof f !== "string" || !f.trim())) ||
+      (!Array.isArray(files) || files.length > MAX_TURN_FILES ||
+        files.some((f) => typeof f !== "string" || !f.trim() || !path.isAbsolute(f))) ||
       typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) {
     throw invalid("Invalid turn arguments");
   }

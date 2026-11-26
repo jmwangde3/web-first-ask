@@ -36,6 +36,11 @@ function computeRequestHash(turn, promptSha256) {
       // silent idempotent replay of the old turn.
       turn.geminiMode ?? null,
       turn.downloadDir ?? null,
+      // Neon hotfix alignment (D3): files are request-affecting too — a
+      // retry with different attachments must 409, not replay the old turn.
+      // Only non-empty file lists join the fingerprint, so a no-files turn
+      // hashes exactly as before (stored request records keep replaying).
+      ...(Array.isArray(turn.files) && turn.files.length > 0 ? [turn.files] : []),
     ]))
     .digest("hex");
 }
