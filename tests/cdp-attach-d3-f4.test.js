@@ -241,6 +241,116 @@ test("D3 driver.attachFiles (gemini): chip with the right filename succeeds", as
   assert.deepEqual(res.attached, [testFile]);
 });
 
+// D3 r3 (2026-11-26): the live failure `chipCount=1, inputFiles=[]` could
+// not be located because the thrown message dropped matched / chipTexts /
+// sendReady, and the setter's own outcome was never read back — the verify
+// loop reads input.files up to 7 s after the setter, by which time React
+// may already have consumed and cleared it. The failure message now carries
+// the full diag plus the immediate post-setter read-back; the read-back is
+// diagnostic only and must never change the pass/fail decision.
+test("D3 driver.attachFiles (gemini): failure message carries the full diag incl. setter read-back (reported shape)", async () => {
+  const testFile = path.resolve("package.json");
+  let fakeNow = 1000;
+  const mockCdp = {
+    send: async (method, params = {}) => {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.querySelector") return { nodeId: 42 };
+      if (method === "Runtime.evaluate") {
+        const expression = String(params?.expression || "");
+        // Order matters: the verify JS also mentions input.files.
+        if (expression.includes("chipCount")) {
+          return { result: { value: {
+            present: false, matched: [false], sendReady: true, chipCount: 1,
+            chipTexts: [""], inputFiles: [],
+          } } };
+        }
+        if (expression.includes("Upload & tools")) return { result: { value: { success: true } } };
+        if (expression.includes("input.files")) {
+          return { result: { value: ["package.json"] } };
+        }
+        return { result: { value: {} } };
+      }
+      return {};
+    },
+  };
+  await assert.rejects(
+    () => attachFiles(mockCdp, "sess-d3-diag", geminiAdapter, [testFile], {
+      sleep: async () => { fakeNow += 200; },
+      now: () => fakeNow,
+      attachmentVerifyTimeoutMs: 1000,
+    }),
+    (err) => {
+      assert.equal(err?.code, "ATTACH_UPLOAD_FAILED");
+      assert.match(err.message, /chip not visible/i);
+      // The reported live shape, now self-diagnosing: setter landed
+      // (setterInputFiles has the name) but the one matched chip carries
+      // no filename text — an empty shell / wrapper, not a real chip.
+      assert.match(err.message, /"chipCount":1/);
+      assert.match(err.message, /"matched":\[false\]/);
+      assert.match(err.message, /"chipTexts":\[""\]/);
+      assert.match(err.message, /"sendReady":true/);
+      assert.match(err.message, /"setterInputFiles":\["package\.json"\]/);
+      return true;
+    },
+  );
+});
+
+test("D3 driver.attachFiles: empty setter read-back does not fail an upload whose chip verifies (diagnostic only)", async () => {
+  const testFile = path.resolve("package.json");
+  const mockCdp = {
+    send: async (method, params = {}) => {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.querySelector") return { nodeId: 42 };
+      if (method === "Runtime.evaluate") {
+        const expression = String(params?.expression || "");
+        if (expression.includes("chipCount")) {
+          return { result: { value: {
+            present: true, matched: [true], sendReady: true, chipCount: 1,
+            chipTexts: ["package.json"], inputFiles: [],
+          } } };
+        }
+        if (expression.includes("Upload & tools")) return { result: { value: { success: true } } };
+        if (expression.includes("input.files")) return { result: { value: [] } };
+        return { result: { value: {} } };
+      }
+      return {};
+    },
+  };
+  const res = await attachFiles(mockCdp, "sess-d3-readback-empty", geminiAdapter, [testFile], {
+    sleep: async () => {},
+    now: () => 0,
+  });
+  assert.deepEqual(res.attached, [testFile]);
+});
+
+test("D3 driver.attachFiles: a failing setter read-back never masks the verify outcome", async () => {
+  const testFile = path.resolve("package.json");
+  const mockCdp = {
+    send: async (method, params = {}) => {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.querySelector") return { nodeId: 42 };
+      if (method === "Runtime.evaluate") {
+        const expression = String(params?.expression || "");
+        if (expression.includes("chipCount")) {
+          return { result: { value: {
+            present: true, matched: [true], sendReady: true, chipCount: 1,
+            chipTexts: ["package.json"], inputFiles: [],
+          } } };
+        }
+        if (expression.includes("Upload & tools")) return { result: { value: { success: true } } };
+        if (expression.includes("input.files")) throw new Error("evaluate exploded");
+        return { result: { value: {} } };
+      }
+      return {};
+    },
+  };
+  const res = await attachFiles(mockCdp, "sess-d3-readback-throws", geminiAdapter, [testFile], {
+    sleep: async () => {},
+    now: () => 0,
+  });
+  assert.deepEqual(res.attached, [testFile]);
+});
+
 test("D3 engine: failed attachment verification returns failed and never submits the prompt", async () => {
   await withTempDir(async (home) => {
     const counters = {};

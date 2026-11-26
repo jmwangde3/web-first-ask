@@ -657,6 +657,25 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
     throw new WfaError("ATTACH_UPLOAD_FAILED", `CDP DOM.setFileInputFiles failed: ${err.message || String(err)}`);
   }
 
+  // D3（2026-11-26，r3 排查）：setter 自身的成败在此之前是不可观测的——
+  // DOM.setFileInputFiles 只在协议层报错时才抛错，成功返回不证明文件落进
+  // 了 input；而 verify 轮询里读到的 input.files 是“setter 返回后最长
+  // 7s 之后”的值，React 读走文件进 state 后会清空 input.files（见下文
+  // 注释），所以失败诊断里的 inputFiles: [] 无法区分“setter 没落下”和
+  // “React 已消费”。因此在 setter 刚返回时立即读一次 input.files，只作
+  // 诊断记录，绝不参与成功判定（React 可能在毫秒内清空，空读数不是失败
+  // 证据）。读数失败（求值异常 / 非数组）时记 null，不掩盖 verify 结果。
+  let setterInputFiles = null;
+  try {
+    const inputSelector = adapter.fileInputSelector || 'input[type="file"]';
+    const readRes = await cdp.send("Runtime.evaluate", {
+      expression: `(() => { const input = document.querySelector(${JSON.stringify(inputSelector)}); return input && input.files ? [...input.files].map((f) => f.name) : null; })()`,
+      returnByValue: true,
+    }, sessionId);
+    const names = readRes?.result?.value;
+    setterInputFiles = Array.isArray(names) ? names : null;
+  } catch {}
+
   if (signal?.aborted) {
     const err = new Error("Operation cancelled");
     err.code = "CANCELLED";
@@ -673,10 +692,22 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
     intervalMs: attachmentVerifyIntervalMs,
   });
   if (diag && !diag.present) {
+    // D3（2026-11-26，r3 排查）：旧消息只带 inputFiles / chipCount，丢掉了
+    // 恰好能区分失败原因的字段——matched（chip 里有无文件名）、chipTexts
+    // （命中的 chip 是不是空壳）、sendReady（chip 对了但发送按钮未就绪）。
+    // 真机 `chipCount=1, inputFiles=[]` 曾因此无法定位。失败诊断现在全量
+    // 带出，成功判定不变（仍 fail-closed，不提交）。
     throw new WfaError(
       "ATTACH_UPLOAD_FAILED",
       `Attachment chip not visible within ${attachmentVerifyTimeoutMs}ms for ${adapter?.id || "unknown"}. ` +
-        `diagnostics=${JSON.stringify({ inputFiles: diag?.inputFiles ?? null, chipCount: diag?.chipCount ?? 0 })}`
+        `diagnostics=${JSON.stringify({
+          inputFiles: diag?.inputFiles ?? null,
+          chipCount: diag?.chipCount ?? 0,
+          matched: diag?.matched ?? null,
+          chipTexts: diag?.chipTexts ?? null,
+          sendReady: diag?.sendReady ?? null,
+          setterInputFiles,
+        })}`
     );
   }
 

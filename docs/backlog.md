@@ -178,6 +178,78 @@ muse already forwarded `files` through `POST /turns` (`src/broker/server.js:353`
 still replay). `wfa broker ask` still has no `--file` support (follow-up, not
 covered by neon either).
 
+**Follow-up (2026-11-26, branch `fix/d3-upload-investigate`, live report
+REPORT-8ead8b4b.md §5):** `wfa cdp ask --provider gemini --file d3-attachment.txt`
+still fails with `ATTACH_UPLOAD_FAILED`, `diagnostics={"inputFiles":[],"chipCount":1}`
+— chip not visible within 7000 ms. Code investigation established the following
+(file:line on this branch); the UI-layer root cause itself is NOT established
+from code alone and still needs the live probe below — no guessed fix was made.
+
+Established from code:
+- (a) The failure message discarded the discriminating fields. `verifyAttachments`
+  returns `matched` / `chipTexts` / `sendReady` (`src/browser/adapters/gemini.js`
+  ~285–305), but `attachFiles` only serialized `{inputFiles, chipCount}`
+  (`src/browser/driver.js:678–679`). With `chipCount=1` the message could not
+  distinguish “the one matched element is an empty shell with no filename”
+  (`matched=[false]`, `chipTexts=[""]`) from “chip matched but send not ready”
+  (`sendReady=false`). Fixed: the message now carries the full diag.
+- (b) The setter's outcome was never read back. After `DOM.setFileInputFiles`
+  succeeds (`src/browser/driver.js:646–657`), nothing read `input.files` until
+  the verify poll — up to 7 s later — and the code's own comment
+  (`driver.js` ~665–668) says React reads files into state and then clears
+  `input.files`. So `inputFiles: []` in the failure diag is consistent with
+  both “setter never landed” and “React consumed and cleared”. Fixed: one
+  best-effort `Runtime.evaluate` read of `input.files` immediately after the
+  setter returns, recorded as `setterInputFiles` in the failure diagnostics
+  only — it never participates in the pass/fail decision (React may clear
+  within milliseconds; an empty read-back is not failure evidence). A
+  failing read-back is swallowed (`null`) and never masks the verify outcome.
+  Fail-closed behaviour unchanged (`ATTACH_UPLOAD_FAILED`, no submit).
+  Regression tests in `tests/cdp-attach-d3-f4.test.js` (3 new).
+- (c) Ruled out as the live cause by the observed error shape: a stale node
+  between `DOM.querySelector` and the setter would throw
+  `CDP DOM.setFileInputFiles failed` (`driver.js:657`); the live run reached
+  chip verification instead, so the setter call returned success at the
+  protocol level. Protocol success ≠ files landed in the input — that is
+  exactly what `setterInputFiles` now observes.
+- (d) `chipCount=1` is consistent with the selector matching an
+  always-present empty wrapper: `attachmentChipSelector`
+  (`gemini.js:280`) includes the broad `[class*="attachment-preview"]` arm,
+  which matches any element whose class contains that string, chip or
+  container. Whether such a wrapper exists in the live Gemini DOM cannot be
+  established from code — the probe must dump the matched element's HTML.
+- (e) Not changed: the 7000 ms / 200 ms poll (`driver.js` verify call),
+  `buildUploadJs` trigger/menu/input sequence (`gemini.js:221–268`), the
+  pre-submit re-verify and post-submit confirmation paths.
+
+Still awaiting live evidence — run on Windows, in order (do not re-run
+blindly; each step's output decides the next):
+1. Re-run the exact D3 command with this build and paste the FULL
+   `ATTACH_UPLOAD_FAILED` message (now enriched):
+   ```powershell
+   node bin/wfa.js cdp ask --provider gemini --file <EV>\d3-attachment.txt --prompt "read the attached file and reply with its exact content" --timeout 180 --json
+   ```
+   Read it as: `setterInputFiles=["d3-attachment.txt"]` + `matched=[false]`,
+   `chipTexts=[""]` → setter landed; the matched element is an empty shell —
+   fix the chip selector / require non-empty chip text. `setterInputFiles=[]`
+   + `matched=[false]` → setter did not land (or React cleared within ms —
+   go to step 2). `matched=[true]` + `sendReady=false` → chip fine, send
+   button not ready — investigate `sendSelector`.
+2. Only if step 1 is still ambiguous, run the probe script against the
+   user's already-open logged-in Gemini tab with the broker STOPPED (port
+   from `browser.lock` `actualDebugPort`; it never types or submits, the
+   chip stays in the composer until the tab is refreshed):
+   ```powershell
+   node scripts/d3-live-probe.mjs --port 4040 --file <EV>\d3-attachment.txt
+   ```
+   It replays buildUploadJs → setter → immediate dump of EVERY matching
+   input (`accept`, `files`, `isConnected`), whether a `change` event fired,
+   the matched chips' `outerHTML`, and the verify diag immediately and after
+   2 s. Interpretation: multiple matching inputs with files on a different
+   one than the setter targeted → `DOM.querySelector` picks the wrong input;
+   `changeEvents=[]` with files present → React never heard about the
+   upload; a chip `outerHTML` with no filename → empty-shell selector match.
+
 **Symptom.** `wfa cdp ask --file <archive>` passes the attachment check, the prompt is submitted, but the
 provider receives no file. Gemini answers `REPO_UNREADABLE`; ChatGPT has historically answered
 "No file is attached".
