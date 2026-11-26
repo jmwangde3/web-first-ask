@@ -805,6 +805,38 @@ export async function runCdpTurn({
           err.code = "CANCELLED";
           throw err;
         }
+        // D3（2026-11-26 真机复现）：attachFiles 校验过的 chip 可能是瞬态的——
+        // Gemini 在校验通过后、提交前把 d3b-probe.zip 丢掉，prompt 照常发出，
+        // 回答却是 "No attachment or zip file was provided"。因此在发送槽内、
+        // 记 send intent 之前再复核一次：失败即 fail closed，返回哨兵而不是
+        // 抛错（抛错会进外层 catch，被小写的 reason 归一化，与上传段
+        // ATTACH_UPLOAD_FAILED 的终态不一致）；此时尚未 journal send intent，
+        // 也不产生 sendCommittedAt，submitTurn 绝不执行。
+        if (Array.isArray(files) && files.length > 0) {
+          const reverifyFn = typeof driver.verifyAttachments === "function"
+            ? driver.verifyAttachments
+            : (deps.driver ? null : defaultDriver.verifyAttachments);
+          if (reverifyFn) {
+            const recheck = await reverifyFn(cdp, sessionId, adapter, files, {
+              signal,
+              sleep: sleepFn,
+              timeoutMs: 2000,
+              intervalMs: 200,
+            });
+            if (recheck && !recheck.present) {
+              return {
+                reverifyFailed: true,
+                verify: {
+                  present: false,
+                  matched: recheck.matched ?? null,
+                  chipCount: recheck.chipCount ?? 0,
+                  chipTexts: recheck.chipTexts ?? [],
+                  sendReady: recheck.sendReady ?? null,
+                },
+              };
+            }
+          }
+        }
         if (typeof deps.onSendIntent === "function") {
           const intentTime = Date.now();
           try {
@@ -868,6 +900,27 @@ export async function runCdpTurn({
           elapsedMs: Date.now() - startTime,
         });
       }
+      if (submission.reverifyFailed) {
+        return withTerminalStatus({
+          status: "failed",
+          text: "",
+          reason: "ATTACH_UPLOAD_FAILED",
+          evidence: {
+            message: "Attachment no longer present at submit time; the prompt was not submitted.",
+            stage: "pre_submit_reverify",
+            fileNames: files.map((fp) => String(fp).split(/[\\/]/).pop()),
+            ...(submission.verify ? { verify: submission.verify } : {}),
+          },
+          conversationUrl,
+          browser: {
+            pid: recovery.chrome?.pid ?? null,
+            port: recovery.chrome?.port ?? null,
+            mode,
+            reused: recovery.action === "ADOPT",
+          },
+          elapsedMs: Date.now() - startTime,
+        });
+      }
       submitted = true;
 
       // Publish the submission signal immediately after submitTurn succeeds.
@@ -882,6 +935,59 @@ export async function runCdpTurn({
         err.code = "CANCELLED";
         err.sendCommittedAt = submittedAt;
         throw err;
+      }
+
+      // D3 提交后确认（2026-11-26 真机复现）：附件也可能在提交后、渲染前被
+      // 丢掉——d3b-probe.zip 就是这样：校验通过、prompt 已发、会话里却没有
+      // 文件，CLI 随后在 completion 轮询里静默等满 150s 超时。prompt 已提交，
+      // 这里无法 fail closed，改为在进入 completion 轮询前按文件名复核最新
+      // user turn：确认失败立即返回明确的终态
+      // SUBMITTED_WITH_UNVERIFIED_ATTACHMENT（带 sendCommittedAt 的 turn
+      // 记录），绝不静默超时；也绝不自动重发——重发与否由用户在看到会话后
+      // 决定。确认通过的结果记入终态 evidence，供 turn 记录留存。
+      let attachmentPostSubmit = null;
+      if (Array.isArray(files) && files.length > 0) {
+        const confirmFn = typeof driver.confirmAttachmentsPostSubmit === "function"
+          ? driver.confirmAttachmentsPostSubmit
+          : (deps.driver ? null : defaultDriver.confirmAttachmentsPostSubmit);
+        if (confirmFn) {
+          try {
+            attachmentPostSubmit = await confirmFn(cdp, sessionId, adapter, files, {
+              signal,
+              sleep: sleepFn,
+              baselineUserTurns,
+            });
+          } catch (confirmErr) {
+            if (signal?.aborted || confirmErr?.code === "CANCELLED") throw confirmErr;
+            attachmentPostSubmit = {
+              confirmed: false,
+              reason: "confirm_error",
+              message: confirmErr?.message || String(confirmErr),
+            };
+          }
+          if (attachmentPostSubmit && attachmentPostSubmit.confirmed === false) {
+            return withTerminalStatus({
+              status: "failed",
+              text: "",
+              reason: "SUBMITTED_WITH_UNVERIFIED_ATTACHMENT",
+              evidence: {
+                message: "Prompt was submitted but the attachment could not be confirmed in the conversation afterwards; the provider may not have received the file. Do not auto-resend; inspect the conversation and re-attach manually if needed.",
+                fileNames: files.map((fp) => String(fp).split(/[\\/]/).pop()),
+                attachmentPostSubmit,
+                ...(geminiModeResult ? { geminiMode: geminiModeResult } : {}),
+              },
+              conversationUrl,
+              sendCommittedAt: submittedAt,
+              browser: {
+                pid: recovery.chrome?.pid ?? null,
+                port: recovery.chrome?.port ?? null,
+                mode,
+                reused: recovery.action === "ADOPT",
+              },
+              elapsedMs: Date.now() - startTime,
+            });
+          }
+        }
       }
 
       // D5 (coordinator wiring): pause measurement. Opt-in via
@@ -1042,6 +1148,9 @@ export async function runCdpTurn({
           ...(geminiModeResult ? { geminiMode: geminiModeResult } : {}),
           ...(sessionCleanupEvidence ? { sessionCleanup: sessionCleanupEvidence } : {}),
           ...(pauseSummary ? { pauseSummary } : {}),
+          // D3: post-submit attachment confirmation (null when no files
+          // were attached, or the adapter/driver does not support it).
+          ...(attachmentPostSubmit ? { attachmentPostSubmit } : {}),
           ...(downloadError ? { downloadError } : {}),
           ...(conversationTurns !== null && conversationTurns >= 40
             ? {

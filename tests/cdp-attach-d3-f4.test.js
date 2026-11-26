@@ -5,8 +5,9 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import * as chatgptAdapter from "../src/browser/adapters/chatgpt.js";
+import * as claudeAdapter from "../src/browser/adapters/claude.js";
 import * as geminiAdapter from "../src/browser/adapters/gemini.js";
-import { attachFiles } from "../src/browser/driver.js";
+import { attachFiles, confirmAttachmentsPostSubmit, verifyAttachments } from "../src/browser/driver.js";
 import {
   buildDownloadRecord,
   downloadFromProvider,
@@ -61,6 +62,18 @@ function makeVerifyDocument({ chips = [], sendButtons = [], inputFiles = [] } = 
       if (selector.includes("file")) return { files: inputFiles.map((name) => ({ name })) };
       return null;
     },
+  };
+}
+
+function makePostSubmitDocument({ userTurns = [] } = {}) {
+  return {
+    querySelectorAll: (selector) => {
+      if (selector === "user-query") return userTurns;
+      if (String(selector).includes('data-message-author-role="user"')
+        || String(selector).includes("user-message")) return userTurns;
+      return [];
+    },
+    querySelector: () => null,
   };
 }
 
@@ -528,5 +541,312 @@ test("F4 turn store already persists the downloads field when a record carries i
     assert.deepEqual(saved.downloads, [entry]);
     const reloaded = await readTurn(home, "turn-d3f4-1");
     assert.deepEqual(reloaded.downloads, [entry]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D3 follow-up (2026-11-26 branch acceptance): the chip verified by
+// attachFiles is transient — Gemini dropped d3b-probe.zip between verify
+// and submit, the prompt went out with no file, and the CLI then timed out
+// silently after 150s. Fix: re-verify at submit time (fail closed, no
+// submit) and confirm the filename in the conversation post-submit
+// (explicit SUBMITTED_WITH_UNVERIFIED_ATTACHMENT, never a silent timeout).
+// ---------------------------------------------------------------------------
+
+test("D3 post-submit verify JS (gemini): filename in the newest user turn -> matched", () => {
+  const js = geminiAdapter.buildAttachmentPostSubmitVerifyJs(["/tmp/d3b-probe.zip"]);
+  const res = runPageJs(js, makePostSubmitDocument({
+    userTurns: [makeElement({ text: "old turn" }), makeElement({ text: "Read d3b-probe.zip" })],
+  }));
+  assert.equal(res.userTurns, 2);
+  assert.deepEqual(res.matched, [true]);
+  assert.deepEqual(res.fileNames, ["d3b-probe.zip"]);
+});
+
+test("D3 post-submit verify JS (gemini): newest user turn without the filename -> matched false", () => {
+  const js = geminiAdapter.buildAttachmentPostSubmitVerifyJs(["/tmp/d3b-probe.zip"]);
+  const res = runPageJs(js, makePostSubmitDocument({
+    userTurns: [makeElement({ text: "Read d3b-probe.zip" }), makeElement({ text: "No attachment or zip file was provided" })],
+  }));
+  assert.equal(res.userTurns, 2);
+  assert.deepEqual(res.matched, [false]);
+});
+
+test("D3 post-submit verify JS (gemini): no user turn rendered yet -> matched false", () => {
+  const js = geminiAdapter.buildAttachmentPostSubmitVerifyJs(["/tmp/d3b-probe.zip"]);
+  const res = runPageJs(js, makePostSubmitDocument({ userTurns: [] }));
+  assert.equal(res.userTurns, 0);
+  assert.deepEqual(res.matched, [false]);
+});
+
+test("D3 post-submit verify JS (chatgpt): filename in the user article -> matched; wrong name -> false", () => {
+  const js = chatgptAdapter.buildAttachmentPostSubmitVerifyJs(["/tmp/bundle.zip"]);
+  const right = runPageJs(js, makePostSubmitDocument({
+    userTurns: [makeElement({ text: "bundle.zip\nThe repository is in the attachment." })],
+  }));
+  assert.equal(right.userTurns, 1);
+  assert.deepEqual(right.matched, [true]);
+  const wrong = runPageJs(js, makePostSubmitDocument({
+    userTurns: [makeElement({ text: "other.zip\nThe repository is in the attachment." })],
+  }));
+  assert.deepEqual(wrong.matched, [false]);
+});
+
+test("D3 post-submit verify JS (claude): filename in the user message -> matched", () => {
+  const js = claudeAdapter.buildAttachmentPostSubmitVerifyJs(["/tmp/bundle.zip"]);
+  const res = runPageJs(js, makePostSubmitDocument({
+    userTurns: [makeElement({ text: "bundle.zip" })],
+  }));
+  assert.equal(res.userTurns, 1);
+  assert.deepEqual(res.matched, [true]);
+});
+
+test("D3 driver.verifyAttachments: returns the adapter diag (present false keeps the caller in charge of failing closed)", async () => {
+  let calls = 0;
+  const mockCdp = {
+    send: async (method, params = {}) => {
+      if (method === "Runtime.evaluate" && String(params?.expression || "").includes("chipCount")) {
+        calls += 1;
+        return { result: { value: {
+          present: false, matched: [false], sendReady: true, chipCount: 0,
+          chipTexts: [], inputFiles: [],
+        } } };
+      }
+      return {};
+    },
+  };
+  let fakeNow = 1000;
+  const diag = await verifyAttachments(mockCdp, "sess-d3", geminiAdapter, ["/tmp/bundle.zip"], {
+    sleep: async () => { fakeNow += 200; },
+    now: () => fakeNow,
+    timeoutMs: 1000,
+    intervalMs: 200,
+  });
+  assert.equal(diag.present, false);
+  assert.deepEqual(diag.matched, [false]);
+  assert.ok(calls >= 1);
+
+  const okCdp = {
+    send: async () => ({ result: { value: {
+      present: true, matched: [true], sendReady: true, chipCount: 1,
+      chipTexts: ["bundle.zip"], inputFiles: [],
+    } } }),
+  };
+  const ok = await verifyAttachments(okCdp, "sess-d3", geminiAdapter, ["/tmp/bundle.zip"], {
+    sleep: async () => {},
+    now: () => 0,
+  });
+  assert.equal(ok.present, true);
+
+  const noBuilder = await verifyAttachments(okCdp, "sess-d3", { id: "plain" }, ["/tmp/bundle.zip"], {
+    sleep: async () => {},
+    now: () => 0,
+  });
+  assert.equal(noBuilder, null);
+});
+
+test("D3 driver.confirmAttachmentsPostSubmit: new user turn with the filename confirms; an old turn alone does not", async () => {
+  const scripted = (states) => {
+    let calls = 0;
+    return {
+      send: async (method) => {
+        if (method !== "Runtime.evaluate") return {};
+        const state = states[Math.min(calls, states.length - 1)];
+        calls += 1;
+        return { result: { value: state } };
+      },
+    };
+  };
+  let fakeNow = 1000;
+  const tick = { sleep: async () => { fakeNow += 500; }, now: () => fakeNow };
+
+  const confirmed = await confirmAttachmentsPostSubmit(
+    scripted([
+      { userTurns: 0, matched: [false], fileNames: ["bundle.zip"] },
+      { userTurns: 1, matched: [true], fileNames: ["bundle.zip"] },
+    ]),
+    "sess-d3", geminiAdapter, ["/tmp/bundle.zip"],
+    { ...tick, baselineUserTurns: 0, timeoutMs: 10000, intervalMs: 500 },
+  );
+  assert.equal(confirmed.confirmed, true);
+  assert.equal(confirmed.userTurns, 1);
+  assert.deepEqual(confirmed.matched, [true]);
+
+  // Baseline guard: a pre-existing turn that already contains the name
+  // must not confirm the new submission; only the new turn counts.
+  fakeNow = 1000;
+  const baselineGuarded = await confirmAttachmentsPostSubmit(
+    scripted([
+      { userTurns: 1, matched: [true], fileNames: ["bundle.zip"] },
+      { userTurns: 2, matched: [true], fileNames: ["bundle.zip"] },
+    ]),
+    "sess-d3", geminiAdapter, ["/tmp/bundle.zip"],
+    { ...tick, baselineUserTurns: 1, timeoutMs: 10000, intervalMs: 500 },
+  );
+  assert.equal(baselineGuarded.confirmed, true);
+  assert.equal(baselineGuarded.userTurns, 2);
+});
+
+test("D3 driver.confirmAttachmentsPostSubmit: timeout distinguishes unrendered turn from turn without the file", async () => {
+  let fakeNow = 1000;
+  const tick = { sleep: async () => { fakeNow += 500; }, now: () => fakeNow };
+  const neverRendered = await confirmAttachmentsPostSubmit(
+    { send: async () => ({ result: { value: { userTurns: 0, matched: [false], fileNames: ["bundle.zip"] } } }) },
+    "sess-d3", geminiAdapter, ["/tmp/bundle.zip"],
+    { ...tick, baselineUserTurns: 0, timeoutMs: 1000, intervalMs: 500 },
+  );
+  assert.equal(neverRendered.confirmed, false);
+  assert.equal(neverRendered.reason, "user_turn_not_rendered");
+
+  fakeNow = 1000;
+  const noFile = await confirmAttachmentsPostSubmit(
+    { send: async () => ({ result: { value: { userTurns: 1, matched: [false], fileNames: ["bundle.zip"] } } }) },
+    "sess-d3", geminiAdapter, ["/tmp/bundle.zip"],
+    { ...tick, baselineUserTurns: 0, timeoutMs: 1000, intervalMs: 500 },
+  );
+  assert.equal(noFile.confirmed, false);
+  assert.equal(noFile.reason, "attachment_not_in_user_turn");
+  assert.deepEqual(noFile.matched, [false]);
+
+  const noFiles = await confirmAttachmentsPostSubmit(
+    { send: async () => { throw new Error("must not evaluate"); } },
+    "sess-d3", geminiAdapter, [], { ...tick },
+  );
+  assert.equal(noFiles.confirmed, true);
+  assert.equal(noFiles.skipped, true);
+
+  const unsupported = await confirmAttachmentsPostSubmit(
+    { send: async () => ({}) },
+    "sess-d3", { id: "plain" }, ["/tmp/bundle.zip"], { ...tick },
+  );
+  assert.equal(unsupported.confirmed, null);
+  assert.equal(unsupported.supported, false);
+});
+
+function makeEngineDriver(overrides = {}) {
+  const counters = { typed: 0, submitted: 0, completed: 0 };
+  const driver = {
+    openTab: async () => ({ targetId: "target-1", sessionId: "session-1" }),
+    waitForEditor: async () => true,
+    readTurnState: async () => ({
+      userTurns: 0, answerTurns: 0, answerText: "", stopVisible: false,
+      editorEmpty: true, loggedOut: false, pageError: null,
+    }),
+    attachFiles: async () => ({ attached: [], provider: "gemini" }),
+    verifyAttachments: async () => ({
+      present: true, matched: [true], chipCount: 1,
+      chipTexts: ["package.json"], sendReady: true, inputFiles: [],
+    }),
+    confirmAttachmentsPostSubmit: async () => ({
+      confirmed: true, userTurns: 1, matched: [true], fileNames: ["package.json"],
+    }),
+    typePrompt: async () => {
+      counters.typed += 1;
+      return { typedChars: 1, replacedChars: 0 };
+    },
+    submitTurn: async () => {
+      counters.submitted += 1;
+      return {};
+    },
+    waitForCompletion: async () => {
+      counters.completed += 1;
+      return { status: "completed", reason: "completed", text: "answer", evidence: {} };
+    },
+    ...overrides,
+  };
+  return { driver, counters };
+}
+
+function makeEngineDeps(driver) {
+  return {
+    enforceCooldown: async () => {},
+    skipTurnLock: true,
+    pace: async () => 0,
+    config: { stagger: { minMs: 0, maxMs: 0 } },
+    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1234, port: 9222 } }),
+    connectCdp: async () => ({
+      send: async (method) => {
+        if (method === "Runtime.evaluate") return { result: { value: "" } };
+        return {};
+      },
+      close() {},
+    }),
+    driver,
+  };
+}
+
+test("D3 engine (a): pre-submit re-verify fails -> ATTACH_UPLOAD_FAILED, prompt never submitted", async () => {
+  await withTempDir(async (home) => {
+    const { driver, counters } = makeEngineDriver({
+      verifyAttachments: async () => ({
+        present: false, matched: [false], chipCount: 0,
+        chipTexts: [], sendReady: true, inputFiles: [],
+      }),
+    });
+    const result = await runCdpTurn({
+      provider: "gemini",
+      prompt: "The repository is in the attachment. Read it.",
+      home,
+      files: [path.resolve("package.json")],
+      deps: makeEngineDeps(driver),
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(result.reason, "ATTACH_UPLOAD_FAILED");
+    assert.equal(result.text, "");
+    assert.equal(result.evidence.stage, "pre_submit_reverify");
+    assert.equal(result.sendCommittedAt, undefined);
+    assert.equal(counters.typed, 1, "prompt may be typed, but must not be sent");
+    assert.equal(counters.submitted, 0);
+    assert.equal(counters.completed, 0);
+  });
+});
+
+test("D3 engine (b): verify passes at submit, attachment gone post-submit -> SUBMITTED_WITH_UNVERIFIED_ATTACHMENT, no silent timeout", async () => {
+  await withTempDir(async (home) => {
+    const { driver, counters } = makeEngineDriver({
+      confirmAttachmentsPostSubmit: async () => ({
+        confirmed: false,
+        reason: "attachment_not_in_user_turn",
+        userTurns: 1,
+        baselineUserTurns: 0,
+        matched: [false],
+        fileNames: ["package.json"],
+      }),
+    });
+    const result = await runCdpTurn({
+      provider: "gemini",
+      prompt: "The repository is in the attachment. Read it.",
+      home,
+      files: [path.resolve("package.json")],
+      deps: makeEngineDeps(driver),
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(result.reason, "SUBMITTED_WITH_UNVERIFIED_ATTACHMENT");
+    assert.equal(result.text, "");
+    assert.equal(counters.submitted, 1, "the prompt was submitted before the drop was detected");
+    assert.equal(counters.completed, 0, "must not wait out the completion timeout on an unverified attachment");
+    assert.equal(typeof result.sendCommittedAt, "number", "turn record must carry sendCommittedAt");
+    assert.equal(result.evidence.attachmentPostSubmit.confirmed, false);
+    assert.equal(result.evidence.attachmentPostSubmit.reason, "attachment_not_in_user_turn");
+    assert.deepEqual(result.evidence.fileNames, ["package.json"]);
+  });
+});
+
+test("D3 engine (c): post-submit confirmation passes -> turn completes and the confirmation is recorded", async () => {
+  await withTempDir(async (home) => {
+    const { driver, counters } = makeEngineDriver();
+    const result = await runCdpTurn({
+      provider: "gemini",
+      prompt: "The repository is in the attachment. Read it.",
+      home,
+      files: [path.resolve("package.json")],
+      deps: makeEngineDeps(driver),
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.reason, "completed");
+    assert.equal(counters.submitted, 1);
+    assert.equal(counters.completed, 1);
+    assert.equal(result.evidence.attachmentPostSubmit.confirmed, true);
+    assert.deepEqual(result.evidence.attachmentPostSubmit.matched, [true]);
   });
 });

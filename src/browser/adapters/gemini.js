@@ -209,6 +209,35 @@ export function buildAttachmentVerifyJs(fileNames) {
 })()`;
 }
 
+// D3 提交后确认（2026-11-26 真机复现）：提交后 composer 的 chip 已按设计消失，
+// 文件名必须在会话本身——最新一条 user turn——里复核。提交前一刻 chip 还在、
+// 提交后 Gemini 把附件丢掉，正是 d3b-probe.zip 的失败形态：prompt 已发出，
+// 回答却是 "No attachment or zip file was provided"。本函数只报最新 user turn
+// 的文本是否含每个文件名；userTurns 供调用方与提交前基线比较，确认新 turn
+// 确实已渲染，而不是拿旧 turn 冒充。
+export function buildAttachmentPostSubmitVerifyJs(fileNames) {
+  const bases = fileNames.map((fp) => String(fp).split(/[\\/]/).pop());
+  return `(() => {
+  const bases = ${JSON.stringify(bases)};
+  const turns = [...document.querySelectorAll("user-query")];
+  const latest = turns[turns.length - 1] || null;
+  const textOf = (el) => {
+    if (!el) return "";
+    const parts = [el.innerText, el.textContent];
+    if (el.querySelectorAll) {
+      for (const d of el.querySelectorAll("[aria-label], [title]")) {
+        parts.push(typeof d.getAttribute === "function" ? d.getAttribute("aria-label") : null);
+        parts.push(typeof d.getAttribute === "function" ? d.getAttribute("title") : null);
+      }
+    }
+    return parts.filter(Boolean).join(" ");
+  };
+  const text = textOf(latest);
+  const matched = bases.map((b) => text.includes(b));
+  return { userTurns: turns.length, matched, fileNames: bases };
+})()`;
+}
+
 // F4：provider 产物的下载入口（best-effort 选择器，尚未在真机 DOM 上核实，
 // 仅作点击钩子；无匹配控件时返回 clicked:false，调用方不伪造下载记录）。
 export const downloadTriggerSelector = 'button[aria-label*="Download"], button[aria-label*="下载"], a[download], [data-testid*="download"]';
