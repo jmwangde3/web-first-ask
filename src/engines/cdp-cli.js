@@ -487,7 +487,7 @@ async function handleLogin(argv, deps) {
         } else {
           stdout.write(`[cdp] logged in (${provider})\n`);
         }
-        stdout.write("[cdp] session persisted; later runs restore it with --restore-last-session\n");
+        stdout.write("[cdp] session persisted in the profile; later runs reuse the same profile\n");
       }
       return { code: 0, result: { status: "completed", provider, title: finalTitle, user: finalUser ?? null } };
     }

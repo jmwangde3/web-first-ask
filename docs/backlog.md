@@ -492,6 +492,13 @@ Gemini case has not been re-tested with this same-key method.
 
 ### D10 — Chrome launch restores every historical tab and can trigger Google `/sorry` (P1, 2026-11-26)
 
+**Status (2026-11-26): removed in code, awaiting live verification.** `--restore-last-session` is gone from
+`src/browser/launch.js`; the `oai-asli` justification is disproven (verified live 2026-11-26: a manually
+launched Chrome without the switch, startup NOT "Continue where you left off", and no `oai-asli` cookie still
+shows chatgpt.com logged in). Live re-verification: `wfa cdp login --provider chatgpt`, clean exit and
+relaunch, `fetch('/api/auth/session')` still returns the user, and the launch no longer restores historical
+tabs.
+
 **Symptom.** Every Chrome launch passes `--restore-last-session` (`src/browser/launch.js:66`) so ChatGPT's
 non-persistent `oai-asli` cookie survives a restart. On this machine one launch restored **19 tabs, 9 of them
 Gemini**, all loading concurrently. Immediately afterwards every new Gemini navigation — the landing page and a
