@@ -14,7 +14,8 @@ import { sleep as defaultSleep } from "../util.js";
 import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
 import { ensureBroker, createTurn, waitForTurn, waitForSubmission } from "../broker/client.js";
 import { spawnDetachedBroker } from "../broker/cli.js";
-import { stageCdpResponse as defaultStageCdpResponse } from "./cdp-stage.js";
+import { stageCdpResponse as defaultStageCdpResponse, extractFileBlocksToDir } from "./cdp-stage.js";
+import * as defaultResultStore from "../broker/result-store.js";
 import { expandAttachmentInputs } from "../attachments.js";
 import { readConversation as defaultReadConversation } from "./cdp-read.js";
 
@@ -45,6 +46,8 @@ const VALUE_FLAGS = new Set([
   "task-id",
   "wait",
   "out",
+  "input",
+  "out-dir",
 ]);
 
 function parseArgs(argv) {
@@ -112,8 +115,10 @@ Commands:
   wfa cdp read   (--url <conversation-url> | --task-id <id>)
                  [--provider <chatgpt|gemini>] [--mode background|visible|headless]
                  [--timeout <s>] [--wait <s>] [--no-reopen] [--json] [--out <path>]
+  wfa cdp extract (--input <file> | --task-id <id>) --out-dir <dir> [--overwrite] [--json]
+  wfa cdp cleanup (--task-id <id> | --url <url> --provider <chatgpt|gemini|claude>) [--mode background|visible|headless] [--json]
   wfa cdp status [--json]
-  wfa cdp login  [--provider <chatgpt|gemini>] [--mode visible|background]
+  wfa cdp login  [--provider <chatgpt|gemini|claude>] [--mode visible|background]
                  [--timeout <seconds>] [--json]
 
 Options:
@@ -847,7 +852,7 @@ async function handleAsk(argv, deps) {
     : Math.max(0, Date.now() - startTime);
 
   const rawText = turn.text ?? "";
-  const result = {
+  let result = {
     id: turn.id ?? turnId,
     provider: turn.provider ?? provider,
     conversationId: turn.conversationId ?? conversationId,
@@ -859,6 +864,57 @@ async function handleAsk(argv, deps) {
     ...(turn.sendCommittedAt != null ? { sendCommittedAt: turn.sendCommittedAt } : {}),
     elapsedMs,
   };
+
+  if (options["fallback-bundle"] && result.status === "completed" && isRepoUnreadableResponse(result.text)) {
+    const fb = await runWithRepoFallback({
+      initialResult: result,
+      workspaceRoot: options.workspace ? path.resolve(String(options.workspace)) : (deps.cwd || process.cwd()),
+      archiveDir: path.join(home, "fallback-archives"),
+      createArchiveFn: deps.archiveRepository || archiveRepository,
+      submitFallbackFn: async ({ archivePath }) => {
+        const fbReqId = randomUUID();
+        const fbTurnRes = await createTurnFn(record, {
+          provider,
+          prompt,
+          mode,
+          requestId: fbReqId,
+          settleMs,
+          stallTimeoutMs,
+          hardTimeoutMs,
+          files: [archivePath],
+          ...(geminiMode !== null ? { geminiMode } : {}),
+          ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
+          ...(options["chrome-path"] ? { chromePath: options["chrome-path"] } : {}),
+        });
+        if (fbTurnRes?.status >= 400) {
+          throw new WfaError(
+            fbTurnRes?.json?.code || "FALLBACK_TURN_FAILED",
+            fbTurnRes?.json?.message || fbTurnRes?.json?.error || "Fallback turn submission failed",
+          );
+        }
+        const fbTurnId = fbTurnRes.json.id;
+        const fbDone = await (deps.waitForTurn || waitForTurn)({
+          record,
+          turnId: fbTurnId,
+          home,
+          timeoutMs: hardTimeoutMs + 60000,
+          deps,
+        });
+        return {
+          ...fbDone,
+          status: fbDone.state || fbDone.status,
+        };
+      },
+    });
+    if (fb.triggered) {
+      result = {
+        ...fb.result,
+        fallbackTriggered: true,
+        fallbackFromTaskId: turnId,
+        fallbackArchivePath: fb.archivePath,
+      };
+    }
+  }
 
   let stagedResult = null;
   const shouldStage = result.status === "completed" && Boolean(rawText) && !options["no-stage"];
@@ -931,6 +987,132 @@ async function handleAsk(argv, deps) {
   return { code: result.status === "completed" ? 0 : 1, result };
 }
 
+async function handleExtract(argv, deps = {}) {
+  const stdout = deps.stdout || process.stdout;
+  const home = deps.home || getHomeDir();
+  const { options } = parseArgs(argv);
+  if (options.help) {
+    printCdpHelp(stdout);
+    return { code: 0 };
+  }
+  const hasInput = typeof options.input === "string" && options.input.trim().length > 0;
+  const hasTaskId = typeof options["task-id"] === "string" && options["task-id"].trim().length > 0;
+  if (hasInput === hasTaskId) {
+    throw new WfaError("INVALID_ARGUMENT", "Specify exactly one of --input <file> or --task-id <id>.");
+  }
+  if (!options["out-dir"] || !String(options["out-dir"]).trim()) {
+    throw new WfaError("INVALID_ARGUMENT", "Option --out-dir <dir> is required.");
+  }
+
+  let markdown;
+  if (hasInput) {
+    markdown = await readFile(path.resolve(String(options.input)), "utf8");
+  } else {
+    const readResultFn = deps.resultStore?.readResult || deps.readResult || defaultResultStore.readResult;
+    const rec = await readResultFn(home, String(options["task-id"]).trim());
+    if (!rec || typeof rec.text !== "string" || !rec.text.trim()) {
+      throw new WfaError("TURN_NOT_FOUND", `No persisted answer text found for task ${options["task-id"]}`);
+    }
+    markdown = rec.text;
+  }
+
+  const out = await extractFileBlocksToDir({
+    markdown,
+    outputDir: path.resolve(String(options["out-dir"])),
+    allowOverwrite: Boolean(options.overwrite),
+  });
+  if (options.json) {
+    stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+  } else {
+    stdout.write(`[extract] wrote ${out.files.length} file(s) to ${out.outputDir}\n`);
+    for (const f of out.files) {
+      stdout.write(`  - ${f.filePath} (${f.bytes} B)\n`);
+    }
+  }
+  return { code: 0, result: out };
+}
+
+async function handleCleanup(argv, deps = {}) {
+  const stdout = deps.stdout || process.stdout;
+  const home = deps.home || getHomeDir();
+  const { options } = parseArgs(argv);
+  if (options.help) {
+    printCdpHelp(stdout);
+    return { code: 0 };
+  }
+
+  const hasTaskId = typeof options["task-id"] === "string" && options["task-id"].trim().length > 0;
+  const hasUrl = typeof options.url === "string" && options.url.trim().length > 0;
+  if (hasTaskId === hasUrl) {
+    throw new WfaError("INVALID_ARGUMENT", "Specify exactly one of --task-id <id> or --url <url>.");
+  }
+
+  let provider = options.provider ? String(options.provider).trim().toLowerCase() : null;
+  let targetUrl = hasUrl ? String(options.url).trim() : null;
+
+  if (hasTaskId) {
+    const readResultFn = deps.resultStore?.readResult || deps.readResult || defaultResultStore.readResult;
+    const rec = await readResultFn(home, String(options["task-id"]).trim());
+    if (!rec) {
+      throw new WfaError("TURN_NOT_FOUND", `No persisted record found for task ${options["task-id"]}`);
+    }
+    if (rec.createdByWfa === false) {
+      throw new WfaError("REFUSE_PREEXISTING_CONVERSATION", "Refusing to delete a pre-existing conversation not created by wfa.");
+    }
+    provider = provider || (rec.provider ? String(rec.provider).toLowerCase() : null);
+    targetUrl = rec.conversationUrl || null;
+  }
+
+  if (!provider || !DEFAULT_ADAPTERS[provider]) {
+    throw new WfaError("INVALID_ARGUMENT", "Option --provider must be chatgpt, gemini, or claude.");
+  }
+  if (!targetUrl) {
+    throw new WfaError("INVALID_ARGUMENT", "Conversation URL is missing for cleanup.");
+  }
+
+  const adapter = (deps.adapters && deps.adapters[provider]) || DEFAULT_ADAPTERS[provider];
+  if (typeof adapter.buildDeleteConversationJs !== "function") {
+    const skipped = { status: "skipped", reason: "adapter_delete_not_supported", provider, url: targetUrl };
+    if (options.json) stdout.write(`${JSON.stringify(skipped, null, 2)}\n`);
+    else stdout.write(`[cleanup] skipped (${skipped.reason}): ${targetUrl}\n`);
+    return { code: 0, result: skipped };
+  }
+
+  const recoverFn = deps.recoverBrowser || recoverBrowser;
+  const connectFn = deps.connectCdp || connectCdp;
+  const driver = deps.driver || defaultDriver;
+  const mode = options.mode ? String(options.mode).toLowerCase() : "background";
+  const rec = await recoverFn({ home, mode, probes: deps.probes });
+  if (!rec?.chrome?.port) {
+    throw new WfaError("BROWSER_UNAVAILABLE", "Chrome is not available for conversation cleanup.");
+  }
+
+  let cdp = null;
+  let tab = null;
+  try {
+    cdp = await connectFn(rec.chrome.port);
+    tab = await driver.openTab(cdp, targetUrl, { timeoutMs: 15000 });
+    const expr = adapter.buildDeleteConversationJs(targetUrl);
+    const evalRes = await cdp.send("Runtime.evaluate", {
+      expression: expr,
+      awaitPromise: true,
+      returnByValue: true,
+    }, tab.sessionId);
+    const deleted = Boolean(evalRes?.result?.value?.deleted);
+    const out = { status: deleted ? "deleted" : "attempted", provider, url: targetUrl };
+    if (options.json) stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+    else stdout.write(`[cleanup] ${out.status}: ${targetUrl}\n`);
+    return { code: 0, result: out };
+  } finally {
+    if (cdp && tab?.targetId && typeof driver.closeTab === "function") {
+      try { await driver.closeTab(cdp, tab.targetId); } catch {}
+    }
+    if (cdp && typeof cdp.close === "function") {
+      try { cdp.close(); } catch {}
+    }
+  }
+}
+
 export function isRepoUnreadableResponse(text) {
   return typeof text === "string" && /\bREPO_UNREADABLE\b/.test(text);
 }
@@ -974,8 +1156,8 @@ export async function runCdpCommand(argv = [], deps = {}) {
   }
 
   const subcmd = argv[0];
-  if (!subcmd || !["ask", "read", "status", "login"].includes(subcmd)) {
-    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|read|status|login>\n`);
+  if (!subcmd || !["ask", "read", "extract", "cleanup", "status", "login"].includes(subcmd)) {
+    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|read|extract|cleanup|status|login>\n`);
     return { code: 2 };
   }
 
@@ -993,6 +1175,8 @@ export async function runCdpCommand(argv = [], deps = {}) {
       return await loginFn(argv.slice(1), deps);
     }
     if (subcmd === "read") return await handleRead(argv.slice(1), deps);
+    if (subcmd === "extract") return await handleExtract(argv.slice(1), deps);
+    if (subcmd === "cleanup") return await handleCleanup(argv.slice(1), deps);
     return await handleAsk(argv.slice(1), deps);
   } catch (error) {
     if (error instanceof WfaError) {
