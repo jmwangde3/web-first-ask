@@ -222,6 +222,7 @@ export async function waitForEditor(cdp, sessionId, adapter, {
     return {
       found: Boolean(el),
       title: document.title || "",
+      url: typeof location !== "undefined" && typeof location.href === "string" ? location.href : "",
       hasPassword,
       bodyLength: bodyText.length,
       emptyBody: bodyText.length === 0,
@@ -229,11 +230,13 @@ export async function waitForEditor(cdp, sessionId, adapter, {
   })()`;
 
   let lastTitle = "";
+  let lastUrl = "";
   let lastBodyLength = 0;
   let lastHasPassword = false;
   let consecutiveChallenged = 0;
 
   const challengePattern = adapter.turnChallengeTitlePattern || adapter.challengeTitlePattern || /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
+  const sorryUrlPattern = /\/sorry(?:\/|$|\?)/i;
 
   while (now() - startTime < timeoutMs) {
     if (signal?.aborted) {
@@ -252,6 +255,9 @@ export async function waitForEditor(cdp, sessionId, adapter, {
         if (typeof val.title === "string") {
           lastTitle = val.title;
         }
+        if (typeof val.url === "string") {
+          lastUrl = val.url;
+        }
         if (typeof val.bodyLength === "number") {
           lastBodyLength = val.bodyLength;
         }
@@ -260,11 +266,12 @@ export async function waitForEditor(cdp, sessionId, adapter, {
         }
 
         const titleMatches = challengePattern.test(val.title || "");
+        const urlMatches = sorryUrlPattern.test(val.url || "");
         const hasPassword = Boolean(val.hasPassword);
 
         lastHasPassword = hasPassword;
 
-        const isPollChallenged = hasPassword || titleMatches;
+        const isPollChallenged = hasPassword || titleMatches || urlMatches;
         if (isPollChallenged) {
           consecutiveChallenged += 1;
           if (consecutiveChallenged >= 2) {
@@ -287,7 +294,7 @@ export async function waitForEditor(cdp, sessionId, adapter, {
     await sleep(pollIntervalMs);
   }
 
-  const isChallenge = Boolean(lastHasPassword || challengePattern.test(lastTitle));
+  const isChallenge = Boolean(lastHasPassword || challengePattern.test(lastTitle) || sorryUrlPattern.test(lastUrl));
 
   if (isChallenge) {
     const parked = await parkChallengedTab(cdp, sessionId);

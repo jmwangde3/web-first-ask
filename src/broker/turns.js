@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
+
+const MAX_TURN_FILES = 20;
 
 export const TURN_STATES = Object.freeze([
   "queued", "running", "completed", "needs_human", "takeover", "stalled", "failed",
@@ -34,6 +37,7 @@ export function createTurn({
   minIntervalMs = null,
   chromePath = null,
   geminiMode = null,
+  files = null,
   createdAt = new Date().toISOString(),
 } = {}) {
   if (typeof id !== "string" || !id.trim() ||
@@ -48,12 +52,15 @@ export function createTurn({
       (minIntervalMs !== null && (!Number.isSafeInteger(minIntervalMs) || minIntervalMs < 0)) ||
       (chromePath !== null && (typeof chromePath !== "string" || !chromePath.trim())) ||
       (geminiMode !== null && !["chat", "task"].includes(geminiMode)) ||
+      (files !== null && (!Array.isArray(files) || files.length > MAX_TURN_FILES ||
+        !files.every((f) => typeof f === "string" && f.trim().length > 0 && path.isAbsolute(f)))) ||
       typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) {
     throw invalid("Invalid turn arguments");
   }
   return {
     id, provider, prompt, conversationId, mode, requestId,
     settleMs, stallTimeoutMs, hardTimeoutMs, minIntervalMs, chromePath, geminiMode,
+    files: Array.isArray(files) && files.length > 0 ? [...files] : null,
     createdAt,
     state: "queued", startedAt: null, finishedAt: null,
     cooldownWaitMs: null, cooldownWaitAt: null,

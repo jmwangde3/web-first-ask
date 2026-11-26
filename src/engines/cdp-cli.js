@@ -26,6 +26,7 @@ const VALUE_FLAGS = new Set([
   "prompt",
   "prompt-file",
   "mode",
+  "gemini-mode",
   "timeout",
   "settle",
   "chrome-path",
