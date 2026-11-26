@@ -33,6 +33,7 @@ export function createTurn({
   hardTimeoutMs = null,
   minIntervalMs = null,
   chromePath = null,
+  geminiMode = null,
   createdAt = new Date().toISOString(),
 } = {}) {
   if (typeof id !== "string" || !id.trim() ||
@@ -46,12 +47,13 @@ export function createTurn({
       (hardTimeoutMs !== null && (!Number.isFinite(hardTimeoutMs) || hardTimeoutMs <= 0)) ||
       (minIntervalMs !== null && (!Number.isSafeInteger(minIntervalMs) || minIntervalMs < 0)) ||
       (chromePath !== null && (typeof chromePath !== "string" || !chromePath.trim())) ||
+      (geminiMode !== null && !["chat", "task"].includes(geminiMode)) ||
       typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) {
     throw invalid("Invalid turn arguments");
   }
   return {
     id, provider, prompt, conversationId, mode, requestId,
-    settleMs, stallTimeoutMs, hardTimeoutMs, minIntervalMs, chromePath,
+    settleMs, stallTimeoutMs, hardTimeoutMs, minIntervalMs, chromePath, geminiMode,
     createdAt,
     state: "queued", startedAt: null, finishedAt: null,
     cooldownWaitMs: null, cooldownWaitAt: null,

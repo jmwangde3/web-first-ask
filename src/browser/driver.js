@@ -101,10 +101,91 @@ export async function attachTab(cdp, targetId, { timeoutMs = 60000 } = {}) {
   }
   const { sessionId } = attachResult;
 
-  await cdp.send("Page.enable", {}, sessionId);
+  try {
+    await cdp.send("Page.enable", {}, sessionId);
+  } catch (err) {
+    // D8: frozen/throttled background tab can stall CDP enable until activated once.
+    const activated = await activateTarget(cdp, targetId);
+    if (!activated) throw err;
+    await cdp.send("Page.enable", {}, sessionId);
+  }
   // Runtime.evaluate works without subscribing to the Runtime event domain.
   await cdp.send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" }, sessionId);
+  // D8: soft-enable focus emulation so background tabs stay composited without stealing focus.
+  await enableFocusEmulation(cdp, sessionId);
   return { targetId, sessionId };
+}
+
+export async function enableFocusEmulation(cdp, sessionId) {
+  if (!cdp || typeof cdp.send !== "function" || !sessionId) return false;
+  try {
+    await cdp.send("Emulation.setFocusEmulationEnabled", { enabled: true }, sessionId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function activateTarget(cdp, targetId) {
+  if (!cdp || typeof cdp.send !== "function" || !targetId) return false;
+  try {
+    await cdp.send("Target.activateTarget", { targetId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function parkChallengedTab(cdp, sessionId) {
+  if (!cdp || typeof cdp.send !== "function" || !sessionId) return false;
+  try {
+    await cdp.send("Page.navigate", { url: "about:blank" }, sessionId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function ensureProviderMode(cdp, sessionId, adapter, targetMode, {
+  timeoutMs = 10000,
+  pollIntervalMs = 250,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  signal,
+} = {}) {
+  if (!targetMode || typeof adapter?.buildEnsureModeJs !== "function") {
+    return { ok: true, skipped: true };
+  }
+  const expression = adapter.buildEnsureModeJs(targetMode);
+  const deadline = now() + timeoutMs;
+  let last = null;
+  while (now() < deadline) {
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
+    const res = await cdp.send("Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+    }, sessionId);
+    const val = res?.result?.value || null;
+    last = val;
+    if (val?.ok && val?.active) {
+      return val;
+    }
+    if (val?.reason === "mode_button_not_found") {
+      // Allow brief SPA hydration before failing.
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(pollIntervalMs, remaining));
+  }
+  throw new WfaError(
+    "PROVIDER_MODE_SWITCH_FAILED",
+    `Failed to switch ${adapter?.id || "provider"} to mode "${targetMode}" (${last?.reason || "timeout"})`,
+    { details: { provider: adapter?.id || null, targetMode, last } },
+  );
 }
 
 export async function openTab(cdp, url, { timeoutMs = 60000 } = {}) {
@@ -187,10 +268,11 @@ export async function waitForEditor(cdp, sessionId, adapter, {
         if (isPollChallenged) {
           consecutiveChallenged += 1;
           if (consecutiveChallenged >= 2) {
+            const parked = await parkChallengedTab(cdp, sessionId);
             const err = new WfaError(
               "HUMAN_VERIFICATION_REQUIRED",
               `Human verification required for ${adapter.id} (title: "${lastTitle}")`,
-              { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength } }
+              { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength, parked } }
             );
             err.title = lastTitle;
             throw err;
@@ -208,10 +290,11 @@ export async function waitForEditor(cdp, sessionId, adapter, {
   const isChallenge = Boolean(lastHasPassword || challengePattern.test(lastTitle));
 
   if (isChallenge) {
+    const parked = await parkChallengedTab(cdp, sessionId);
     const err = new WfaError(
       "HUMAN_VERIFICATION_REQUIRED",
       `Human verification required for ${adapter.id} (title: "${lastTitle}")`,
-      { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength } }
+      { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength, parked } }
     );
     err.title = lastTitle;
     throw err;
@@ -912,12 +995,13 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     const challenged = (state.hasChallenge || challengePattern.test(state.title || "")) && !composerReady;
 
     if (challenged) {
+      const parked = await parkChallengedTab(cdp, sessionId);
       return {
         status: "needs_human",
         reason: "human_verification_required",
         text: belongs ? (state.answerText || "") : "",
         elapsedMs: now() - startTime,
-        evidence: buildEvidence(state, now() - lastProgressAt),
+        evidence: { ...buildEvidence(state, now() - lastProgressAt), parked },
       };
     }
 

@@ -21,6 +21,39 @@ export const challengeTitlePattern = /请稍候|just a moment|verifying|security
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
 // 批次 D 附件上传契约：Gemini 需点击 trigger 展开菜单，并点击 menuitem 后由 DOM 插入 input
+// F1（2026-11-26 真机 T4 采证）：Composer 下方 Chat/Task 分段控件
+export const taskModeRowSelector = 'gem-segmented-button-row[role="group"]';
+export const taskModeButtonSelector = 'gem-segmented-button-row button.gem-segmented-button-action';
+
+export function buildEnsureModeJs(targetMode = "task") {
+  const normalized = String(targetMode || "task").toLowerCase();
+  const expectedLabel = normalized === "chat" ? "chat" : "task";
+  return `(() => {
+  const buttons = [...document.querySelectorAll(${JSON.stringify(taskModeButtonSelector)})];
+  const btn = buttons.find((el) => String((el && (el.innerText || el.textContent)) || "").trim().toLowerCase() === ${JSON.stringify(expectedLabel)});
+  if (!btn) {
+    return { ok: false, active: false, switched: false, reason: "mode_button_not_found" };
+  }
+  const isPressed = () => (typeof btn.getAttribute === "function" && btn.getAttribute("aria-pressed") === "true");
+  let switched = false;
+  if (!isPressed()) {
+    if (typeof btn.click === "function") btn.click();
+    switched = true;
+  }
+  const active = isPressed();
+  const editor = document.querySelector(${JSON.stringify(editorSelector)});
+  const placeholder = editor && typeof editor.getAttribute === "function" ? (editor.getAttribute("data-placeholder") || "") : "";
+  return {
+    ok: active,
+    active,
+    switched,
+    mode: ${JSON.stringify(expectedLabel)},
+    placeholder,
+    reason: active ? "mode_active" : "mode_switch_pending",
+  };
+})()`;
+}
+
 export const uploadTriggerSelector = 'button[aria-label="Upload & tools"]';
 export const uploadMenuItemSelector = '[role="menuitem"][aria-label^="Upload files"]';
 export const fileInputSelector = 'input[type="file"].hidden-file-input[accept^=".txt"]';

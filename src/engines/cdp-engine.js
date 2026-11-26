@@ -176,6 +176,7 @@ export async function runCdpTurn({
   stallTimeoutMs = 420000,
   hardTimeoutMs = 900000,
   minIntervalMs,
+  geminiMode = null,
   onWait,
   onProgress,
   keepBrowser = false,
@@ -442,6 +443,15 @@ export async function runCdpTurn({
         sleep: sleepFn,
         signal,
       });
+      if (normalizedProvider === "gemini" && geminiMode) {
+        const ensureModeFn = typeof driver.ensureProviderMode === "function"
+          ? driver.ensureProviderMode
+          : defaultDriver.ensureProviderMode;
+        await ensureModeFn(cdp, sessionId, adapter, geminiMode, {
+          sleep: sleepFn,
+          signal,
+        });
+      }
       if (signal?.aborted) {
         const err = new Error("Operation cancelled");
         err.code = "CANCELLED";

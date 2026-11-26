@@ -115,6 +115,7 @@ Options:
   --prompt-file <path>       Path to prompt file
   --file <path|glob|dir>     Repeatable attachment; native CDP uploads via DOM.setFileInputFiles
   --mode <mode>              background (default for ask, visible for login), visible, or headless
+  --gemini-mode <chat|task>  Optional Gemini web UI mode (chat or task)
   --conversation-id <id>     Optional conversation ID to serialize same-session turns
   --request-id <id>          Optional idempotency key (auto-generated UUID if omitted)
   --json                     Output machine-readable JSON
@@ -591,6 +592,14 @@ async function handleAsk(argv, deps) {
     }
   }
 
+  let geminiMode = null;
+  if (options["gemini-mode"] !== undefined) {
+    geminiMode = String(options["gemini-mode"]).trim().toLowerCase();
+    if (!["chat", "task"].includes(geminiMode)) {
+      throw new WfaError("INVALID_ARGUMENT", `Invalid --gemini-mode: ${options["gemini-mode"]}. Must be chat or task.`);
+    }
+  }
+
   let requestId;
   if (options["request-id"] !== undefined) {
     requestId = String(options["request-id"]).trim();
@@ -617,6 +626,7 @@ async function handleAsk(argv, deps) {
     hardTimeoutMs,
     ...(conversationId !== null ? { conversationId } : {}),
     ...(attachedFiles.length > 0 ? { files: attachedFiles } : {}),
+    ...(geminiMode !== null ? { geminiMode } : {}),
     ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
     ...(options["chrome-path"] ? { chromePath: options["chrome-path"] } : {}),
   });

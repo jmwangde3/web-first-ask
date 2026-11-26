@@ -30,6 +30,7 @@ function computeRequestHash(turn, promptSha256) {
       turn.stallTimeoutMs ?? null,
       turn.hardTimeoutMs ?? null,
       turn.minIntervalMs ?? null,
+      ...(turn.geminiMode != null ? [turn.geminiMode] : []),
     ]))
     .digest("hex");
 }
@@ -310,6 +311,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         ...(body.hardTimeoutMs !== undefined ? { hardTimeoutMs: body.hardTimeoutMs } : {}),
         ...(body.minIntervalMs !== undefined ? { minIntervalMs: body.minIntervalMs } : {}),
         ...(body.chromePath !== undefined ? { chromePath: body.chromePath } : {}),
+        ...(body.geminiMode !== undefined ? { geminiMode: body.geminiMode } : {}),
       });
       const promptSha256 = journal.hashPrompt(turn.prompt);
       let requestHash = null;
