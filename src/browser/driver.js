@@ -203,6 +203,7 @@ export async function waitForEditor(cdp, sessionId, adapter, {
     return {
       found: Boolean(el),
       title: document.title || "",
+      url: typeof location !== "undefined" && typeof location.href === "string" ? location.href : "",
       hasPassword,
       bodyLength: bodyText.length,
       emptyBody: bodyText.length === 0,
@@ -210,11 +211,16 @@ export async function waitForEditor(cdp, sessionId, adapter, {
   })()`;
 
   let lastTitle = "";
+  let lastUrl = "";
   let lastBodyLength = 0;
   let lastHasPassword = false;
   let consecutiveChallenged = 0;
 
   const challengePattern = challengePatternFor(adapter);
+  // Neon hotfix alignment (D7): a Google /sorry redirect carries no
+  // challenge title, so the title pattern alone never fires on it — the
+  // URL is the signal. Same park, same HUMAN_VERIFICATION_REQUIRED error.
+  const sorryUrlPattern = /\/sorry(?:\/|$|\?)/i;
 
   while (now() - startTime < timeoutMs) {
     if (signal?.aborted) {
@@ -233,6 +239,9 @@ export async function waitForEditor(cdp, sessionId, adapter, {
         if (typeof val.title === "string") {
           lastTitle = val.title;
         }
+        if (typeof val.url === "string") {
+          lastUrl = val.url;
+        }
         if (typeof val.bodyLength === "number") {
           lastBodyLength = val.bodyLength;
         }
@@ -241,11 +250,12 @@ export async function waitForEditor(cdp, sessionId, adapter, {
         }
 
         const titleMatches = challengePattern.test(val.title || "");
+        const urlMatches = sorryUrlPattern.test(val.url || "");
         const hasPassword = Boolean(val.hasPassword);
 
         lastHasPassword = hasPassword;
 
-        const isPollChallenged = hasPassword || titleMatches;
+        const isPollChallenged = hasPassword || titleMatches || urlMatches;
         if (isPollChallenged) {
           consecutiveChallenged += 1;
           if (consecutiveChallenged >= 2) {
@@ -270,7 +280,7 @@ export async function waitForEditor(cdp, sessionId, adapter, {
     await sleep(pollIntervalMs);
   }
 
-  const isChallenge = Boolean(lastHasPassword || challengePattern.test(lastTitle));
+  const isChallenge = Boolean(lastHasPassword || challengePattern.test(lastTitle) || sorryUrlPattern.test(lastUrl));
 
   if (isChallenge) {
     // D7: park the challenged tab before reporting, so a retry opens a
