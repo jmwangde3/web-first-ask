@@ -112,6 +112,24 @@ than stated: Gemini `buildAttachmentVerifyJs` referenced free variables (`sendRe
 filename-verified chips, selector no longer matches the attach button, fail-closed with
 `ATTACH_UPLOAD_FAILED` and no submission. ChatGPT already verified by name (locked by test).
 
+**Follow-up (2026-11-26, branch acceptance FAILED):** the chip is transient — with
+`d3b-probe.zip` (421,605 B) the verify passed at the submit moment (`present: true`),
+Gemini dropped the zip afterwards, the prompt was submitted anyway (`sendCommittedAt`
+written, Gemini answered "No attachment or zip file was provided") and the CLI timed
+out after 150 s instead of returning an error. Fix (branch `fix/d3`, uncommitted):
+(1) re-verify at submit time inside the send slot, before any send intent is journaled —
+`src/browser/driver.js` `verifyAttachments`, `src/engines/cdp-engine.js` pre-submit
+re-check; failure returns `ATTACH_UPLOAD_FAILED` with no submission and no
+`sendCommittedAt`. (2) confirm post-submit that every filename is in the newest user
+turn (`buildAttachmentPostSubmitVerifyJs` in `gemini.js` / `chatgpt.js` / `claude.js`,
+`driver.confirmAttachmentsPostSubmit` with a baseline-user-turns guard, bounded 10 s);
+a failed confirmation returns `SUBMITTED_WITH_UNVERIFIED_ATTACHMENT` with the turn
+record (`sendCommittedAt` set) instead of waiting out the completion timeout — and
+never auto-resends. Filename verification is unchanged and still enforced at all
+three checkpoints. Still awaiting live verification on Windows (no logged-in Chrome
+on the Linux VM); the post-submit `user-query` filename rendering is the step most
+in need of a real-DOM check.
+
 **Symptom.** `wfa cdp ask --file <archive>` passes the attachment check, the prompt is submitted, but the
 provider receives no file. Gemini answers `REPO_UNREADABLE`; ChatGPT has historically answered
 "No file is attached".

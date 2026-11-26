@@ -85,6 +85,33 @@ export function buildAttachmentVerifyJs(fileNames) {
 })()`;
 }
 
+// D3 提交后确认（2026-11-26）：与 gemini.js / chatgpt.js 同形——提交后
+// composer chip 已消失，文件名必须在最新一条 user turn 里复核。注意本文件
+// 全部选择器均为 UNVERIFIED（见文件头），userMessageSelector 也不例外：
+// 提交后确认在 Claude 真机核实前不可采信。
+export function buildAttachmentPostSubmitVerifyJs(fileNames) {
+  const bases = fileNames.map((fp) => String(fp).split(/[\\/]/).pop());
+  return `(() => {
+  const bases = ${JSON.stringify(bases)};
+  const turns = [...document.querySelectorAll(${JSON.stringify(userMessageSelector)})];
+  const latest = turns[turns.length - 1] || null;
+  const textOf = (el) => {
+    if (!el) return "";
+    const parts = [el.innerText, el.textContent];
+    if (el.querySelectorAll) {
+      for (const d of el.querySelectorAll("[aria-label], [title]")) {
+        parts.push(typeof d.getAttribute === "function" ? d.getAttribute("aria-label") : null);
+        parts.push(typeof d.getAttribute === "function" ? d.getAttribute("title") : null);
+      }
+    }
+    return parts.filter(Boolean).join(" ");
+  };
+  const text = textOf(latest);
+  const matched = bases.map((b) => text.includes(b));
+  return { userTurns: turns.length, matched, fileNames: bases };
+})()`;
+}
+
 // F4 shape, same as the other adapters: best-effort click hook; no match
 // returns clicked:false and the caller must not fabricate a download.
 export const downloadTriggerSelector = 'button[aria-label*="Download"], button[aria-label*="下载"], a[download], [data-testid*="download"]';

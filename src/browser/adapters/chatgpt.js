@@ -51,6 +51,33 @@ export function buildAttachmentVerifyJs(fileNames) {
 })()`;
 }
 
+// D3 提交后确认（2026-11-26）：与 gemini.js 同形——提交后 composer chip 已
+// 消失，文件名必须在最新一条 user turn（article[data-message-author-role="user"]）
+// 里复核。提交前 verify 通过、提交后附件被丢的形态，在 ChatGPT 历史上同样
+// 出现过（"No file is attached"），因此同一确认也适用于 ChatGPT。
+export function buildAttachmentPostSubmitVerifyJs(fileNames) {
+  const bases = fileNames.map((fp) => String(fp).split(/[\\/]/).pop());
+  return `(() => {
+  const bases = ${JSON.stringify(bases)};
+  const turns = [...document.querySelectorAll('article[data-message-author-role="user"]')];
+  const latest = turns[turns.length - 1] || null;
+  const textOf = (el) => {
+    if (!el) return "";
+    const parts = [el.innerText, el.textContent];
+    if (el.querySelectorAll) {
+      for (const d of el.querySelectorAll("[aria-label], [title]")) {
+        parts.push(typeof d.getAttribute === "function" ? d.getAttribute("aria-label") : null);
+        parts.push(typeof d.getAttribute === "function" ? d.getAttribute("title") : null);
+      }
+    }
+    return parts.filter(Boolean).join(" ");
+  };
+  const text = textOf(latest);
+  const matched = bases.map((b) => text.includes(b));
+  return { userTurns: turns.length, matched, fileNames: bases };
+})()`;
+}
+
 // F4：provider 产物的下载入口（best-effort 选择器，尚未在真机 DOM 上核实，
 // 仅作点击钩子；无匹配控件时返回 clicked:false，调用方不伪造下载记录）。
 export const downloadTriggerSelector = 'button[aria-label*="Download"], button[aria-label*="下载"], a[download], [data-testid*="download"]';

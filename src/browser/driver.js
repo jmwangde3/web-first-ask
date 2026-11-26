@@ -638,33 +638,17 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
   // React 读文件进 state 后清空 input.files，chip 才是真实成功标志；
   // 它出现前就提交 prompt 会导致 "I don't see an attached file"。
   // input.files 仅作诊断，绝不参与成功判定。
-  const verifyJs = typeof adapter.buildAttachmentVerifyJs === "function"
-    ? adapter.buildAttachmentVerifyJs(absolutePaths)
-    : null;
-  if (verifyJs) {
-    let diag = null;
-    const deadline = now() + attachmentVerifyTimeoutMs;
-    while (now() < deadline) {
-      if (signal?.aborted) {
-        const err = new Error("Operation cancelled");
-        err.code = "CANCELLED";
-        throw err;
-      }
-      const res = await cdp.send("Runtime.evaluate", {
-        expression: verifyJs,
-        returnByValue: true,
-      }, sessionId);
-      diag = res?.result?.value || null;
-      if (diag?.present) break;
-      await sleep(attachmentVerifyIntervalMs);
-    }
-    if (!diag?.present) {
-      throw new WfaError(
-        "ATTACH_UPLOAD_FAILED",
-        `Attachment chip not visible within ${attachmentVerifyTimeoutMs}ms for ${adapter?.id || "unknown"}. ` +
-          `diagnostics=${JSON.stringify({ inputFiles: diag?.inputFiles ?? null, chipCount: diag?.chipCount ?? 0 })}`
-      );
-    }
+  const diag = await verifyAttachments(cdp, sessionId, adapter, absolutePaths, {
+    signal, sleep, now,
+    timeoutMs: attachmentVerifyTimeoutMs,
+    intervalMs: attachmentVerifyIntervalMs,
+  });
+  if (diag && !diag.present) {
+    throw new WfaError(
+      "ATTACH_UPLOAD_FAILED",
+      `Attachment chip not visible within ${attachmentVerifyTimeoutMs}ms for ${adapter?.id || "unknown"}. ` +
+        `diagnostics=${JSON.stringify({ inputFiles: diag?.inputFiles ?? null, chipCount: diag?.chipCount ?? 0 })}`
+    );
   }
 
   // 5. 不在此处重复 waitForEditor：调用方 engine 已在 openTab 后等待过 editor，
@@ -674,6 +658,104 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
     attached: absolutePaths,
     provider: adapter?.id || "unknown",
     skipped: [],
+  };
+}
+
+// D3（2026-11-26）：附件 chip 校验的单次评估 + 有界轮询，供 attachFiles
+//（上传后校验）与 engine 提交前复核共用。adapter 没有
+// buildAttachmentVerifyJs 时返回 null，调用方按“无法校验”处理，绝不伪造
+// present。返回的 diag 与原内联实现同形（present / matched / chipCount /
+// chipTexts / sendReady / inputFiles）。
+export async function verifyAttachments(cdp, sessionId, adapter, filePaths = [], {
+  signal,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(),
+  timeoutMs = 2000,
+  intervalMs = 200,
+} = {}) {
+  const verifyJs = typeof adapter?.buildAttachmentVerifyJs === "function"
+    ? adapter.buildAttachmentVerifyJs(filePaths)
+    : null;
+  if (!verifyJs) return null;
+  let diag = null;
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
+    const res = await cdp.send("Runtime.evaluate", {
+      expression: verifyJs,
+      returnByValue: true,
+    }, sessionId);
+    diag = res?.result?.value || null;
+    if (diag?.present) break;
+    await sleep(intervalMs);
+  }
+  return diag;
+}
+
+// D3 提交后确认（2026-11-26 真机复现）：prompt 发出后，在会话里按文件名
+// 复核附件是否仍在——最新一条 user turn 必须包含每个文件名，且 userTurns
+// 必须超过提交前基线（否则拿到的可能是旧 turn）。确认失败返回
+// { confirmed: false, reason }，绝不抛错：prompt 已提交，调用方要的是
+// 一条明确的失败记录，而不是一次异常。adapter 没有
+// buildAttachmentPostSubmitVerifyJs 时返回 { confirmed: null, supported:
+// false }，调用方跳过确认（不伪造通过）。timeoutMs 有界（默认 10s），
+// 确认失败不进入 completion 轮询——CLI 绝不能在已提交的无附件 prompt 上
+// 静默等满超时。
+export async function confirmAttachmentsPostSubmit(cdp, sessionId, adapter, filePaths = [], {
+  signal,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(),
+  baselineUserTurns = 0,
+  timeoutMs = 10000,
+  intervalMs = 500,
+} = {}) {
+  if (!filePaths || !filePaths.length) {
+    return { confirmed: true, skipped: true, userTurns: null, matched: [] };
+  }
+  if (typeof adapter?.buildAttachmentPostSubmitVerifyJs !== "function") {
+    return { confirmed: null, supported: false, userTurns: null, matched: [] };
+  }
+  const js = adapter.buildAttachmentPostSubmitVerifyJs(filePaths);
+  let diag = null;
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
+    const res = await cdp.send("Runtime.evaluate", {
+      expression: js,
+      returnByValue: true,
+    }, sessionId);
+    diag = res?.result?.value || null;
+    if (
+      diag &&
+      (diag.userTurns ?? 0) > baselineUserTurns &&
+      Array.isArray(diag.matched) &&
+      diag.matched.every(Boolean)
+    ) {
+      return {
+        confirmed: true,
+        userTurns: diag.userTurns,
+        matched: diag.matched,
+        fileNames: diag.fileNames ?? [],
+      };
+    }
+    await sleep(intervalMs);
+  }
+  const rendered = (diag?.userTurns ?? 0) > baselineUserTurns;
+  return {
+    confirmed: false,
+    reason: rendered ? "attachment_not_in_user_turn" : "user_turn_not_rendered",
+    userTurns: diag?.userTurns ?? 0,
+    baselineUserTurns,
+    matched: diag?.matched ?? null,
+    fileNames: diag?.fileNames ?? [],
   };
 }
 
