@@ -38,10 +38,12 @@ export function createTurn({
   chromePath = null,
   geminiMode = null,
   files = null,
+  downloadDir = null,
+  cleanupCreated = false,
   createdAt = new Date().toISOString(),
 } = {}) {
   if (typeof id !== "string" || !id.trim() ||
-      !["chatgpt", "gemini"].includes(provider) ||
+      !["chatgpt", "gemini", "claude"].includes(provider) ||
       typeof prompt !== "string" || !prompt.trim() ||
       (conversationId !== null && (typeof conversationId !== "string" || !conversationId.trim())) ||
       typeof mode !== "string" || !mode.trim() ||
@@ -54,6 +56,7 @@ export function createTurn({
       (geminiMode !== null && !["chat", "task"].includes(geminiMode)) ||
       (files !== null && (!Array.isArray(files) || files.length > MAX_TURN_FILES ||
         !files.every((f) => typeof f === "string" && f.trim().length > 0 && path.isAbsolute(f)))) ||
+      (downloadDir !== null && (typeof downloadDir !== "string" || !downloadDir.trim() || !path.isAbsolute(downloadDir))) ||
       typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) {
     throw invalid("Invalid turn arguments");
   }
@@ -61,10 +64,12 @@ export function createTurn({
     id, provider, prompt, conversationId, mode, requestId,
     settleMs, stallTimeoutMs, hardTimeoutMs, minIntervalMs, chromePath, geminiMode,
     files: Array.isArray(files) && files.length > 0 ? [...files] : null,
+    downloadDir,
+    cleanupCreated: Boolean(cleanupCreated),
     createdAt,
     state: "queued", startedAt: null, finishedAt: null,
     cooldownWaitMs: null, cooldownWaitAt: null,
-    sendCommittedAt: null, text: null, reason: null, evidence: null,
+    sendCommittedAt: null, text: null, reason: null, evidence: null, downloads: null,
   };
 }
 

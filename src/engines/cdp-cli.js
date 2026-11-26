@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getHomeDir } from "../paths.js";
 import { WfaError } from "../errors.js";
@@ -8,6 +8,8 @@ import { connectCdp } from "../browser/cdp.js";
 import * as defaultDriver from "../browser/driver.js";
 import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
+import * as claudeAdapter from "../browser/adapters/claude.js";
+import { archiveRepository } from "../repository-archive.js";
 import { sleep as defaultSleep } from "../util.js";
 import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
 import { ensureBroker, createTurn, waitForTurn, waitForSubmission } from "../broker/client.js";
@@ -19,10 +21,14 @@ import { readConversation as defaultReadConversation } from "./cdp-read.js";
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
   gemini: geminiAdapter,
+  claude: claudeAdapter,
 };
 
 const VALUE_FLAGS = new Set([
   "provider",
+  "providers",
+  "artifact-dir",
+  "download-dir",
   "prompt",
   "prompt-file",
   "mode",
@@ -180,7 +186,7 @@ async function handleLogin(argv, deps) {
   }
 
   const provider = options.provider ? String(options.provider).toLowerCase() : "chatgpt";
-  if (provider !== "chatgpt" && provider !== "gemini") {
+  if (!["chatgpt", "gemini", "claude"].includes(provider)) {
     throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt or gemini.`);
   }
 
@@ -237,8 +243,8 @@ async function handleLogin(argv, deps) {
   try {
     cdp = await connect(recovery.chrome.port);
     const adapters = deps.adapters || DEFAULT_ADAPTERS;
-    const adapter = adapters[provider] || (provider === "gemini" ? geminiAdapter : chatgptAdapter);
-    const targetUrl = adapter.url || (provider === "gemini" ? "https://gemini.google.com/app" : "https://chatgpt.com/");
+    const adapter = adapters[provider] || (provider === "gemini" ? geminiAdapter : (provider === "claude" ? claudeAdapter : chatgptAdapter));
+    const targetUrl = adapter.url || (provider === "gemini" ? "https://gemini.google.com/app" : (provider === "claude" ? "https://claude.ai/new" : "https://chatgpt.com/"));
 
     const tab = await driver.openTab(cdp, targetUrl, { timeoutMs: timeoutSec * 1000 });
     targetId = tab.targetId;
@@ -447,7 +453,7 @@ async function handleRead(argv, deps) {
   }
 
   const provider = options.provider === undefined ? undefined : String(options.provider).toLowerCase();
-  if (provider !== undefined && !["chatgpt", "gemini"].includes(provider)) {
+  if (provider !== undefined && !["chatgpt", "gemini", "claude"].includes(provider)) {
     throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt or gemini.`);
   }
 
@@ -498,6 +504,99 @@ async function handleRead(argv, deps) {
   return { code: 0, result };
 }
 
+async function runMultiProviderAsk(argv, options, deps) {
+  const stdout = deps.stdout || process.stdout;
+  const home = deps.home || getHomeDir();
+  const rawList = String(options.providers || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const providers = [...new Set(rawList)];
+  if (providers.length === 0) {
+    throw new WfaError("INVALID_ARGUMENT", "Option --providers requires a comma-separated list of providers.");
+  }
+  const batchId = `batch-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const artifactDir = options["artifact-dir"]
+    ? path.resolve(String(options["artifact-dir"]))
+    : path.join(home, "artifacts", batchId);
+  await mkdir(artifactDir, { recursive: true });
+
+  // Strip --providers and --artifact-dir when delegating to single-provider handleAsk
+  const baseArgs = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const tok = argv[i];
+    if (tok === "--providers" || tok === "--artifact-dir" || tok === "--provider") {
+      i += 1;
+      continue;
+    }
+    if (tok === "--json") continue;
+    baseArgs.push(tok);
+  }
+
+  const settled = await Promise.all(providers.map(async (prov) => {
+    const subOut = { buf: "", write(s) { this.buf += String(s); } };
+    const subErr = { buf: "", write(s) { this.buf += String(s); } };
+    try {
+      const res = await handleAsk([...baseArgs, "--provider", prov, "--json"], {
+        ...deps,
+        stdout: subOut,
+        stderr: subErr,
+      });
+      const jsonPath = path.join(artifactDir, `${prov}.json`);
+      const mdPath = path.join(artifactDir, `${prov}.md`);
+      let payload = res.result || null;
+      if (!payload && subOut.buf.trim()) {
+        try { payload = JSON.parse(subOut.buf); } catch {}
+      }
+      await writeFile(jsonPath, `${JSON.stringify({ provider: prov, code: res.code, result: payload, stderr: subErr.buf.trim() || null }, null, 2)}
+`, "utf8");
+      if (typeof payload?.text === "string" && payload.text) {
+        await writeFile(mdPath, payload.text, "utf8");
+      }
+      const ok = res.code === 0 && (payload?.status === "completed" || payload?.state === "completed" || payload?.state === "running");
+      return [prov, {
+        ok,
+        code: res.code,
+        status: payload?.status || payload?.state || (ok ? "completed" : "failed"),
+        taskId: payload?.id || payload?.taskId || null,
+        artifactJson: jsonPath,
+        artifactMd: typeof payload?.text === "string" && payload.text ? mdPath : null,
+        ...(ok ? {} : { retryCommand: `wfa cdp ask --provider ${prov} ${baseArgs.join(" ")}`.trim() }),
+      }];
+    } catch (error) {
+      const jsonPath = path.join(artifactDir, `${prov}.json`);
+      await writeFile(jsonPath, `${JSON.stringify({ provider: prov, code: 1, error: error?.code || "ERROR", message: error?.message || String(error) }, null, 2)}
+`, "utf8");
+      return [prov, {
+        ok: false,
+        code: 1,
+        status: "failed",
+        error: error?.code || "ERROR",
+        message: error?.message || String(error),
+        artifactJson: jsonPath,
+        artifactMd: null,
+        retryCommand: `wfa cdp ask --provider ${prov} ${baseArgs.join(" ")}`.trim(),
+      }];
+    }
+  }));
+
+  const summary = {
+    batchId,
+    artifactDir,
+    providers: Object.fromEntries(settled),
+  };
+  const allOk = settled.every(([, info]) => info.ok);
+  if (options.json) {
+    stdout.write(`${JSON.stringify(summary, null, 2)}
+`);
+  } else {
+    stdout.write(`[cdp] batch ${batchId} artifacts: ${artifactDir}
+`);
+    for (const [prov, info] of settled) {
+      stdout.write(`  - ${prov}: ${info.status}${info.retryCommand ? ` (retry: ${info.retryCommand})` : ""}
+`);
+    }
+  }
+  return { code: allOk ? 0 : 1, result: summary };
+}
+
 async function handleAsk(argv, deps) {
   const stdout = deps.stdout || process.stdout;
   const stderr = deps.stderr || process.stderr;
@@ -510,11 +609,18 @@ async function handleAsk(argv, deps) {
     return { code: 0 };
   }
 
+  if (options.providers !== undefined) {
+    if (options.provider !== undefined) {
+      throw new WfaError("INVALID_ARGUMENT", "Specify either --provider or --providers, not both.");
+    }
+    return await runMultiProviderAsk(argv, options, deps);
+  }
+
   if (!options.provider) {
     throw new WfaError("INVALID_ARGUMENT", "Option --provider is required. Must be chatgpt or gemini.");
   }
   const provider = String(options.provider).toLowerCase();
-  if (provider !== "chatgpt" && provider !== "gemini") {
+  if (!["chatgpt", "gemini", "claude"].includes(provider)) {
     throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt or gemini.`);
   }
 
@@ -593,6 +699,11 @@ async function handleAsk(argv, deps) {
     }
   }
 
+  let downloadDir = null;
+  if (options["download-dir"] !== undefined) {
+    downloadDir = path.resolve(String(options["download-dir"]).trim());
+  }
+
   let geminiMode = null;
   if (options["gemini-mode"] !== undefined) {
     geminiMode = String(options["gemini-mode"]).trim().toLowerCase();
@@ -628,6 +739,8 @@ async function handleAsk(argv, deps) {
     ...(conversationId !== null ? { conversationId } : {}),
     ...(attachedFiles.length > 0 ? { files: attachedFiles } : {}),
     ...(geminiMode !== null ? { geminiMode } : {}),
+    ...(downloadDir !== null ? { downloadDir } : {}),
+    ...(options.cleanup ? { cleanupCreated: true } : {}),
     ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
     ...(options["chrome-path"] ? { chromePath: options["chrome-path"] } : {}),
   });
@@ -816,6 +929,39 @@ async function handleAsk(argv, deps) {
   }
 
   return { code: result.status === "completed" ? 0 : 1, result };
+}
+
+export function isRepoUnreadableResponse(text) {
+  return typeof text === "string" && /\bREPO_UNREADABLE\b/.test(text);
+}
+
+export async function runWithRepoFallback({
+  initialResult,
+  workspaceRoot = process.cwd(),
+  archiveDir,
+  createArchiveFn = archiveRepository,
+  submitFallbackFn,
+} = {}) {
+  if (!initialResult || initialResult.status !== "completed" || !isRepoUnreadableResponse(initialResult.text)) {
+    return { triggered: false, result: initialResult };
+  }
+  if (typeof submitFallbackFn !== "function") {
+    throw new WfaError("INVALID_ARGUMENT", "submitFallbackFn is required for REPO_UNREADABLE fallback.");
+  }
+  const archive = await createArchiveFn({
+    cwd: workspaceRoot,
+    outDir: archiveDir,
+  });
+  const archivePath = archive?.archivePath || archive?.path || archive;
+  const fallbackResult = await submitFallbackFn({
+    archivePath,
+    originalResult: initialResult,
+  });
+  return {
+    triggered: true,
+    archivePath,
+    result: fallbackResult,
+  };
 }
 
 export async function runCdpCommand(argv = [], deps = {}) {

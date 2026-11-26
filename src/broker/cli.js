@@ -548,7 +548,7 @@ async function handleBrokerAsk(argv, deps) {
   }
 
   const provider = options.provider ? String(options.provider).toLowerCase() : "";
-  if (!provider || !["chatgpt", "gemini"].includes(provider)) {
+  if (!provider || !["chatgpt", "gemini", "claude"].includes(provider)) {
     stderr.write("wfa: INVALID_ARGUMENT: Provider must be chatgpt or gemini\n");
     return { code: 2 };
   }

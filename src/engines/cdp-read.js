@@ -5,6 +5,7 @@ import { connectCdp as defaultConnectCdp } from "../browser/cdp.js";
 import * as defaultDriver from "../browser/driver.js";
 import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
+import * as claudeAdapter from "../browser/adapters/claude.js";
 import * as defaultResultStore from "../broker/result-store.js";
 import * as defaultTurnStore from "../broker/turn-store.js";
 import * as defaultJournal from "../broker/journal.js";
@@ -15,7 +16,7 @@ import {
 } from "../broker/client.js";
 import { sleep as defaultSleep } from "../util.js";
 
-const ADAPTERS = Object.freeze({ chatgpt: chatgptAdapter, gemini: geminiAdapter });
+const ADAPTERS = Object.freeze({ chatgpt: chatgptAdapter, gemini: geminiAdapter, claude: claudeAdapter });
 const POLL_INTERVAL_MS = 500;
 const STALL_AFTER_MS = 30000;
 
@@ -37,6 +38,7 @@ function providerFromUrl(value) {
   const host = parsed.hostname.toLowerCase();
   if (host === "chatgpt.com" || host === "www.chatgpt.com") return "chatgpt";
   if (host === "gemini.google.com") return "gemini";
+  if (host === "claude.ai") return "claude";
   throw coded("INVALID_ARGUMENT", `Unsupported conversation URL host: ${host}`);
 }
 

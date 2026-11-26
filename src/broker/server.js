@@ -238,6 +238,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
             ? { targetId: result.targetId }
             : (turns.get(turn.id)?.targetId != null ? { targetId: turns.get(turn.id).targetId } : {})),
           ...(result?.sendCommittedAt != null ? { sendCommittedAt: result.sendCommittedAt } : {}),
+          ...(result?.downloads != null ? { downloads: result.downloads } : {}),
         });
         const current = turns.get(turn.id);
         if (current && current.state === "failed" && current.sendCommittedAt == null &&
@@ -314,6 +315,8 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         ...(body.chromePath !== undefined ? { chromePath: body.chromePath } : {}),
         ...(body.geminiMode !== undefined ? { geminiMode: body.geminiMode } : {}),
         ...(body.files !== undefined ? { files: body.files } : {}),
+        ...(body.downloadDir !== undefined ? { downloadDir: body.downloadDir } : {}),
+        ...(body.cleanupCreated !== undefined ? { cleanupCreated: Boolean(body.cleanupCreated) } : {}),
       });
       const promptSha256 = journal.hashPrompt(turn.prompt);
       let requestHash = null;

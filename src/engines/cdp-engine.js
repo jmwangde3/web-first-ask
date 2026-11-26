@@ -5,6 +5,7 @@ import * as defaultDriver from "../browser/driver.js";
 import { classifyRunError } from "../browser/driver.js";
 import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
+import * as claudeAdapter from "../browser/adapters/claude.js";
 import { WfaError } from "../errors.js";
 import { sleep as defaultSleep } from "../util.js";
 import * as defaultConversationStore from "../browser/conversation-store.js";
@@ -16,6 +17,7 @@ import { withSendSlot as defaultWithSendSlot } from "../browser/stagger.js";
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
   gemini: geminiAdapter,
+  claude: claudeAdapter,
 };
 
 function isConversationInvalidated(classifier, reason, message) {
@@ -177,6 +179,8 @@ export async function runCdpTurn({
   hardTimeoutMs = 900000,
   minIntervalMs,
   geminiMode = null,
+  downloadDir = null,
+  cleanupCreated = false,
   onWait,
   onProgress,
   keepBrowser = false,
@@ -426,6 +430,17 @@ export async function runCdpTurn({
 
       const targetUrl = restoreUrl || adapter.url;
       conversationUrl = targetUrl || "";
+      let downloadBeforeFiles = null;
+      if (downloadDir) {
+        const cfgDl = typeof driver.configureDownloadBehavior === "function"
+          ? driver.configureDownloadBehavior
+          : defaultDriver.configureDownloadBehavior;
+        const snapDl = typeof driver.snapshotDownloadDir === "function"
+          ? driver.snapshotDownloadDir
+          : defaultDriver.snapshotDownloadDir;
+        await cfgDl(cdp, downloadDir);
+        downloadBeforeFiles = await snapDl(downloadDir);
+      }
       const tab = await driver.openTab(cdp, targetUrl, { timeoutMs: hardTimeoutMs });
       targetId = tab.targetId;
       sessionId = tab.sessionId;
@@ -795,10 +810,45 @@ export async function runCdpTurn({
         }
       }
 
+      let downloads = null;
+      if (downloadDir && finalStatus === "completed") {
+        const collectDl = typeof driver.collectDownloads === "function"
+          ? driver.collectDownloads
+          : defaultDriver.collectDownloads;
+        downloads = await collectDl({
+          downloadDir,
+          beforeFiles: downloadBeforeFiles || new Set(),
+        });
+      }
+      const createdByWfa = Boolean(!restoreUrl && conversationUrl && conversationUrl !== adapter.url);
+      let createdCleanup = null;
+      if (cleanupCreated && createdByWfa && finalStatus === "completed" && !signal?.aborted && cdp) {
+        if (typeof adapter.buildDeleteConversationJs === "function") {
+          try {
+            const delExpr = adapter.buildDeleteConversationJs(conversationUrl);
+            const delRes = await cdp.send("Runtime.evaluate", {
+              expression: delExpr,
+              awaitPromise: true,
+              returnByValue: true,
+            }, sessionId);
+            createdCleanup = { status: delRes?.result?.value?.deleted ? "deleted" : "attempted", url: conversationUrl, createdByWfa: true };
+          } catch (cleanupErr) {
+            createdCleanup = { status: "failed", reason: cleanupErr?.message || String(cleanupErr), url: conversationUrl, createdByWfa: true };
+          }
+        } else {
+          createdCleanup = { status: "skipped", reason: "adapter_delete_not_supported", url: conversationUrl, createdByWfa: true };
+        }
+      } else if (cleanupCreated && !createdByWfa) {
+        createdCleanup = { status: "skipped", reason: "preexisting_conversation_preserved", url: conversationUrl || null, createdByWfa: false };
+      }
+
       return withTerminalStatus({
         status: finalStatus,
         text: completion.text || "",
         reason: finalReason,
+        downloads,
+        createdByWfa,
+        ...(createdCleanup ? { createdCleanup } : {}),
         evidence: {
           ...(completion.evidence || {}),
           replacedChars: typeRes?.replacedChars ?? 0,

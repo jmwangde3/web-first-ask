@@ -1,4 +1,7 @@
 
+import { createHash } from "node:crypto";
+import { mkdir, readdir, readFile, stat } from "node:fs/promises";
+import path from "node:path";
 import { WfaError } from "../errors.js";
 
 function buildEvidence(state, lastProgressAgoMs) {
@@ -144,6 +147,71 @@ export async function parkChallengedTab(cdp, sessionId) {
   } catch {
     return false;
   }
+}
+
+export async function configureDownloadBehavior(cdp, downloadDir, sessionId = undefined) {
+  if (!cdp || typeof cdp.send !== "function" || !downloadDir) {
+    return { configured: false, method: null };
+  }
+  const absDir = path.resolve(downloadDir);
+  await mkdir(absDir, { recursive: true });
+  try {
+    await cdp.send("Browser.setDownloadBehavior", {
+      behavior: "allow",
+      downloadPath: absDir,
+      eventsEnabled: true,
+    });
+    return { configured: true, method: "Browser.setDownloadBehavior", downloadDir: absDir };
+  } catch {
+    try {
+      await cdp.send("Page.setDownloadBehavior", {
+        behavior: "allow",
+        downloadPath: absDir,
+      }, sessionId);
+      return { configured: true, method: "Page.setDownloadBehavior", downloadDir: absDir };
+    } catch {
+      return { configured: false, method: null, downloadDir: absDir };
+    }
+  }
+}
+
+export async function snapshotDownloadDir(downloadDir) {
+  if (!downloadDir) return new Set();
+  try {
+    const entries = await readdir(downloadDir);
+    return new Set(entries);
+  } catch {
+    return new Set();
+  }
+}
+
+export async function collectDownloads({ downloadDir, beforeFiles = new Set() } = {}) {
+  if (!downloadDir) return null;
+  let entries;
+  try {
+    entries = await readdir(downloadDir);
+  } catch {
+    return null;
+  }
+  const collected = [];
+  for (const name of entries.sort()) {
+    if (beforeFiles.has(name)) continue;
+    if (name.endsWith(".crdownload") || name.endsWith(".tmp") || name.endsWith(".part")) continue;
+    const fullPath = path.join(downloadDir, name);
+    try {
+      const info = await stat(fullPath);
+      if (!info.isFile()) continue;
+      const buf = await readFile(fullPath);
+      const digest = createHash("sha256").update(buf).digest("hex");
+      collected.push({
+        name,
+        path: fullPath,
+        bytes: info.size,
+        sha256: digest,
+      });
+    } catch {}
+  }
+  return collected.length > 0 ? collected : null;
 }
 
 export async function ensureProviderMode(cdp, sessionId, adapter, targetMode, {
@@ -349,9 +417,27 @@ export async function waitForComposerReady(cdp, sessionId, adapter, {
     const editorChars = typeof editorRaw === "string" ? editorRaw.trim().length : -1;
     const stopSelector = ${JSON.stringify(adapter.stopSelector || "")};
     const stopEls = stopSelector ? [...document.querySelectorAll(stopSelector)] : [];
-    const stopActive = stopEls.some((el) =>
-      Boolean(el) && !el.disabled && (typeof el.getAttribute !== "function" || el.getAttribute("aria-disabled") !== "true")
-    );
+    const inspectStop = (el) => {
+      if (!el) return null;
+      const rect = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+      const visible = !rect || (rect.width > 0 && rect.height > 0);
+      const disabled = Boolean(el.disabled);
+      const ariaDisabled = typeof el.getAttribute === "function" ? el.getAttribute("aria-disabled") : null;
+      const active = !disabled && ariaDisabled !== "true";
+      return {
+        tag: String(el.tagName || "").toLowerCase(),
+        ariaLabel: typeof el.getAttribute === "function" ? (el.getAttribute("aria-label") || "") : "",
+        disabled,
+        ariaDisabled,
+        visible,
+        width: rect ? rect.width : null,
+        height: rect ? rect.height : null,
+        active,
+        html: typeof el.outerHTML === "string" ? el.outerHTML.slice(0, 160) : "",
+      };
+    };
+    const stopDiagnostics = stopEls.map(inspectStop).filter(Boolean);
+    const stopActive = stopDiagnostics.some((d) => d.active);
     const ready = Boolean(editorEditable && editorVisible && !stopActive);
     return {
       ready,
@@ -361,6 +447,7 @@ export async function waitForComposerReady(cdp, sessionId, adapter, {
       editorChars,
       stopActive,
       stopMatched: stopActive,
+      stopDiagnostics,
     };
   })()`;
 

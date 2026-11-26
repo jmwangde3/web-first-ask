@@ -5,7 +5,7 @@ import { getHomeDir } from "../paths.js";
 
 export const CONVERSATION_SCHEMA = 1;
 
-const PROVIDERS = new Set(["chatgpt", "gemini"]);
+const PROVIDERS = new Set(["chatgpt", "gemini", "claude"]);
 const CHATGPT_CONVERSATION_PATH = /^\/c\/[a-zA-Z0-9-]+\/?$/;
 const GEMINI_CONVERSATION_PATH = /^\/app\/[a-zA-Z0-9_-]+\/?$/;
 
@@ -45,6 +45,11 @@ export function isValidConversationUrl(provider, value) {
   if (provider === "gemini") {
     return parsed.hostname === "gemini.google.com" &&
       GEMINI_CONVERSATION_PATH.test(parsed.pathname);
+  }
+
+  if (provider === "claude") {
+    return parsed.hostname === "claude.ai" &&
+      /^\/chat\/[a-zA-Z0-9_-]{8,}$/.test(parsed.pathname);
   }
 
   return false;

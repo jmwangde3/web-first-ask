@@ -209,6 +209,8 @@ export function createCdpRunner({
         ...(Array.isArray(turn?.files) && turn.files.length > 0 ? { files: turn.files } : {}),
         ...(turn?.minIntervalMs != null ? { minIntervalMs: turn.minIntervalMs } : {}),
         ...(turn?.geminiMode != null ? { geminiMode: turn.geminiMode } : {}),
+        ...(turn?.downloadDir != null ? { downloadDir: turn.downloadDir } : {}),
+        ...(turn?.cleanupCreated ? { cleanupCreated: true } : {}),
         ...(onWait ? { onWait } : {}),
         onProgress: (patch) => {
           if (patch && typeof patch === "object" && typeof onProgress === "function") {

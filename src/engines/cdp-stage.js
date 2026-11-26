@@ -56,6 +56,138 @@ async function assertNoSymlinkComponents(root, target, { allowMissing = true } =
   }
 }
 
+export function validateAnswerIntegrity(markdown = "") {
+  const normalized = String(markdown ?? "").replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+
+  // 1. Fence pairing check
+  let openFence = null;
+  let fencePairs = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i].trimStart();
+    if (!openFence) {
+      const openMatch = trimmed.match(/^(`{3,}|~{3,})/);
+      if (openMatch) {
+        openFence = { char: openMatch[1][0], len: openMatch[1].length, line: i + 1 };
+      }
+    } else {
+      const closeRe = new RegExp(`^${openFence.char}{${openFence.len},}\\s*$`);
+      if (closeRe.test(trimmed)) {
+        openFence = null;
+        fencePairs += 1;
+      }
+    }
+  }
+  if (openFence) {
+    throw new WfaError(
+      "INCOMPLETE_CODE_FENCE",
+      `Unclosed code fence starting at line ${openFence.line}; answer appears truncated.`,
+    );
+  }
+
+  // 2. FILE: header count vs parsed blocks
+  const fileHeaderCount = lines.filter((line) => /^FILE:\s*.+\s*$/.test(line)).length;
+  let blocks = [];
+  if (fileHeaderCount > 0) {
+    blocks = parseFileBlocks(normalized);
+    const uniqueFileHeaders = new Set(blocks.map((b) => b.filePath)).size;
+    if (blocks.length < fileHeaderCount && uniqueFileHeaders < fileHeaderCount) {
+      throw new WfaError(
+        "TRUNCATED_FILE_BLOCKS",
+        `Detected ${fileHeaderCount} FILE: headers but only parsed ${blocks.length} complete blocks.`,
+      );
+    }
+  }
+
+  // 3. Unified diff hunk line-count verification inside diff/patch blocks
+  let verifiedHunks = 0;
+  for (const block of blocks) {
+    const isDiff = block.language === "diff" || block.language === "patch" ||
+      /\.(diff|patch)$/i.test(block.filePath || "");
+    if (!isDiff || typeof block.content !== "string") continue;
+    const diffLines = block.content.replace(/\r\n?/g, "\n").split("\n");
+    for (let i = 0; i < diffLines.length; i += 1) {
+      const m = diffLines[i].match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+      if (!m) continue;
+      const expectedOld = m[2] === undefined ? 1 : Number(m[2]);
+      const expectedNew = m[4] === undefined ? 1 : Number(m[4]);
+      let actualOld = 0;
+      let actualNew = 0;
+      let j = i + 1;
+      while (j < diffLines.length) {
+        const l = diffLines[j];
+        if (/^(@@ |diff --git |--- |\+\+\+ )/.test(l)) break;
+        if (l.startsWith("\\ No newline")) { j += 1; continue; }
+        if (l.startsWith("-")) actualOld += 1;
+        else if (l.startsWith("+")) actualNew += 1;
+        else if (l.startsWith(" ") || l === "") { actualOld += 1; actualNew += 1; }
+        else break;
+        j += 1;
+      }
+      if (actualOld !== expectedOld || actualNew !== expectedNew) {
+        throw new WfaError(
+          "INVALID_HUNK_LINE_COUNT",
+          `Hunk mismatch in ${block.filePath}: header expects -${expectedOld}/+${expectedNew}, got -${actualOld}/+${actualNew}.`,
+        );
+      }
+      verifiedHunks += 1;
+      i = j - 1;
+    }
+  }
+
+  return {
+    ok: true,
+    fencePairs,
+    fileHeaderCount,
+    blockCount: blocks.length,
+    verifiedHunks,
+  };
+}
+
+export async function extractFileBlocksToDir({
+  markdown,
+  outputDir,
+  allowOverwrite = false,
+} = {}) {
+  if (!outputDir || typeof outputDir !== "string") {
+    throw new WfaError("INVALID_ARGUMENT", "outputDir is required to extract FILE blocks.");
+  }
+  const integrity = validateAnswerIntegrity(markdown);
+  const blocks = parseFileBlocks(markdown);
+  const root = path.resolve(outputDir);
+  await mkdir(root, { recursive: true });
+
+  const planned = [];
+  for (const block of blocks) {
+    if (block.kind !== "full") {
+      throw new WfaError("UNSUPPORTED_EXTRACT_KIND", `extractFileBlocksToDir only supports full FILE blocks, got ${block.kind} for ${block.filePath}`);
+    }
+    const { normalized, target } = assertSafeRelativePath(block.filePath, root);
+    await assertNoSymlinkComponents(root, target, { allowMissing: true });
+    if (!allowOverwrite) {
+      const existing = await stat(target).catch(() => null);
+      if (existing) {
+        throw new WfaError("TARGET_FILE_EXISTS", `Refusing to overwrite existing file without allowOverwrite: ${normalized}`);
+      }
+    }
+    planned.push({ filePath: normalized, targetPath: target, content: block.content });
+  }
+
+  const written = [];
+  for (const item of planned) {
+    await mkdir(path.dirname(item.targetPath), { recursive: true });
+    await writeFile(item.targetPath, item.content, "utf8");
+    const buf = Buffer.from(item.content, "utf8");
+    written.push({
+      filePath: item.filePath,
+      targetPath: item.targetPath,
+      bytes: buf.length,
+      sha256: sha256(item.content),
+    });
+  }
+  return { ok: true, outputDir: root, files: written, integrity };
+}
+
 export async function stageCdpResponse({
   home,
   runId,
@@ -70,6 +202,9 @@ export async function stageCdpResponse({
     return null;
   }
 
+  if (/^FILE:\s*.+\s*$/m.test(String(text))) {
+    validateAnswerIntegrity(text);
+  }
   let blocks;
   try {
     blocks = parseFileBlocks(text);
