@@ -523,19 +523,6 @@ that still restored 19 tabs, and `ask` runs at 15:25:5x / 15:30:5x plus probes a
 `/sorry` (landing page and `/app/ceeb4b6cc5ca503d` alike). Run record:
 `reverdict/live-tests/20261126-1520-neon-hotfix/REPORT.md`.
 
-**Status (2026-11-26): evidence only, awaiting the user's design decision — no
-code change, no tests.** Removing the flag breaks ChatGPT persistence per the
-repo's own reasoning, but that claim is now **contested, not verified**: the
-user reports (2026-11-26 17:02) that a manually launched Chrome **without**
-`--restore-last-session` still shows ChatGPT logged in. Likely explanations:
-the profile's "Continue where you left off" setting (set via Chrome UI)
-restores session cookies without the flag, an unclean last exit also preserves
-them, or ChatGPT re-authenticates from a persistent token. Decisive check
-pending (user side): `chrome://settings/onStartup` value + whether `oai-asli`
-is present after a clean no-flag relaunch. If login survives that, the fix
-may be simply dropping the flag, not a config option / per-provider profiles.
-Do not implement any D10 fix until that decision lands.
-
 ---
 
 ## Planned work
