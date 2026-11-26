@@ -56,9 +56,17 @@ export const taskModePlaceholderTexts = Object.freeze(["Describe a task", "描�
 // Short interval, no fixed sleep: the in-page poll re-checks every
 // 100 ms until the deadline. The builder accepts overrides so tests can
 // use a short bound without weakening the production one.
+// F1 (2026-11-26 live verification, REPORT-8ead8b4b.md §4): the click
+// succeeds — aria-pressed flips at ~2.09 s — but the composer shows the
+// intermediate text "Type @ for connectors, skills and more" from
+// 2.4–5.0 s and only settles to "Describe a task" later, so the old 2 s
+// placeholder bound failed 3/3 with task_mode_placeholder_not_confirmed.
+// The bound is now 5 s. The intermediate text is generic connector UI,
+// not mode evidence, and is deliberately NOT accepted as proof of Task
+// mode — only the two target texts in taskModePlaceholderTexts count.
 export const taskModeControlTimeoutMs = 5000;
 export const taskModeControlPollIntervalMs = 100;
-export const taskModePlaceholderTimeoutMs = 2000;
+export const taskModePlaceholderTimeoutMs = 5000;
 
 // Find the Task switch, click it only when the requested mode differs from
 // the current one, and confirm aria-pressed flipped. Never throws in-page:
@@ -129,6 +137,11 @@ export function buildTaskModeJs(mode, options = {}) {
   const isTaskPlaceholder = (text) =>
     typeof text === "string" && placeholderTexts.some((want) => text.includes(want));
   const confirmTaskPlaceholder = async () => {
+    // Waits for the placeholder to SETTLE to a target text. The
+    // intermediate "Type @ for connectors, skills and more" shown right
+    // after the click is generic connector UI, not mode evidence, so it
+    // never satisfies isTaskPlaceholder — the poll keeps waiting for the
+    // real Task prompt until the deadline, then fails closed.
     const deadline = Date.now() + ${JSON.stringify(placeholderTimeoutMs)};
     let placeholder = readPlaceholder();
     while (!isTaskPlaceholder(placeholder) && Date.now() < deadline) {
