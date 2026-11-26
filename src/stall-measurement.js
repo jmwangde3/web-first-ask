@@ -36,14 +36,34 @@
 //      420 s default stands; if any completed pause exceeded 420 s, raise the
 //      background default or add a "paused but not dead" page signal.
 //   Until those runs exist, STALL_TIMEOUT_DECISION below is PROVISIONAL.
+//   Update (2026-11-26, D5 fix): the "paused but not dead" signal now
+//   exists — src/stall-alive.js classifies the 420 s boundary as alive
+//   (page responsive, pendingCount > 0) vs dead, keeps an alive turn waiting
+//   under a bounded continued-wait budget, and records the decision as a
+//   stall_* event in this same log (see recordDecision). The live runs must
+//   therefore be read for stall decisions as well as pause durations:
+//   `node scripts/summarize-pauses.mjs` prints both. 420 s is now a
+//   classification boundary, not a stall declaration; the decision below
+//   stays PROVISIONAL until those runs separate throttling from freeze.
 
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
-// D5 decision, recorded 2026-11-26. PROVISIONAL: no live pause-distribution
-// data exists yet (a live logged-in Chrome is required and was not
-// available), so the 420 s default is kept, not endorsed as sufficient.
-// It becomes final only after the measurement runs in the header comment.
+// D5 decision, recorded 2026-11-26, updated the same day. PROVISIONAL:
+// no live pause-distribution data exists yet (a live logged-in Chrome is
+// required and was not available), so the 420 s boundary is kept, not
+// endorsed as sufficient. What changed: 420 s is no longer a stall
+// declaration. Branch acceptance (Windows 2026-11-26) reproduced 5/5
+// background pauses (pending 482-658, chars 18-25, openPause 249-269 s at
+// the 300 s cutoff) and the visible control also timed out at 422.9 s, so
+// 420 s as a declaration is proven insufficient — with the confound that
+// Gemini may have been throttling that day (same prompt: 27-55 s the day
+// before). src/stall-alive.js now classifies the boundary instead: a
+// paused-but-alive turn (page responsive, pendingCount > 0) keeps waiting
+// up to a further 600 s continued-wait budget (capped by hardTimeoutMs);
+// a dead turn is still declared stalled at 420 s. The decision becomes
+// final only after live runs separate throttling from freeze via the
+// recorded stall decisions (see the procedure in this file's header).
 export const PROVISIONAL_STALL_TIMEOUT_MS = 420000;
 
 export const STALL_TIMEOUT_DECISION = Object.freeze({
@@ -55,10 +75,18 @@ export const STALL_TIMEOUT_DECISION = Object.freeze({
   basis: "Single measured background pause (2026-11-25): .pending stayed 378 "
     + "for 5+ min with no text change, answer then completed at 7803 chars; "
     + "same kind of task finished in 41 s in visible mode. One sample cannot "
-    + "establish a distribution.",
+    + "establish a distribution. Branch acceptance (2026-11-26) added 5/5 "
+    + "background pauses plus a visible-control timeout at 422.9 s, proving "
+    + "420 s insufficient as a stall declaration — with a throttling "
+    + "confound that day, so no single cause is attributed. The 420 s value "
+    + "is therefore kept as the alive/dead classification boundary "
+    + "(src/stall-alive.js), not as a declaration.",
   requires: "Pause-distribution measurement across several long background "
-    + "runs (see the procedure in this file's header). If p90 exceeds 420 s, "
-    + "or any completed pause exceeds 420 s, revisit the default.",
+    + "runs (see the procedure in this file's header). Read the stall "
+    + "decisions, not just the pause percentiles: a stall_alive_continued "
+    + "followed by completion means throttling, a stall_dead means freeze. "
+    + "If any alive turn exhausts the continued-wait budget, revisit the "
+    + "budget with that data; do not raise a bare number without it.",
 });
 
 function percentile(sorted, p) {
@@ -168,6 +196,17 @@ export function createPauseTracker({
   return {
     sample,
     finish,
+    // D5 fix: records an alive/dead stall decision (src/stall-alive.js) in
+    // the same event log, stamped with provider/mode/taskId like the pause
+    // events. The decision carries counts and character lengths only — no
+    // prompt or response text. Unknown decision shapes are stored as-is;
+    // summarizePauses ignores non-pause event types.
+    recordDecision(event) {
+      if (!event || typeof event !== "object") return null;
+      const stamped = { ...base(), ...event };
+      events.push(stamped);
+      return stamped;
+    },
     events: () => [...events],
     inPause: () => inPause,
   };
@@ -217,6 +256,46 @@ export function formatPauseSummary(summary) {
       ? "note: open pauses have unknown duration and are excluded from the percentiles"
       : "note: no open pauses",
   ].join("\n");
+}
+
+// Counts alive/dead stall decisions (src/stall-alive.js) in an event log.
+// Pause events and run_end events are ignored, so this composes with
+// summarizePauses over the same file.
+export function summarizeStallDecisions(events) {
+  const list = Array.isArray(events) ? events : [];
+  const counts = { stallAliveContinued: 0, stallDead: 0, stallContinuedWaitExhausted: 0 };
+  const deadReasons = {};
+  for (const event of list) {
+    if (event?.type === "stall_alive_continued") {
+      counts.stallAliveContinued += 1;
+    } else if (event?.type === "stall_dead") {
+      counts.stallDead += 1;
+      if (typeof event.deadReason === "string" && event.deadReason) {
+        deadReasons[event.deadReason] = (deadReasons[event.deadReason] ?? 0) + 1;
+      }
+    } else if (event?.type === "stall_continued_wait_exhausted") {
+      counts.stallContinuedWaitExhausted += 1;
+    }
+  }
+  return {
+    ...counts,
+    deadReasons,
+    total: counts.stallAliveContinued + counts.stallDead + counts.stallContinuedWaitExhausted,
+  };
+}
+
+export function formatStallDecisions(summary) {
+  if (!summary.total) return "stall decisions: none recorded";
+  const parts = [
+    `alive-continued: ${summary.stallAliveContinued}`,
+    `dead: ${summary.stallDead}`,
+    `continued-wait exhausted: ${summary.stallContinuedWaitExhausted}`,
+  ];
+  const reasonEntries = Object.entries(summary.deadReasons ?? {});
+  const reasons = reasonEntries.length
+    ? ` (dead reasons: ${reasonEntries.map(([reason, count]) => `${reason} x${count}`).join(", ")})`
+    : "";
+  return `stall decisions: ${summary.total} (${parts.join(", ")})${reasons}`;
 }
 
 export async function appendPauseEvents(filePath, events) {
