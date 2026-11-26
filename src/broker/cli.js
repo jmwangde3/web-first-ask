@@ -23,6 +23,30 @@ import { loadConfig } from "../config.js";
 
 const VALUE_FLAGS = new Set(["mode", "state", "timeout", "provider", "prompt", "prompt-file", "request-id"]);
 
+// Side finding (2026-11-26 branch acceptance): `wfa broker status --json
+// | head -4` crashed with EPIPE because stdout.write to a closed pipe has
+// no error handler. A stream guarded once never gets a second listener.
+const pipeGuardedStreams = new WeakSet();
+
+// Install a closed-pipe guard on the CLI output streams. A consumer that
+// closes early (e.g. `| head`) is not a failure: exit 0 instead of
+// crashing with an uncaught EPIPE. Any other stream error keeps the old
+// behaviour (it surfaces as an uncaught exception). `exit` is injectable
+// so tests can observe the decision without killing the test process.
+export function installPipeGuard({ stdout = process.stdout, stderr = process.stderr, exit = (code) => process.exit(code) } = {}) {
+  for (const stream of [stdout, stderr]) {
+    if (!stream || typeof stream.on !== "function" || pipeGuardedStreams.has(stream)) continue;
+    pipeGuardedStreams.add(stream);
+    stream.on("error", (err) => {
+      if (err?.code === "EPIPE") {
+        exit(0);
+        return;
+      }
+      throw err;
+    });
+  }
+}
+
 function parseArgs(argv) {
   const positional = [];
   const options = {};
@@ -717,6 +741,10 @@ async function handleClearOrphan(argv, deps) {
 export async function runBrokerCommand(argv = [], deps = {}) {
   const stdout = deps.stdout || process.stdout;
   const stderr = deps.stderr || process.stderr;
+
+  // EPIPE guard (see installPipeGuard): piping to `head` must exit
+  // cleanly instead of crashing the command.
+  installPipeGuard({ stdout, stderr, ...(deps.pipeGuardExit ? { exit: deps.pipeGuardExit } : {}) });
 
   if (argv.includes("--help") || argv.includes("-h") || argv[0] === "help") {
     printBrokerHelp(stdout);

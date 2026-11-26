@@ -465,6 +465,7 @@ test("runCdpCommand status: reports running when broker.json exists, returns cod
     stdout,
     stderr,
     readBrokerRecord: async () => record,
+    isInstanceAlive: async () => true,
   });
 
   assert.equal(res.code, 0);
@@ -478,11 +479,59 @@ test("runCdpCommand status: reports running when broker.json exists, returns cod
     stdout,
     stderr,
     readBrokerRecord: async () => record,
+    isInstanceAlive: async () => true,
   });
   assert.equal(resJson.code, 0);
   const parsed = JSON.parse(stdout.output);
   assert.equal(parsed.instanceId, "inst-1234");
   assert.equal(parsed.pid, 7777);
+});
+
+test("runCdpCommand status: a stale broker.json record (dead pid/port) is reported as not running, not as live", async () => {
+  const stdout = createMockStream();
+  const stderr = createMockStream();
+
+  const staleRecord = {
+    instanceId: "inst-dead",
+    pid: 33744,
+    port: 44954,
+    mode: "background",
+    startedAt: "2026-11-26T00:00:00.000Z",
+  };
+
+  const res = await runCdpCommand(["status"], {
+    stdout,
+    stderr,
+    readBrokerRecord: async () => staleRecord,
+    isInstanceAlive: async () => false,
+  });
+  assert.equal(res.code, 0);
+  assert.equal(stdout.output.trim(), "broker: not running");
+  assert.ok(!stdout.output.includes("33744"), "dead pid must not be printed as live");
+
+  stdout.clear();
+  const resJson = await runCdpCommand(["status", "--json"], {
+    stdout,
+    stderr,
+    readBrokerRecord: async () => staleRecord,
+    isInstanceAlive: async () => false,
+  });
+  assert.equal(resJson.code, 0);
+  const parsed = JSON.parse(stdout.output);
+  assert.equal(parsed.running, false);
+  assert.equal(parsed.alive, false);
+  assert.equal(parsed.pid, undefined);
+
+  // A failing liveness probe is treated the same as dead, never as live.
+  stdout.clear();
+  const resThrow = await runCdpCommand(["status", "--json"], {
+    stdout,
+    stderr,
+    readBrokerRecord: async () => staleRecord,
+    isInstanceAlive: async () => { throw new Error("probe failed"); },
+  });
+  assert.equal(resThrow.code, 0);
+  assert.equal(JSON.parse(stdout.output).running, false);
 });
 
 test("runCdpCommand status: reports 'broker: not running' when broker.json is missing, returns code: 0", async () => {

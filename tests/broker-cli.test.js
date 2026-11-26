@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { runBrokerCommand } from "../src/broker/cli.js";
+import { runBrokerCommand, installPipeGuard } from "../src/broker/cli.js";
 
 function createMockStream() {
   let content = "";
@@ -560,4 +561,55 @@ test("21. ask forwards explicit --request-id and wait recovers after broker port
   });
   assert.equal(resWait.code, 0);
   assert.equal(stdout.output, "recovered text\n");
+});
+
+function createEventedMockStream() {
+  const emitter = new EventEmitter();
+  let content = "";
+  emitter.write = (chunk) => {
+    content += chunk;
+    return true;
+  };
+  Object.defineProperty(emitter, "output", { get: () => content });
+  emitter.clear = () => {
+    content = "";
+  };
+  return emitter;
+}
+
+test("EPIPE: installPipeGuard exits 0 on a closed pipe instead of crashing, rethrows other stream errors, guards a stream once", async () => {
+  const stdout = createEventedMockStream();
+  let exitCode = null;
+  installPipeGuard({ stdout, stderr: createMockStream(), exit: (code) => { exitCode = code; } });
+
+  stdout.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+  assert.equal(exitCode, 0);
+
+  assert.throws(
+    () => stdout.emit("error", Object.assign(new Error("write ECONNRESET"), { code: "ECONNRESET" })),
+    /ECONNRESET/,
+  );
+
+  assert.equal(stdout.listenerCount("error"), 1, "installing the guard twice must not stack listeners");
+  installPipeGuard({ stdout, stderr: createMockStream(), exit: () => {} });
+  assert.equal(stdout.listenerCount("error"), 1);
+});
+
+test("EPIPE: runBrokerCommand wires the guard, so `broker status --json | head` exits 0 on a closed pipe", async () => {
+  const stdout = createEventedMockStream();
+  const stderr = createMockStream();
+  let exitCode = null;
+
+  const res = await runBrokerCommand(["status"], {
+    stdout,
+    stderr,
+    discoverBroker: async () => null,
+    pipeGuardExit: (code) => { exitCode = code; },
+  });
+  assert.equal(res.code, 0);
+  assert.equal(stdout.output, "broker: not running\n");
+
+  // Simulate the downstream `head` closing the pipe after the first lines.
+  stdout.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+  assert.equal(exitCode, 0, "closed pipe must exit 0, not throw");
 });

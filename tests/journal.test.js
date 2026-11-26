@@ -78,6 +78,55 @@ test("2. recordCommit then findCommitted matches; different provider or differen
   }
 });
 
+test("2b. findCommitted is scoped per conversationId: different conversation -> null, same -> match, unknown -> still blocks", async () => {
+  const tmp = await tempHome();
+  try {
+    const prompt = "same question in two conversations";
+    const sha = hashPrompt(prompt);
+
+    await recordCommit(tmp, {
+      turnId: "turn-conv-a",
+      provider: "chatgpt",
+      promptSha256: sha,
+      conversationId: "conv-A",
+    });
+
+    // Same prompt + provider in a DIFFERENT conversation must not be blocked.
+    const diffConv = await findCommitted(tmp, { provider: "chatgpt", promptSha256: sha, conversationId: "conv-B" });
+    assert.equal(diffConv, null);
+
+    // Same prompt + provider + conversation must still be blocked.
+    const sameConv = await findCommitted(tmp, { provider: "chatgpt", promptSha256: sha, conversationId: "conv-A" });
+    assert.ok(sameConv);
+    assert.equal(sameConv.turnId, "turn-conv-a");
+
+    // Unknown identity on either side stays conservative: it might be the
+    // same conversation, so the orphan still blocks (never auto-resend an
+    // uncertain prompt).
+    const unknownQuery = await findCommitted(tmp, { provider: "chatgpt", promptSha256: sha });
+    assert.ok(unknownQuery);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("2c. findCommitted with an orphan recorded without conversationId still blocks any query (legacy records)", async () => {
+  const tmp = await tempHome();
+  try {
+    const sha = hashPrompt("legacy prompt without key");
+    await recordCommit(tmp, {
+      turnId: "turn-legacy",
+      provider: "chatgpt",
+      promptSha256: sha,
+    });
+    const queried = await findCommitted(tmp, { provider: "chatgpt", promptSha256: sha, conversationId: "conv-9" });
+    assert.ok(queried, "stored conversationId is unknown, so the orphan must still block");
+    assert.equal(queried.turnId, "turn-legacy");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("3. Two orphans for the same prompt -> older submittedAt is returned", async () => {
   const tmp = await tempHome();
   try {
@@ -185,6 +234,53 @@ test("5. POST /turns rejects unresolved journal match with 409 previously_submit
     assert.ok(body1.id);
     assert.ok(body2.id);
     assert.notEqual(body1.id, body2.id);
+  } finally {
+    if (broker) await broker.close();
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("5b. POST /turns 409 orphan gate is scoped per conversationId", async () => {
+  const tmp = await tempHome();
+  let broker;
+  try {
+    const riskyPrompt = "same prompt in two conversations";
+    await recordCommit(tmp, {
+      turnId: "turn-orphan-conv-a",
+      provider: "chatgpt",
+      promptSha256: hashPrompt(riskyPrompt),
+      conversationId: "conv-A",
+      submittedAt: "2026-11-23T09:00:00.000Z",
+    });
+
+    const mockRunner = {
+      chrome: { pid: process.pid, port: 9222 },
+      run: async () => ({ status: "completed", text: "ok" }),
+    };
+
+    broker = await startBroker({
+      home: tmp,
+      runner: mockRunner,
+    });
+
+    const post = (body) => fetch(`http://127.0.0.1:${broker.port}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-wfa-token": broker.token },
+      body: JSON.stringify(body),
+    });
+
+    // Different conversation: same prompt must NOT be blocked.
+    const otherConv = await post({ provider: "chatgpt", prompt: riskyPrompt, conversationId: "conv-B" });
+    assert.equal(otherConv.status, 202);
+
+    // Same conversation: must still be blocked, and the runner never runs.
+    const sameConv = await post({ provider: "chatgpt", prompt: riskyPrompt, conversationId: "conv-A" });
+    assert.equal(sameConv.status, 409);
+    assert.equal((await sameConv.json()).error, "previously_submitted_uncertain");
+
+    // No conversation key: identity unknown, stays conservative and blocks.
+    const noConv = await post({ provider: "chatgpt", prompt: riskyPrompt });
+    assert.equal(noConv.status, 409);
   } finally {
     if (broker) await broker.close();
     await rm(tmp, { recursive: true, force: true });

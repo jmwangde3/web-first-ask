@@ -104,11 +104,25 @@ export async function listOrphans(home) {
   return orphans;
 }
 
-export async function findCommitted(home, { provider, promptSha256 } = {}) {
+// Same-conversation test for the orphan gate. An orphan only blocks a
+// retry when the conversation identity is the same — or unknown on either
+// side. Unknown stays conservative: a turn submitted without a
+// conversation key, or an orphan recorded before keys were stored, must
+// still block, because it might be the same conversation and the prompt
+// must never be auto-resent while its submission is uncertain.
+function sameConversation(stored, queried) {
+  const s = typeof stored === "string" && stored.trim() ? stored : null;
+  const q = typeof queried === "string" && queried.trim() ? queried : null;
+  if (s === null || q === null) return true;
+  return s === q;
+}
+
+export async function findCommitted(home, { provider, promptSha256, conversationId } = {}) {
   if (!provider || !promptSha256) return null;
   const orphans = await listOrphans(home);
   for (const orphan of orphans) {
-    if (orphan.provider === provider && orphan.promptSha256 === promptSha256) {
+    if (orphan.provider === provider && orphan.promptSha256 === promptSha256 &&
+        sameConversation(orphan.conversationId, conversationId)) {
       return orphan;
     }
   }

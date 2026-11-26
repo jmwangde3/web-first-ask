@@ -358,6 +358,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
       const unresolved = await journal.findCommitted(home, {
         provider: turn.provider,
         promptSha256,
+        conversationId: turn.conversationId,
       }).catch(() => null);
       if (unresolved) {
         send(res, 409, {
