@@ -9,6 +9,79 @@ zero runtime dependencies.
 Everything below was reproduced on a real Chrome with logged-in ChatGPT and Gemini accounts unless marked
 otherwise. Items marked *(unverified)* were reported but not re-confirmed with a controlled experiment.
 
+## Branch verification — `neon` (Batch 1 + Batch 2 patch bundle)
+
+This file is the `neon` branch's copy: only results produced on this branch are recorded here.
+The shared defect catalogue lives on `main`; the `muse` fix round records its own results in its own copy.
+
+### Live verification of the Batch 1 + Batch 2 patch bundle (branch `neon`)
+
+The patch bundle (`01-batch1-d4-d3-d1-d2.patch` + `02-batch2-d8-d7-f1.patch`, baseline `4001f14`) was applied
+on a fresh local branch `neon` as two commits — `6457aa3` (D4/D3/D1/D2) and `8fdb215` (D8/D7/F1).
+`npm run check` green, `npm test` = **514/514** (11 new tests included).
+
+| Item | Live result | Notes |
+|---|---|---|
+| D1 | **pass** | after `--no-wait`, the broker pid was unchanged at t+35 s and `read --task-id` returned `completed` ("M" / "K") in two independent runs. The baseline returned `BROKER_UNREACHABLE(committed, safeToResend=false)`. |
+| D3 | **fail (new root cause)** | `--file` is dropped at the broker boundary — see "Broker drops `files`" below. The chip verification added by this patch is fine; it is simply never reached. |
+| D4 | **pass** | 49.8 s, 17,688 chars, complete head-to-tail; DOM `innerText` 17,676 chars (0.07% delta); no 420 s `stalled`. Baseline returned a 25-char title line and stalled. |
+| F1 | **fail (arg parsing)** | `--gemini-mode task` becomes boolean `true` because `gemini-mode` is missing from `VALUE_FLAGS`; the CLI throws `INVALID_ARGUMENT` before any broker call. |
+| D2 / D7 / D8 | not run on `neon` | unit-tested only in this round. |
+
+### Broker drops `files` on `POST /turns` (P1, D3's real root cause)
+
+`wfa cdp ask --file <path>` never attaches anything when the turn goes through the broker:
+
+| Location | Behaviour |
+|---|---|
+| `src/engines/cdp-cli.js:543-545` | expands attachments correctly (`expandAttachmentInputs` returns the 421,605 B zip) |
+| `src/engines/cdp-cli.js:628` | puts them in the HTTP body: `{ files: attachedFiles }` |
+| `src/broker/server.js:303-315` | `createTurn({...})` copies an allowlist of fields — **no `files`** |
+| `src/broker/turns.js:24-61` | `createTurn` neither accepts nor returns `files` |
+| `src/broker/runner.js:209` | reads `turn?.files` — always `undefined` |
+
+Consequence: `cdp-engine.js:551` (`files.length > 0`) is always false, `attachFiles` is never called, and the
+prompt is submitted bare. Three live runs (background, background+`--no-wait`, visible) all ended with Gemini
+answering "there is no attached zip" and **no** `ATTACH_UPLOAD_FAILED`.
+
+This also corrects the earlier G4/D3 attribution: an isolated probe that calls the same adapter code
+(`buildUploadJs` + `DOM.setFileInputFiles` + `buildAttachmentVerifyJs`) on the same page shows the real chip at
+4.9 s (`uploader-file-preview.file-preview-chip`, 112x112, text `d3-probe.zip`) and `present=true`. The adapter is
+healthy; the transport is not.
+
+Fix: move `files` through `server.js` → `turns.js` (with absolute-path and size/count validation) and add a broker
+test asserting `runCdpTurn` receives the array.
+
+### `--gemini-mode` missing from `VALUE_FLAGS` (P1, F1's root cause)
+
+`src/engines/cdp-cli.js` defines its own `VALUE_FLAGS` set (line 24) and `gemini-mode` is absent from it, so
+`--gemini-mode task` is parsed as a boolean flag and `task` becomes a positional argument. The validation added in
+this patch then rejects `true`:
+
+```text
+wfa: INVALID_ARGUMENT: Invalid --gemini-mode: true. Must be chat or task.
+```
+
+The page itself is ready — the probe read `[{"txt":"Chat","pressed":"true"},{"txt":"Task","pressed":"false"}]` and
+placeholder `Ask Gemini`, so once the flag is parsed the mode switch can be verified.
+
+Fix: add `"gemini-mode"` to `VALUE_FLAGS`; add a parser-level test (current tests cover `createTurn`/engine but not
+argument parsing); audit other documented flags (`--download-dir`, `--providers`) for the same omission.
+
+### Google bot-check interstitial during this round (03:39–12:5x, resolved)
+
+From 2026-11-26 03:39 (UTC+8) every Gemini tab in the wfa Chrome profile was redirected to
+`https://www.google.com/sorry/index?continue=https://gemini.google.com/app&q=…` — 9 of 9 existing tabs and a
+freshly opened tab alike. The `/sorry` page has no editor, so `waitForEditor` (bounded by `hardTimeoutMs`) waits
+until the CLI timeout; this explains the two 240 s / 122 s timeouts with `sendCommittedAt: null` recorded earlier
+in the day. The interstitial cleared by 12:49 and all four items above were then re-run successfully.
+
+Timeline: on 11-25 18:00–22:00 Gemini produced text normally but stalled mid-answer; after 22:00 the CLI began
+timing out; on 11-26 03:39 the hard interstitial appeared. **The D5 result above (5/5 background runs stalled
+after 38–52 s) sits inside that same window and may be compounded by provider throttling. Re-measure at least one
+visible + two background runs before changing `stallTimeoutMs`.**
+
+
 ## How to validate a fix
 
 ```bash
