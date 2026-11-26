@@ -155,7 +155,7 @@ test("F1 gemini mode toggle: the production control poll is bounded to 3–5 s w
   assert.equal(geminiAdapter.taskModeControlTimeoutMs, 5000);
   assert.ok(geminiAdapter.taskModeControlTimeoutMs >= 3000 && geminiAdapter.taskModeControlTimeoutMs <= 5000);
   assert.equal(geminiAdapter.taskModeControlPollIntervalMs, 100);
-  assert.equal(geminiAdapter.taskModePlaceholderTimeoutMs, 2000);
+  assert.equal(geminiAdapter.taskModePlaceholderTimeoutMs, 5000);
 });
 
 test("F1 gemini mode toggle: already on Task -> no click, step already", async () => {
@@ -217,6 +217,92 @@ test("F1 gemini mode toggle: Task pressed but the placeholder never becomes the 
   assert.equal(res.reason, "task_mode_placeholder_not_confirmed");
   assert.equal(res.mode, "unknown");
   assert.equal(res.placeholder, "Ask Gemini");
+  assert.equal(button.clicked, true);
+});
+
+// F1 placeholder settle (2026-11-26 live verification, REPORT-8ead8b4b.md
+// §4): the click flips aria-pressed at ~2.09 s, but the composer shows the
+// intermediate "Type @ for connectors, skills and more" until ~5 s and only
+// then settles to "Describe a task". The old 2 s bound failed 3/3. These
+// tests drive the placeholder through that timeline on a fake DOM whose
+// data-placeholder changes with wall-clock time.
+function makeSettlingPlaceholderDocument({ segmentButton, settleAtMs = null, stuckText = "Type @ for connectors, skills and more" }) {
+  const start = Date.now();
+  const editorEl = {
+    innerText: "",
+    textContent: "",
+    getAttribute: (name) => {
+      if (name === "data-placeholder" || name === "placeholder") {
+        if (settleAtMs !== null && Date.now() >= start + settleAtMs) return "Describe a task";
+        return stuckText;
+      }
+      return null;
+    },
+    getBoundingClientRect: () => ({ width: 12, height: 12 }),
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    closest: () => null,
+    click() {},
+  };
+  return {
+    title: "Gemini",
+    querySelector: (selector) => {
+      if (selector.includes('gem-segmented-button[data-value="40"]')) return segmentButton;
+      if (selector === '[contenteditable="true"]') return editorEl;
+      return null;
+    },
+    querySelectorAll: () => [],
+  };
+}
+
+test("F1 gemini mode toggle: placeholder settling late (~3.5 s, past the old 2 s bound) succeeds on the production bound", async () => {
+  const button = makeTaskButton(false);
+  const startedAt = Date.now();
+  const res = await runPageJs(
+    geminiAdapter.buildTaskModeJs("task"),
+    makeSettlingPlaceholderDocument({ segmentButton: button, settleAtMs: 3500 }),
+  );
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(res.success, true);
+  assert.equal(res.step, "clicked");
+  assert.equal(res.mode, "task");
+  assert.equal(res.placeholderVerified, true);
+  assert.equal(res.placeholder, "Describe a task");
+  // Proves the poll actually waited past the old 2 s bound instead of
+  // succeeding on an early read. (Success alone already proves it
+  // settled before the 5 s deadline — the poll cannot succeed after it.)
+  assert.ok(elapsedMs >= 3000, `expected >= 3000 ms wait, got ${elapsedMs} ms`);
+});
+
+test("F1 gemini mode toggle: placeholder never settling fails closed on the production bound", async () => {
+  const button = makeTaskButton(false);
+  const startedAt = Date.now();
+  const res = await runPageJs(
+    geminiAdapter.buildTaskModeJs("task"),
+    makeSettlingPlaceholderDocument({ segmentButton: button, settleAtMs: null, stuckText: "Ask Gemini" }),
+  );
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(res.success, false);
+  assert.equal(res.reason, "task_mode_placeholder_not_confirmed");
+  assert.equal(res.mode, "unknown");
+  assert.equal(res.placeholder, "Ask Gemini");
+  assert.equal(button.clicked, true);
+  // The full production bound was spent waiting, not a short test override.
+  assert.ok(elapsedMs >= 4500, `expected ~5000 ms wait, got ${elapsedMs} ms`);
+});
+
+test("F1 gemini mode toggle: intermediate connector text alone for the whole bound is never accepted as Task mode", async () => {
+  const button = makeTaskButton(false);
+  const res = await runPageJs(
+    geminiAdapter.buildTaskModeJs("task", { placeholderTimeoutMs: 500 }),
+    makeSettlingPlaceholderDocument({ segmentButton: button, settleAtMs: null, stuckText: "Type @ for connectors, skills and more" }),
+  );
+  assert.equal(res.success, false);
+  assert.equal(res.reason, "task_mode_placeholder_not_confirmed");
+  assert.equal(res.mode, "unknown");
+  // The failure reports the intermediate text it observed — proof the
+  // text was seen the whole time and still rejected, not missed.
+  assert.equal(res.placeholder, "Type @ for connectors, skills and more");
   assert.equal(button.clicked, true);
 });
 
