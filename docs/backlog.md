@@ -308,6 +308,27 @@ cleanup: 109 Gemini + 113 ChatGPT wfa conversations.
 
 ---
 
+### D12 — `wfa cdp login` off-origin redirect interrupts manual login (P2, 2026-11-26)
+
+**Symptom.** `wfa cdp login` opens the provider URL and polls. If the tab stays off the provider origin (for
+example Google's sign-in or 2FA pages) for 45 seconds, the command navigates it back to the provider URL
+(`Page.navigate`), up to two times. A human login can easily take longer than 45 seconds (password manager, 2FA,
+phone approval), so the redirect destroys an in-progress login.
+
+**Expected.** Manual/interactive login must never be interrupted. The redirect should be opt-in (for example
+`--recover-off-origin`), or only fire after a much longer idle window (5–10 minutes) with no page changes, and it
+must not fire while a sign-in / 2FA form is present. The default should be to leave the tab alone.
+
+**Code fact (2026-11-26).** `src/engines/cdp-cli.js` `handleLogin`: `offOriginThresholdMs` defaults to 45 s and
+calls `Page.navigate` back to the provider URL, max 2 attempts. The behavior is codified in
+`tests/cdp-cli.test.js` ("off-origin ticks ..."), so a fix must update that test. There is no CLI flag to disable it.
+
+**Evidence.** Manual login attempt on 2026-11-26: the command was interrupted while the user was signing in; the
+45 s redirect path is the designed behavior. A separate issue (the command closing the Chrome it launched on exit)
+is not covered by this item.
+
+---
+
 ## Planned work
 
 ### F1 — Gemini "Task" mode over CDP (P1)
