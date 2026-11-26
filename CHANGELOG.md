@@ -41,6 +41,21 @@ awaiting Windows re-verification):
   `alive: false`. F5: code review only — no conformance bugs found; all
   Claude selectors still unverified.
 
+Fix round 5 (broker close-before-persist race, 2026-11-26 — user-approved
+follow-up to the round-4 flake investigation; code-done, awaiting Windows
+re-run of the flake file):
+
+- `close()` now waits for in-flight result persistence: `runTurn`'s `finally`
+  (`src/broker/server.js`) keeps the task in `active` until
+  `persistTurnSnapshot` / `persistTurnResult` have landed, instead of deleting
+  it first. The scheduler slot is still released early, so `/status`
+  `runningTotal` and the idle-timeout path (same `close()`) are unchanged.
+  Regression test with an injected 300 ms slow store asserts a restarted
+  broker restores the turn as `completed`, not the POST-time `queued`
+  snapshot; it fails on pre-fix code and passes 6/6, 5/5 isolated runs.
+  `npm test`: 743 tests, 741 pass, 1 fail (pre-existing Linux-only
+  `cdp-stage.test.js:107`), 1 skipped.
+
 Fix round 4 (live re-verification REPORT-5b3e91ee.md, 2026-11-26 — all code-done,
 awaiting Windows re-verification):
 

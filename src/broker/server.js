@@ -282,13 +282,18 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         finish(turn.id, "failed", { reason: String(error?.code ?? "runner_error") });
         log("runner_failed", { turnId: turn.id, code: String(error?.code ?? "runner_error") });
       } finally {
-        // Release the scheduler slot as soon as the runner settles, before the
-        // async result persistence, so /status never reports a stale runningTotal.
+        // Release the scheduler slot as soon as the runner settles, so
+        // /status never reports a stale runningTotal — but keep this task in
+        // `active` (and its controller registered) until the persistence
+        // awaits below have landed. close() only waits for tasks still in
+        // `active`; deleting here first let close() resolve while persistence
+        // was still in flight, so a restarted broker restored the POST-time
+        // snapshot (queued) and the completed result was silently lost.
         release(scheduler, turn);
-        controllers.delete(turn.id);
-        active.delete(turn.id);
         await persistTurnSnapshot(turns.get(turn.id));
         await persistTurnResult(turns.get(turn.id));
+        controllers.delete(turn.id);
+        active.delete(turn.id);
         if (!closing) drain();
         trackIdle();
       }
