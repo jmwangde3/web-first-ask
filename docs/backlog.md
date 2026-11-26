@@ -1,107 +1,14 @@
 # Backlog — open defects and planned work
 
+> **Verification results live on their own branches.** `main` stays the shared defect catalogue.
+> Live results are recorded on the branch that produced them — `muse` (D1–D9 / F1–F9 fix round)
+> and `neon` (Batch 1 + Batch 2 patch bundle) — so the three branches never overwrite each other.
+
 This is the **wfa-side** list: defects in the native CDP engine (`wfa cdp`), the broker (`wfa broker`) and the
 provider adapters. Upstream ask-bridge defects (U1–U19) live in [`known-issues.md`](known-issues.md).
 
 State of `main` when this list was written: `f3d104e`, `npm test` = **503 tests, 503 pass**, Node.js >= 22.15,
 zero runtime dependencies.
-
-Implementation status (2026-11-26, branch `backlog/d1-f9`, HEAD `4001f14`, package 1.2.0):
-`npm test` = **657 tests, 655 pass, 1 fail (pre-existing Linux-only `cdp-stage.test.js:107`), 1 skipped**;
-`npm run check` green. No live-browser validation was run on this VM (no logged-in
-Chrome here) — every item that needs a real browser is marked **awaiting live verification**
-below, with the manual command to run on Windows. Per-item status lines were added under
-each heading; nothing else in this file was rewritten.
-
-Live verification (2026-11-26, Windows 11 / Node 26.13.1 / Chrome 158, local branch `muse` built from
-`backlog/d1-f9` @ `5146c1b`): `npm test` = **657/657**, `npm run check` green. Results:
-
-| Item | Live result | Notes |
-|---|---|---|
-| D1 | **pass** | broker survived a 35 s gate and an ~8 min generation; `read --task-id` completed both times (21,986 chars). |
-| D2 | **fail** | first read empty on both the restored-tab path and the `openTab` path; see the D2 status line. |
-| D3 | **fail** | a 421 KB zip was not attached, the prompt was still submitted, and the CLI timed out instead of failing closed. |
-| D4 | **pass** | Gemini 11,909 chars / ChatGPT 25,391 chars; no missing sections, code blocks match the DOM. |
-| D5 | **reproduced** | 5/5 background runs stalled after 38–52 s (pending 482–658, ~20 chars), still open at the 300 s cutoff; a visible run also timed out at 423 s. May be compounded by provider throttling. |
-| D6 | not reproduced | repeated continuations all submitted normally. |
-| D7 | not triggered | no Cloudflare interstitial during the run. |
-| D8 | **pass** (focus) | a read of a background tab took 2.8 s and did not steal focus; launching Chrome itself may. |
-| D9 | **pass** | same conversation and `userTurns` 1→2 for both Gemini and ChatGPT. |
-| F1 | **fail** | `POST /turns` drops `geminiMode`, so `--gemini-mode task` silently runs in Chat mode. |
-| F2 | **pass** | parallel fan-out produced per-provider files; retry refused a completed provider. |
-| F3 | **pass** | extraction + manifest/hash; truncated answer refused with zero writes. |
-| F4 | **fail** | ChatGPT produced a downloadable file but nothing was captured (`downloads: null`); same `POST /turns` allowlist also drops `downloadDir`. |
-| F5 | not run | Claude was not logged in (`login` timed out after 60 s). |
-| F6 | **pass** | pacing measured: casual 1.1–2.0 s, batch 4.8–5.2 s, disabled 0 ms. |
-| F7/F8 | partial | as described in their status lines (tracking/classification only). |
-| F9 | **pass** | `skills/web-first/SKILL.md` is 32 lines / 1,995 B. |
-
-### Live verification of the Batch 1 + Batch 2 patch bundle (branch `neon`)
-
-The patch bundle (`01-batch1-d4-d3-d1-d2.patch` + `02-batch2-d8-d7-f1.patch`, baseline `4001f14`) was applied
-on a fresh local branch `neon` as two commits — `6457aa3` (D4/D3/D1/D2) and `8fdb215` (D8/D7/F1).
-`npm run check` green, `npm test` = **514/514** (11 new tests included).
-
-| Item | Live result | Notes |
-|---|---|---|
-| D1 | **pass** | after `--no-wait`, the broker pid was unchanged at t+35 s and `read --task-id` returned `completed` ("M" / "K") in two independent runs. The baseline returned `BROKER_UNREACHABLE(committed, safeToResend=false)`. |
-| D3 | **fail (new root cause)** | `--file` is dropped at the broker boundary — see "Broker drops `files`" below. The chip verification added by this patch is fine; it is simply never reached. |
-| D4 | **pass** | 49.8 s, 17,688 chars, complete head-to-tail; DOM `innerText` 17,676 chars (0.07% delta); no 420 s `stalled`. Baseline returned a 25-char title line and stalled. |
-| F1 | **fail (arg parsing)** | `--gemini-mode task` becomes boolean `true` because `gemini-mode` is missing from `VALUE_FLAGS`; the CLI throws `INVALID_ARGUMENT` before any broker call. |
-| D2 / D7 / D8 | not run on `neon` | unit-tested only in this round. |
-
-### Broker drops `files` on `POST /turns` (P1, D3's real root cause)
-
-`wfa cdp ask --file <path>` never attaches anything when the turn goes through the broker:
-
-| Location | Behaviour |
-|---|---|
-| `src/engines/cdp-cli.js:543-545` | expands attachments correctly (`expandAttachmentInputs` returns the 421,605 B zip) |
-| `src/engines/cdp-cli.js:628` | puts them in the HTTP body: `{ files: attachedFiles }` |
-| `src/broker/server.js:303-315` | `createTurn({...})` copies an allowlist of fields — **no `files`** |
-| `src/broker/turns.js:24-61` | `createTurn` neither accepts nor returns `files` |
-| `src/broker/runner.js:209` | reads `turn?.files` — always `undefined` |
-
-Consequence: `cdp-engine.js:551` (`files.length > 0`) is always false, `attachFiles` is never called, and the
-prompt is submitted bare. Three live runs (background, background+`--no-wait`, visible) all ended with Gemini
-answering "there is no attached zip" and **no** `ATTACH_UPLOAD_FAILED`.
-
-This also corrects the earlier G4/D3 attribution: an isolated probe that calls the same adapter code
-(`buildUploadJs` + `DOM.setFileInputFiles` + `buildAttachmentVerifyJs`) on the same page shows the real chip at
-4.9 s (`uploader-file-preview.file-preview-chip`, 112x112, text `d3-probe.zip`) and `present=true`. The adapter is
-healthy; the transport is not.
-
-Fix: move `files` through `server.js` → `turns.js` (with absolute-path and size/count validation) and add a broker
-test asserting `runCdpTurn` receives the array.
-
-### `--gemini-mode` missing from `VALUE_FLAGS` (P1, F1's root cause)
-
-`src/engines/cdp-cli.js` defines its own `VALUE_FLAGS` set (line 24) and `gemini-mode` is absent from it, so
-`--gemini-mode task` is parsed as a boolean flag and `task` becomes a positional argument. The validation added in
-this patch then rejects `true`:
-
-```text
-wfa: INVALID_ARGUMENT: Invalid --gemini-mode: true. Must be chat or task.
-```
-
-The page itself is ready — the probe read `[{"txt":"Chat","pressed":"true"},{"txt":"Task","pressed":"false"}]` and
-placeholder `Ask Gemini`, so once the flag is parsed the mode switch can be verified.
-
-Fix: add `"gemini-mode"` to `VALUE_FLAGS`; add a parser-level test (current tests cover `createTurn`/engine but not
-argument parsing); audit other documented flags (`--download-dir`, `--providers`) for the same omission.
-
-### Google bot-check interstitial during this round (03:39–12:5x, resolved)
-
-From 2026-11-26 03:39 (UTC+8) every Gemini tab in the wfa Chrome profile was redirected to
-`https://www.google.com/sorry/index?continue=https://gemini.google.com/app&q=…` — 9 of 9 existing tabs and a
-freshly opened tab alike. The `/sorry` page has no editor, so `waitForEditor` (bounded by `hardTimeoutMs`) waits
-until the CLI timeout; this explains the two 240 s / 122 s timeouts with `sendCommittedAt: null` recorded earlier
-in the day. The interstitial cleared by 12:49 and all four items above were then re-run successfully.
-
-Timeline: on 11-25 18:00–22:00 Gemini produced text normally but stalled mid-answer; after 22:00 the CLI began
-timing out; on 11-26 03:39 the hard interstitial appeared. **The D5 result above (5/5 background runs stalled
-after 38–52 s) sits inside that same window and may be compounded by provider throttling. Re-measure at least one
-visible + two background runs before changing `stallTimeoutMs`.**
 
 Everything below was reproduced on a real Chrome with logged-in ChatGPT and Gemini accounts unless marked
 otherwise. Items marked *(unverified)* were reported but not re-confirmed with a controlled experiment.
@@ -127,13 +34,6 @@ House rules (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)):
 ## Defects
 
 ### D1 — a `--no-wait` turn loses its broker and can never finish (P1)
-
-**Status (2026-11-26): done in code, awaiting live verification.** Idle timer now consults
-the turn store (`src/broker/server.js` `hasNonTerminalTurn` + 5 s idle grace); a
-`needs_human`/restored non-terminal turn pins the broker until terminal or explicit
-`wfa broker stop`. Caveat: `wfa broker start` hardcodes `mode: "tray"`, which never idles —
-the idle timer only fires in `off` mode, so the 10-minute live run must confirm the
-production path.
 
 **Symptom.** `wfa cdp ask --no-wait` returns `state: "running"` and a broker is started, but the broker exits
 after its idle timeout while the turn is still running. Nothing advances the turn afterwards.
@@ -165,19 +65,6 @@ readable and reach `completed`. Real-browser run survives a 10-minute generation
 
 ### D2 — first read after reopening a tab returns `unconfirmed` (P1)
 
-**Status (2026-11-26): done in code, awaiting live verification.** After `openTab` the
-read polls until message nodes appear (bounded 10 s, injectable clock, no fixed sleep);
-a genuinely empty conversation still returns `unconfirmed` (`src/engines/cdp-read.js`).
-
-**Live verification (2026-11-26, Windows / Chrome 158): FAILS.** On the live branch `muse`
-(`backlog/d1-f9` @ `5146c1b`) the first read still returns `unconfirmed` with empty text on both paths:
-(a) tab restored by `--restore-last-session` — 1.07 s, `userTurns: 0`; a second read 2.2 s later returns
-`completed` with 976 chars; (b) no tab, i.e. the repro below — 3.61 s, `userTurns: 2`,
-`answerActionsVisible: true`, but `text: ""`; a second read 2.19 s later returns `completed` with 976 chars.
-Root cause: the settle exists only in the `openTab` branch (`cdp-read.js:538` vs `:550`), and its completion
-condition accepts *any* message node (`:594-598`) — ChatGPT renders user turns and the action bar before the
-answer body. Fix: settle on `answerText.trim().length > 0` (still bounded), and apply it to `attachTab` too.
-
 **Symptom.** Reading a conversation that has no open tab reopens it and samples the page before the message
 list has rendered, so the read reports an empty conversation.
 
@@ -205,18 +92,6 @@ still returns `unconfirmed`; no fixed `sleep` left in the path.
 
 ### D3 — attachment upload is reported as success while nothing was attached (P1)
 
-**Status (2026-11-26): done in code, awaiting live verification.** Root cause was worse
-than stated: Gemini `buildAttachmentVerifyJs` referenced free variables (`sendReady`,
-`bases`) so it always threw `ReferenceError` in-page. Fixed (`src/browser/adapters/gemini.js`):
-filename-verified chips, selector no longer matches the attach button, fail-closed with
-`ATTACH_UPLOAD_FAILED` and no submission. ChatGPT already verified by name (locked by test).
-
-**Live verification (2026-11-26, Windows): FAILS.** A 421,605-byte zip was not attached
-(Gemini answered "No attachment or zip file was provided", the conversation DOM had no file name and only a
-zero-height `div.file-preview-container`), yet the prompt **was** submitted (`sendCommittedAt` set) and the CLI
-timed out after 150 s instead of returning `ATTACH_UPLOAD_FAILED`. The verify check apparently saw a transient
-chip with the file name and let the submit through; add a post-submit confirmation for attachment chips.
-
 **Symptom.** `wfa cdp ask --file <archive>` passes the attachment check, the prompt is submitted, but the
 provider receives no file. Gemini answers `REPO_UNREADABLE`; ChatGPT has historically answered
 "No file is attached".
@@ -243,13 +118,6 @@ provider submission; a real upload round-trip is covered by a manual check.
 
 ### D4 — `wfa cdp read` returns only the first line of long answers (P1)
 
-**Status (2026-11-26): done at the read layer, awaiting live verification.** `pending > 0`
-now blocks `completed` (returns `streaming` + `partial: true`); a `completed` candidate
-must be confirmed by a second identical sample (bounded 2 s); every result carries
-`partial: true/false` (`src/engines/cdp-read.js`). Caveat: adapter node-selection itself
-was not touched — if live testing shows the DOM text handed to this layer is already
-truncated, the remaining fix is in the adapter.
-
 **Symptom.** For long provider answers the CLI returns a fragment — typically the first line — while the page
 contains the full text.
 
@@ -273,20 +141,6 @@ behaviour is unchanged.
 
 ### D5 — Gemini long answers pause for five minutes or more in background mode (P1, needs measurement)
 
-**Status (2026-11-26): measurement harness built, decision recorded as PROVISIONAL, awaiting
-live measurement runs.** `src/stall-measurement.js` + `scripts/summarize-pauses.mjs` record
-pause distribution; the tracker is wired into the completion poll loop
-(`src/browser/driver.js` `pauseTracker`, `src/engines/cdp-engine.js`) and is opt-in via
-`WFA_PAUSE_EVENTS_DIR` (or `deps.pauseEventsDir`), writing `<dir>/<requestId>.jsonl` and a
-`pauseSummary` in turn evidence. 420 s is kept **provisionally** — one sample cannot
-establish a distribution; revisit if p90 or any completed pause exceeds 420 s.
-
-**Live verification (2026-11-26, Windows): reproduced.** Five background runs all entered a pause at
-38–52 s (pending 482–658, answer text stuck at 18–25 chars) and were still paused when the 300 s CLI
-timeout fired (`openPauseMs` 249–269 s; `summarize-pauses.mjs`: 5 open/censored pauses). A visible control
-run also timed out at 423 s. Caveat: many long prompts were sent in a row today, so provider throttling cannot
-be ruled out; yesterday the same prompt finished in 27–55 s.
-
 **Measured 2026-11-25.** With the window hidden (`visibility=hidden`):
 
 - `.pending` stayed at 378 for more than five minutes with no text change;
@@ -307,13 +161,6 @@ sufficient.
 
 ### D6 — continuation blocked by a composer stop-state (P2, intermittent)
 
-**Status (2026-11-26): capture wired, gate unchanged, awaiting a real capture.** The
-composer gate was NOT changed (no guessed fix). `src/browser/composer-capture.js` dumps
-the stop control DOM + attributes + stop-state duration; the engine calls it when the
-composer gate rejects with a stop-state reason or `typePrompt` throws `PROMPT_NOT_TYPED`
-(`src/engines/cdp-engine.js`), writing `<home>/composer-captures/<requestId>.jsonl`
-best-effort. No live occurrence was captured here.
-
 **Symptom.** After an answer finishes, the composer can stay in a stop-state for up to ~45 s; a continuation
 sent in that window is rejected with `PROMPT_NOT_TYPED` / `composer_stop_state`.
 
@@ -329,12 +176,6 @@ it stays. Without that, any change is guesswork.
 
 ### D7 — Cloudflare interstitial is not parked immediately (P2)
 
-**Status (2026-11-26): done in code, awaiting live verification.** Detection reused
-(`isChallengedState`, same condition as `waitForCompletion`); `parkChallengedTab`
-navigates the tab to `about:blank` and reports `parked` in all three driver decision
-points (`src/browser/driver.js`). A failed park never masks the
-`human_verification_required` report.
-
 **Symptom.** When a Chrome profile is challenged, `chatgpt.com` serves a `请稍候…` page with an empty body. The
 engine reports `human_verification_required`, but the challenged tab is left in place.
 
@@ -349,14 +190,6 @@ inherit the challenged page.
 
 ### D8 — reading a background tab can hang until the tab is activated (P2)
 
-**Status (2026-11-26): done in code (tab activation), awaiting live verification; window
-focus explicitly UNVERIFIED.** `Target.activateTarget` (not `Page.bringToFront`) runs once
-before the first read/wait poll and in the broker live-page probe
-(`src/browser/driver.js`, `src/broker/client.js`). Background windows already start
-off-screen (`--window-position=-2000,-2000`), but whether Chrome raises/focuses the
-window on tab activation was not verified on Windows — if the live run shows focus
-theft, that needs a window-layer follow-up.
-
 **Symptom.** A background tab can be throttled or frozen by Chrome, so a read hangs or returns stale state
 until the tab is activated.
 
@@ -368,12 +201,6 @@ window from stealing focus — the window layer is what is currently unverified.
 ---
 
 ### D9 — Gemini may ignore a reused conversation key (P2, unverified)
-
-**Status (2026-11-26): no code changed (unverified report), test procedure + harness
-written, awaiting the live run.** `docs/gemini-conversation-reuse-test.md` (two-ask
-procedure, pass/fail criteria, what to capture on failure) and
-`scripts/gemini-conversation-reuse.mjs` (manual-run-only harness, requires explicit
-`--key --prompt1 --prompt2`). Run it before treating this as a defect.
 
 **Symptom reported earlier:** passing the same conversation identifier on consecutive turns produced a new
 conversation each turn instead of continuing the stored one.
@@ -391,32 +218,11 @@ Gemini case has not been re-tested with this same-key method.
 
 ### F1 — Gemini "Task" mode over CDP (P1)
 
-**Status (2026-11-26): done in code, awaiting live DOM verification.** `--gemini-mode
-chat|task` (separate flag; `--mode` stays the window mode), toggle in the Gemini adapter
-(selectors carried over from the removed `gemini-mode.js`, `aria-pressed` as state signal),
-mode recorded on the turn (`geminiMode`, `evidence.geminiMode`), fail-closed with
-`GEMINI_MODE_FAILED` before typing. Broker passthrough wired by the coordinator
-(`src/broker/turns.js` accepts `geminiMode`, runner forwards it). Selectors are
-UNVERIFIED against the current Gemini DOM.
-
-**Live verification (2026-11-26, Windows): FAILS.** With `--gemini-mode task` the model answered
-"I don't have access to a code execution sandbox…" and the turn record/JSON had no `geminiMode` field:
-`POST /turns` (`src/broker/server.js`) never copies `body.geminiMode` into `createTurn`, so the flag is
-silently dropped before the engine sees it. Add the field (and a broker-level regression test).
-
 The Gemini web UI has a Task mode that runs code in a sandbox with Node.js and `git apply --check`. The CDP path
 only ever reaches Chat mode, so the CLI cannot use that capability. The old `gemini-mode` command has been
 removed; the CDP path needs the mode toggle in the page plus adapter state for it.
 
 ### F2 — concurrent multi-provider runs with per-provider artifacts (P2)
-
-**Status (2026-11-26): done in code, awaiting live verification.** `wfa cdp ask
---providers chatgpt,gemini` (no new verb — `wfa compare` does not exist on this branch),
-per-provider `<runDir>/<provider>/response.md` + `fanout.json`, `--serial` forces global
-serial, retry via `--retry-provider` only for definite pre-submit failures with
-`sendCommittedAt == null` (never an uncertain auto-resend). Engine cap: 1 in-flight per
-provider, at most 2 across providers. Note: broker queue defaults in code are 4/8 vs
-README's stated 1/2 — pre-existing inconsistency, not changed here.
 
 Send the same brief to several providers in parallel, write each answer to its own file, and allow retrying a
 single failed provider without touching the others. Must compose with the existing per-provider and global
@@ -424,30 +230,11 @@ scheduling limits.
 
 ### F3 — extract `FILE:` blocks from answers to disk (P2)
 
-**Status (2026-11-26): done in code, including the CLI consumer.** Integrity self-check
-(block counts, fence pairing, hunk line counts) in `src/stage.js`
-(`verifyFileBlockIntegrity` / `extractFileBlocksToDisk`); truncated input is refused
-before anything is written, output inside a repo is refused, writes are hash-verified
-with a `manifest.json`. CLI wired by the coordinator: `wfa cdp extract --input
-<answer.md> --out-dir <dir> [--json]`.
-
 Answers frequently contain complete file contents in fenced blocks. Turn that into files on disk, with an
 integrity self-check (block counts, fence pairing, hunk line counts) so a truncated answer cannot be written as
 a valid file.
 
 ### F4 — download attachments produced by providers (P2)
-
-**Status (2026-11-26): done in code, awaiting live verification.** `src/browser/downloads.js`
-(`Page.setDownloadBehavior` with `Browser.setDownloadBehavior` fallback, size-stable
-wait, SHA-256 verification, distinct fail-closed codes) + download-click hooks in both
-adapters + engine wiring by the coordinator: `wfa cdp ask --download-dir <dir>` captures
-after a completed turn and records `downloads[]` on the turn (broker copies it through).
-Download-control selectors are best-effort and UNVERIFIED against the live DOM.
-
-**Live verification (2026-11-26, Windows): FAILS.** ChatGPT created a downloadable `sample.csv` and the
-answer confirmed it, but `--download-dir` produced no file and `downloads` stayed `null`. Root cause: the same
-`POST /turns` allowlist that drops `geminiMode` also drops `downloadDir`, so `cdp-engine.js`'s
-`if (downloadDir && …)` never runs. Add both fields at the broker boundary.
 
 Currently there is no download capability at all: no `Page.setDownloadBehavior`, and the `downloads` field in
 turn records is always `null`. Collecting an attachment a provider produced requires clicking the download and
@@ -457,66 +244,24 @@ capturing it, with size/hash verification.
 
 ### F5 — Claude web adapter (P3)
 
-**Status (2026-11-26): partially done — adapter + full gating wired, awaiting live DOM
-verification.** `src/browser/adapters/claude.js` implements the provider interface
-(login probe, answer/read state, filename-verified attach, download hook, delete hook)
-and is registered in engine, CLI, broker turn validation, turn store, conversation
-store and read path (coordinator wiring). All Claude selectors are UNVERIFIED against
-the live Claude DOM. Fan-out stays `chatgpt,gemini` for now.
-
 Login flow plus a DOM adapter, following the existing provider adapter interface.
 
 ### F6 — human-like pacing (P3)
-
-**Status (2026-11-26): done in code, awaiting a live timing check.** Pacer/stagger/
-cooldown are configurable (`resolvePaceConfig`, `resolveStaggerConfig`,
-`resolveMinIntervalMs`; defaults unchanged 1–2 s per action, 4–6 s per batch) and the
-config is threaded: `pace` in `DEFAULT_CONFIG`, validated in `loadConfig`, loaded by
-the broker starter and passed to `runCdpTurn` via `deps.config`
-(`src/engines/cdp-engine.js`). `WFA_NO_PACE=1` still disables pacing.
 
 Configurable delays between actions (1–2 s per action, 4–6 s per batch, randomised) to reduce the chance of
 rate limiting.
 
 ### F7 — clean up conversations created by a run (P3)
 
-**Status (2026-11-26): partially done — tracking wired, cleanup trigger NOT decided.**
-The store records `createdByRun`/`createdRunId` and `cleanupCreatedConversations`
-deletes exactly that set (never pre-existing; idempotent; dry-run/missing-hook report
-`wouldDelete`); the engine now flags a newly opened conversation at save time
-(`src/engines/cdp-engine.js`). What is NOT done: when cleanup runs — no auto-delete
-was wired (deleting user-visible conversations automatically is a design decision
-for the user: explicit `wfa cdp cleanup`-style command vs post-run flag). A run that
-opens a conversation but does not complete records no flag; its URL stays on the
-turn record.
-
 Delete only the conversations this tool created, never pre-existing ones. Requires the adapter to track the
 conversation it opened.
 
 ### F8 — GitHub read failure fallback (P3)
 
-**Status (2026-11-26): partially done — decision + classification + record; automatic
-submit NOT wired.** `classifyProviderError` detects `REPO_UNREADABLE` (sentinel before
-the completed-response guard), `selectRepoFallbackTransport` prefers attached archive
-over inline bundle, `decideRepoFallback`/`recordRepoFallback` (`src/repo-fallback.js`)
-produce a deterministic follow-up turn (new request id, bundled input, never the
-original prompt). What is NOT done: nothing calls them automatically yet — the CDP
-path does not detect the sentinel at all and the ask-bridge path only records the
-manual command. Auto-submitting a follow-up turn is a behaviour change that needs a
-live run to validate; until then the manual fallback command is the path.
-
 When a provider cannot read the referenced repository, fall back to an inline source bundle or an attached
 archive automatically instead of returning `REPO_UNREADABLE` and stopping.
 
 ### F9 — Skill slimming (P3)
-
-**Status (2026-11-26): done.** `skills/web-first/SKILL.md` 41 → 32 lines: state table
-10 rows → 5 grouped rows, `wfa send` paragraph folded into the command line, added the
-missing never-write-generated-code-into-repo rule, pointer to `README.md` /
-`wfa cdp --help` instead of inlined reference. Every command/state was verified
-against the real CLI. Note (pre-existing, outside this change): `README.md:27` still
-says code is written via `wfa apply --confirm`, but `wfa apply` is in the
-`LEGACY_REMOVED` set in `src/cli.js`.
 
 The packaged Skill carries a large instruction document. Reduce it to what changes behaviour, and stop the agent
 from over-thinking when the user explicitly names `wfa`.
