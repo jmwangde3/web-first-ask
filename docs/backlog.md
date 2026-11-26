@@ -401,6 +401,34 @@ Gemini case has not been re-tested with this same-key method.
 
 ---
 
+### D10 — Chrome launch restores every historical tab and can trigger Google `/sorry` (P1, 2026-11-26)
+
+**Symptom.** Every Chrome launch passes `--restore-last-session` (`src/browser/launch.js:66`) so ChatGPT's
+non-persistent `oai-asli` cookie survives a restart. On this machine one launch restored **19 tabs, 9 of them
+Gemini**, all loading concurrently. Immediately afterwards every new Gemini navigation — the landing page and a
+concrete `/app/<id>` conversation — was redirected to `https://www.google.com/sorry/…`, blocking live testing
+until Google's risk control cleared.
+
+**Observed while testing this branch.** 2026-11-26 14:37 the D5 run2 tab was redirected to `/sorry`; the relaunch
+that followed restored 19 tabs (9 Gemini). The defect lives in `launch.js` and is shared by all branches.
+
+**Why it matters.** There is no supported opt-out: the switch is hardcoded, `config.json` has no browser-args
+key, and `tests/cdp-cli.test.js:1081` asserts the flag in every mode. Clearing `Default/Sessions/*` before a
+launch did **not** prevent the restore in practice (cleared at 15:22, the next launch at 15:24 still restored
+19 tabs), so the documented workaround is unreliable. `README.md:378-388` explains why the switch exists
+(ChatGPT cookie), but not this cost.
+
+**Impact.** Any Chrome restart can burn tens of minutes of Gemini quota and invalidate live runs; repeated
+broker restarts amplify it.
+
+**Evidence (2026-11-26).** 14:37 the D5 run2 tab was redirected to `/sorry`; the relaunch that followed restored
+19 tabs (9 Gemini). On the same profile, `Default/Sessions/*` cleared at 15:22 was followed by a 15:24 launch
+that still restored 19 tabs, and `ask` runs at 15:25:5x / 15:30:5x plus probes at 15:31 were redirected to
+`/sorry` (landing page and `/app/ceeb4b6cc5ca503d` alike). Run record:
+`reverdict/live-tests/20261126-1520-neon-hotfix/REPORT.md`.
+
+---
+
 ## Planned work
 
 ### F1 — Gemini "Task" mode over CDP (P1)
