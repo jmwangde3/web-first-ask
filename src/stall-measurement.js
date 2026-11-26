@@ -45,6 +45,16 @@
 //   `node scripts/summarize-pauses.mjs` prints both. 420 s is now a
 //   classification boundary, not a stall declaration; the decision below
 //   stays PROVISIONAL until those runs separate throttling from freeze.
+//   Update (2026-11-26, D5 completion fix): two further bounds. (1) A
+//   pause open for maxOpenPauseMs (default 600 s) is force-closed with a
+//   paired pause_end (reason "pause_timeout") so no pause can sit open
+//   for 13.8 min as in REPORT-02360b8c run1; timed-out pauses are counted
+//   separately and excluded from the duration percentiles. (2) The wait
+//   loop in src/browser/driver.js can now complete a turn whose page
+//   proves completion while pendingCount stays stuck (stale-pending
+//   completion, reason "completed_stale_pending") instead of waiting out
+//   the hard timeout — see the Gemini adapter's modelTextChars /
+//   answerTextFull fields.
 
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -102,12 +112,29 @@ function percentile(sorted, p) {
 export function createPauseTracker({
   now = () => Date.now(),
   pauseThresholdMs = 5000,
+  // D5 fix (2026-11-26, REPORT-02360b8c run1): an unpaired pause_start
+  // needs a timeout fallback — the last pause_start of run1 never got a
+  // pause_end and sat open for 828,596 ms (13.8 min) until the hard
+  // timeout. A pause open for maxOpenPauseMs is force-closed with a paired
+  // pause_end (reason "pause_timeout", timedOut: true) so no turn can sit
+  // in "paused" unboundedly, and the silence clock is re-baselined so a
+  // fresh pause needs another pauseThresholdMs of silence instead of
+  // reopening on the next sample. The bound (default 600 s) sits above
+  // every genuine pause observed so far (5+ min) and is a measurement
+  // bound only: closing the pause does not end the turn — the completion /
+  // stall logic in the wait loop proceeds on current data. A timed-out
+  // pause is censored, not completed: summarizePauses counts it
+  // separately and excludes it from the duration percentiles.
+  maxOpenPauseMs = 600000,
   provider = null,
   mode = null,
   taskId = null,
 } = {}) {
   if (!Number.isFinite(pauseThresholdMs) || pauseThresholdMs < 0) {
     throw new Error("INVALID_PAUSE_THRESHOLD");
+  }
+  if (!Number.isFinite(maxOpenPauseMs) || maxOpenPauseMs <= 0) {
+    throw new Error("INVALID_MAX_OPEN_PAUSE_MS");
   }
   const startAt = now();
   const events = [];
@@ -154,6 +181,30 @@ export function createPauseTracker({
     if (pendingCount !== null) lastPending = pendingCount;
     if (answerTurns !== null) lastTurns = answerTurns;
 
+    // D5 fix: an open pause that outlives maxOpenPauseMs is force-closed
+    // with a paired pause_end instead of staying open until run_end. The
+    // silence clock is re-baselined at the close, so the next sample does
+    // not immediately reopen a pause for the same silence episode.
+    if (inPause && at - pauseStartedAt >= maxOpenPauseMs) {
+      emitted = {
+        ...base(),
+        type: "pause_end",
+        at: new Date(at).toISOString(),
+        atMs: at,
+        durationMs: at - pauseStartedAt,
+        reason: "pause_timeout",
+        timedOut: true,
+        pendingCount: pauseSnapshot.pendingCount,
+        answerChars: pauseSnapshot.answerChars,
+      };
+      events.push(emitted);
+      inPause = false;
+      pauseStartedAt = null;
+      pauseSnapshot = null;
+      lastProgressAt = at;
+      return emitted;
+    }
+
     if (!inPause && at - lastProgressAt >= pauseThresholdMs) {
       inPause = true;
       pauseStartedAt = lastProgressAt;
@@ -174,7 +225,9 @@ export function createPauseTracker({
 
   // Closes the run. A pause still open at the end is NOT closed with a
   // fabricated duration: a `run_end` event records it as open, and
-  // `summarizePauses` counts it as censored (duration unknown).
+  // `summarizePauses` counts it as censored (duration unknown). With the
+  // maxOpenPauseMs fallback in sample(), an open pause at finish is at
+  // most that old — run1's 13.8-minute open pause cannot recur.
   function finish({ status = "unknown" } = {}) {
     const at = now();
     const event = {
@@ -214,28 +267,38 @@ export function createPauseTracker({
 
 // Pairs pause_start/pause_end events (FIFO) and summarises the completed
 // pauses. A start with no matching end is an open (censored) pause: counted,
-// but its duration is unknown and excluded from the percentiles.
+// but its duration is unknown and excluded from the percentiles. A pause_end
+// with timedOut: true (the maxOpenPauseMs fallback) is also censored, not
+// completed: the pause did not end by progress, so its forced duration must
+// not enter the genuine-pause distribution; it is counted separately as
+// timedOutPauses.
 export function summarizePauses(events) {
   const list = Array.isArray(events) ? events : [];
   const open = [];
   const durations = [];
   let openPauses = 0;
+  let timedOutPauses = 0;
   for (const event of list) {
     if (event?.type === "pause_start") {
       open.push(event);
     } else if (event?.type === "pause_end" && open.length) {
-      const start = open.shift();
-      const duration = Number(event.durationMs);
-      if (Number.isFinite(duration) && duration >= 0) durations.push(duration);
+      open.shift();
+      if (event?.timedOut === true) {
+        timedOutPauses += 1;
+      } else {
+        const duration = Number(event.durationMs);
+        if (Number.isFinite(duration) && duration >= 0) durations.push(duration);
+      }
     }
   }
   openPauses = open.length;
   durations.sort((a, b) => a - b);
   const total = durations.reduce((sum, value) => sum + value, 0);
   return {
-    pauseCount: durations.length + openPauses,
+    pauseCount: durations.length + openPauses + timedOutPauses,
     completedPauses: durations.length,
     openPauses,
+    timedOutPauses,
     durationsMs: durations,
     totalPauseMs: total,
     minMs: durations.length ? durations[0] : null,
@@ -249,12 +312,14 @@ export function summarizePauses(events) {
 export function formatPauseSummary(summary) {
   const ms = (value) => (value === null ? "n/a" : `${value} ms`);
   return [
-    `pauses: ${summary.pauseCount} (${summary.completedPauses} completed, ${summary.openPauses} open/censored)`,
+    `pauses: ${summary.pauseCount} (${summary.completedPauses} completed, ${summary.openPauses} open/censored, ${summary.timedOutPauses ?? 0} timed out)`,
     `total paused: ${ms(summary.totalPauseMs)}`,
     `min: ${ms(summary.minMs)}  p50: ${ms(summary.p50Ms)}  p90: ${ms(summary.p90Ms)}  max: ${ms(summary.maxMs)}  mean: ${ms(summary.meanMs)}`,
     summary.openPauses > 0
       ? "note: open pauses have unknown duration and are excluded from the percentiles"
-      : "note: no open pauses",
+      : (summary.timedOutPauses ?? 0) > 0
+        ? "note: timed-out pauses were force-closed by the open-pause fallback and are excluded from the percentiles"
+        : "note: no open pauses",
   ].join("\n");
 }
 

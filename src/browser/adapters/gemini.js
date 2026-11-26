@@ -461,6 +461,28 @@ export function buildReadStateJs() {
     answerText = withCodeFences(body).replace(/^(Gemini|Bard)\\s*(said|说)\\s*[:：]?\\s*/i, "").trim();
   }
 
+  // D5 fix (2026-11-26, REPORT-02360b8c run1): the engine's view of a
+  // background tab can go stale while the page holds the full answer —
+  // run1 showed innerText stuck at 43 chars, pendingCount stuck at 666 and
+  // no stop button, while the same tab's textContent held 29,970 chars,
+  // until the 900 s hard timeout. innerText needs layout, which a
+  // throttled background tab may not run; textContent does not. These two
+  // fields are the page-level "full answer text present" signal the wait
+  // loop uses for its stale-pending completion path. Additive only:
+  // answerText / pendingCount / answerActionsVisible keep their existing
+  // meanings, and the D4 read path (src/engines/cdp-read.js) ignores the
+  // new fields. answerTextFull is raw trimmed textContent, without the
+  // code-fence reconstruction of answerText — it is the rescue text for a
+  // turn that completes through the stale-pending path, not the primary
+  // extraction.
+  let modelTextChars = 0;
+  let answerTextFull = "";
+  if (last) {
+    modelTextChars = String(last.textContent || "").trim().length;
+    const fullBody = last.querySelector("message-content, .markdown") ?? last;
+    answerTextFull = String(fullBody.textContent || "").trim();
+  }
+
   // 真机核实（2026-11-24）：生成中与思考暂停期间都读不到 message-actions，
   // 回答完整结束后才出现操作栏（copy/thumb/regenerate）。这是比停止按钮可靠的完成信号。
   let answerActionsVisible = null;
@@ -539,6 +561,8 @@ export function buildReadStateJs() {
     answerText,
     answerActionsVisible,
     pendingCount,
+    modelTextChars,
+    answerTextFull,
     stopVisible,
     editorEmpty,
     title,

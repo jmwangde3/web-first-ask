@@ -254,6 +254,37 @@ recorded decisions plus later completion can separate them (see the procedure in
 visible control also timed out at 422.9 s — with a same-day throttling confound, so no
 single cause is attributed.
 
+**Status (2026-11-26, fix on `fix/d5-completion-detection`, awaiting live verification):
+completion detection fixed for the stale-pending shape.** Live run1 (REPORT-02360b8c)
+reproduced the failure the alive/dead strategy could not save: the page held 29,970
+chars with no stop button, but the engine saw `answerChars` 43 and `pendingCount` 666
+until the 900 s hard timeout, and the last `pause_start` sat unpaired for 828,596 ms.
+Root causes, both fixed: (1) a merely present `pendingCount` refreshed `lastActivityAt`
+on every poll, so `settled` could never become true while pending was stuck — activity
+now means a change (answer text, pending count, or page-level full text); a missing
+actions field now counts as "done" only when nothing is pending (`isActionsDone` in
+`src/browser/driver.js`), matching the real Gemini adapter contract (null exactly when
+pending is 0). (2) The adapter's `innerText` extraction lags in a background tab, so
+`buildReadStateJs` (`src/browser/adapters/gemini.js`) now also reports `modelTextChars`
+and `answerTextFull` (textContent-based); when the pending count and the full text are
+both frozen for `stalePendingMs` (default: the 420 s stall boundary, NOT raised), the
+stop button is gone, and no positive completion signal has appeared, the turn completes
+as `completed_stale_pending` with the full text — confirmed by one fresh read (which
+also re-activates the tab) before completing. A frozen full text below
+`stalePendingMinChars` (default 1000) never completes through this path: observed
+genuine thinking pauses all stuck at 18–25 chars. Residual risk is recorded in the
+code: a genuine pause past 420 s with a long partial answer and no stop button cannot
+be told apart from a completed-but-unfinalised one. (3) `createPauseTracker`
+(`src/stall-measurement.js`) force-closes a pause open for `maxOpenPauseMs` (default
+600 s) with a paired `pause_end` (`reason: "pause_timeout"`, `timedOut: true`);
+timed-out pauses are counted separately and excluded from the duration percentiles
+(`summarizePauses`, `scripts/summarize-pauses.mjs`). `stallTimeoutMs` default (420 s)
+unchanged. D4 read-layer behaviour (`src/engines/cdp-read.js`: partial marking,
+two-sample confirmation) untouched; regression tests in
+`tests/stall-d5-completion.test.js` (15 tests, incl. both run1 halves and the
+small-text / stop-visible negatives). Live re-verification: single run after ≥30 min
+cooldown with restored tabs cleared, D4 re-verified in the same round, serial.
+
 **Measured 2026-11-25.** With the window hidden (`visibility=hidden`):
 
 - `.pending` stayed at 378 for more than five minutes with no text change;

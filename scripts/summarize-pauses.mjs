@@ -57,6 +57,8 @@ if (!files.length) {
       process.stdout.write("verdict: paused-but-alive turn(s) kept waiting past the 420 s boundary — check whether they completed (throttling) or are still open\n");
     } else if (decisions.stallContinuedWaitExhausted > 0) {
       process.stdout.write("verdict: an alive turn exhausted the continued-wait budget — revisit the budget with this data, do not just raise a bare number\n");
+    } else if (summary.timedOutPauses > 0) {
+      process.stdout.write("verdict: pause(s) hit the open-pause timeout fallback and were force-closed — the turn did not resolve by progress; check the stall decisions\n");
     } else if (summary.maxMs !== null && summary.maxMs > 420000) {
       process.stdout.write("verdict: a completed pause exceeded the 420 s stall default — revisit it (see D5 decision in src/stall-measurement.js)\n");
     } else if (summary.openPauses > 0) {
