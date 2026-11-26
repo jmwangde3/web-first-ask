@@ -41,6 +41,22 @@ awaiting Windows re-verification):
   `alive: false`. F5: code review only — no conformance bugs found; all
   Claude selectors still unverified.
 
+Fix round 4 (live re-verification REPORT-5b3e91ee.md, 2026-11-26 — all code-done,
+awaiting Windows re-verification):
+
+- F1: `submitTurn` no longer treats a dispatched send-button click as proof
+  of submission — it now verifies the send landed (editor emptied or a new
+  user turn, 5 s bound), tries exactly one Enter fallback only on a verified
+  no-op click, and otherwise throws `SEND_UNCONFIRMED`; `sendCommittedAt`
+  is stamped only from the verified submit return, never from send-intent
+  time. The 5 s placeholder poll and mode-switch code are unchanged.
+- Flake (investigation-only, no fix): `tests/broker-turn-fields-f1-f4.test.js`
+  fails 3/5 isolated reruns on Windows (0/25 on Linux) because `close()` can
+  resolve before a completed turn is persisted — `runTurn` deletes the task
+  from `active` before the persistence awaits (`src/broker/server.js:289-291`).
+  No test fix applied; the production fix (`close()` must wait for in-flight
+  persistence) is a follow-up, not part of this round.
+
 First round:
 
 - D1: broker no longer idles out while it owns a non-terminal turn

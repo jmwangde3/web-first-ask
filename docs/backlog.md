@@ -51,6 +51,21 @@ problem, not a product failure; file-by-file runs all exit 0.
 900 s session. See `reverdict/GEMINI-BOT-CHECK-ANALYSIS.md` — long-task runs must be spaced (≥30 min), and
 the restored-tab pile-up must be cleared before each run.
 
+## Live verification — muse @ `e6a8932` (2026-11-26 17:20, Windows 11 / Node 26.13.1 / Chrome 158)
+
+Recorded on this branch only (REPORT-5b3e91ee.md). Broker 31304 on e6a8932 code; Chrome 39236 user-launched
+without `--restore-last-session`.
+
+`npm test` = **739 tests / 738 pass / 1 fail** (the fail is the `broker-turn-fields-f1-f4` flake, see below).
+
+| Item | Live result | Detail |
+|---|---|---|
+| F1 | **mode switch pass, send fail** | 2/2 mode applied (`geminiMode.applied=true`, `placeholderVerified=true`, `placeholder="Describe a task"` — the 5 s poll works). Both asks then ended `send_unconfirmed` after 30 s: editor still held the prompt, `user-query` = 0, `model-response` = 0, send button present and `disabled=false`; CLI warned "prompt was already sent" and `sendCommittedAt` was set, both false. **Fix (2026-11-26, fix round 4):** `submitTurn` now verifies the send landed (editor emptied or new user turn, 5 s bound), one Enter fallback only on a verified no-op click, else `SEND_UNCONFIRMED`; `sendCommittedAt` is stamped only from the verified submit return. Awaiting live re-verification — see the F1 status line. |
+| D10 | **pass (code + runtime + manual restarts)** | `buildChromeArgs` has no `--restore-last-session` (`has_restore=false`); user's manual no-flag restarts (normal close + `taskkill /F` force-kill) keep ChatGPT and Google logged in with no dirty-tab restore; real carriers are `__Secure-next-auth.session-token.0/.1` (exp 2027-02-24) and the Google SID family (~2028-01). The closed loop "wfa itself launches Chrome then logs in" was NOT run this round. |
+| Flake | **investigation-only, no fix** | `tests/broker-turn-fields-f1-f4.test.js` failed 3/5 isolated reruns on Windows (expects `completed`, sees `queued`); 0/25 on Linux. Cause found and proven: `close()` can resolve before a completed turn is persisted — `runTurn` deletes the task from `active` before the persistence awaits (`src/broker/server.js:289-291`), so the post-restart assert can read the `queued` snapshot. No test fix applied (a test-side wait would mask a real production durability bug); the fix belongs in production (`close()` must wait for in-flight persistence). Follow-up, not part of this round. |
+| D4 / D7 / F5 / F8 / F9 | not re-run this round | no code change. |
+| D3 / D5 | not re-run this round | D3 only gained diagnostics in round 3 (live probe still pending); D5 not re-run. |
+
 ## How to validate a fix
 
 ```bash
@@ -497,7 +512,15 @@ Gemini case has not been re-tested with this same-key method.
 launched Chrome without the switch, startup NOT "Continue where you left off", and no `oai-asli` cookie still
 shows chatgpt.com logged in). Live re-verification: `wfa cdp login --provider chatgpt`, clean exit and
 relaunch, `fetch('/api/auth/session')` still returns the user, and the launch no longer restores historical
-tabs.
+tabs. User live verification (2026-11-26 17:21, manual no-flag `.cmd` launch, same profile): normal
+`Browser.close` exit (`exit_type=Normal`) → restart pid 3320, no flag on the command line,
+`gemini.google.com/app` composer=true/signin=false, 3 tabs, no history restore; force-kill (`taskkill /F /T`)
+→ restart pid 39236, 3 tabs, no dirty-tab restore, chatgpt.com still logged in, 23 cookies, `oai-asli` = 0.
+Real carriers: ChatGPT `__Secure-next-auth.session-token.0/.1` (persistent, exp 2027-02-24,
+`hasAccessToken=true`); Google `SID`/`HSID`/`SSID`/`APISID`/`SAPISID`/`__Secure-1PSID`/`__Secure-3PSID`
+(persistent, ~2028-01, unchanged by the kill). The closed loop "wfa itself launches Chrome then logs in"
+was NOT run in REPORT-5b3e91ee.md — code + runtime (`buildChromeArgs` `has_restore=false`) + these manual
+restarts verify the mechanism; the wfa-launched closed loop is still pending.
 
 **Symptom.** Every Chrome launch passes `--restore-last-session` (`src/browser/launch.js:66`) so ChatGPT's
 non-persistent `oai-asli` cookie survives a restart. On this machine one launch restored **19 tabs, 9 of them
@@ -553,6 +576,36 @@ with `GEMINI_MODE_FAILED` before typing when the control never appears.
 Regression tests in `tests/adapters-f1-f5.test.js` (late control, action
 selector, never-appears, placeholder-unconfirmed, already-pressed).
 Selectors are UNVERIFIED against the current Gemini DOM.
+
+**Fix round 4 (2026-11-26, branch `fix/f1-task-mode-send`):** live re-verification
+(REPORT-5b3e91ee.md) showed the mode switch passing 2/2 but both asks ending
+`send_unconfirmed` after 30 s — the editor still held the prompt, `user-query` = 0,
+yet `sendCommittedAt` was set and the CLI warned "prompt was already sent". Two
+defects: (1) `submitTurn` (`src/browser/driver.js`) treated a dispatched `.click()`
+as proof of submission with zero verification; (2) `sendCommittedAt` was stamped at
+send-intent time in `src/engines/cdp-engine.js` before the send. Now `submitTurn`
+polls the completion wait's own ACK (editor emptied or a new user turn) for up to
+5 s after a click; on a verified no-op click only it tries exactly one Enter
+keyDown/keyUp and re-checks; otherwise it throws `SEND_UNCONFIRMED`.
+`sendCommittedAt` is stamped only from `submitTurn`'s verified return. The 5 s
+placeholder poll and mode-switch code are unchanged. Regression tests in
+`tests/browser-driver.test.js` (fake Task-mode composer: click no-op, Enter
+submits; both no-op fails closed) and `tests/adapters-f1-f5.test.js` (no
+`sendCommittedAt` on `SEND_UNCONFIRMED`, intent journal kept). Awaiting live
+re-verification: `wfa cdp ask --provider gemini --gemini-mode task --prompt
+"reply with one word: TASKMODE_OK_2026" --json` — pass requires turn `completed`,
+Task `aria-pressed="true"`, placeholder `Describe a task`, `sendCommittedAt`
+non-empty, AND a user turn visible on the page (not `send_unconfirmed`). If it
+still shows `send_unconfirmed`, it now fails fast (≤ ~10 s) with no
+`sendCommittedAt` — capture the live probe instead of retrying: at three moments
+(before mode click / after placeholder confirms / after the failed submit) list
+all `button[aria-label*="Send"], button[aria-label*="发送"],
+button[type="submit"]` with `aria-label`, `disabled`, `isConnected`, bounding
+rect, and whether each is inside `rich-textarea`'s composer vs another composer
+instance (count `rich-textarea` / `[contenteditable="true"]` elements); the Task
+composer's submit control if any with a different label; editor `innerText`,
+`user-query` count, and whether a real Enter keypress in the focused editor
+submits.
 
 The Gemini web UI has a Task mode that runs code in a sandbox with Node.js and `git apply --check`. The CDP path
 only ever reaches Chat mode, so the CLI cannot use that capability. The old `gemini-mode` command has been
