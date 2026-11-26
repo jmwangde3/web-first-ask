@@ -37,21 +37,55 @@ export const GEMINI_DEFAULT_MODE = "chat";
 export const taskModeSegmentValue = "40";
 export const taskModeSelector = 'gem-segmented-button[data-value="40"] button[aria-pressed]';
 export const taskModeLabelSelector = "gem-segmented-button button";
+// F1 (2026-11-26 live verification): the Task control renders AFTER
+// waitForEditor returns, so a single find fails with
+// task_mode_control_not_found even though the selector is correct. The
+// button itself carries this class (see the DOM probe in
+// REPORT-02360b8c.md: gem-segmented-button-row exists, Chat pressed /
+// Task unpressed); it is a second lookup for the same Task button, not a
+// replacement for the proven segment selector above.
+export const taskModeActionSelector = "button.gem-segmented-button-action";
 export const taskModeLabels = Object.freeze(["Task", "任务"]);
+// Placeholder the composer shows once Task mode is active. Quill renders
+// it as data-placeholder on the editor; the toggle verifies it after the
+// aria-pressed flip so a turn never claims Task mode on the button state
+// alone. Chinese UI shows the localized equivalent.
+export const taskModePlaceholderTexts = Object.freeze(["Describe a task", "描述任务"]);
+// Bounded poll for the late-rendering Task control (3–5 s per the live
+// report's fix direction) and for the placeholder flip after the click.
+// Short interval, no fixed sleep: the in-page poll re-checks every
+// 100 ms until the deadline. The builder accepts overrides so tests can
+// use a short bound without weakening the production one.
+export const taskModeControlTimeoutMs = 5000;
+export const taskModeControlPollIntervalMs = 100;
+export const taskModePlaceholderTimeoutMs = 2000;
 
 // Find the Task switch, click it only when the requested mode differs from
 // the current one, and confirm aria-pressed flipped. Never throws in-page:
 // every outcome is a plain object so the engine can fail closed with a
 // distinct reason instead of guessing whether the click landed.
 // mode "chat" clicks back from Task; "task" clicks into Task.
-export function buildTaskModeJs(mode) {
+export function buildTaskModeJs(mode, options = {}) {
   const wanted = mode === "task" ? "task" : "chat";
+  const controlTimeoutMs = Number.isFinite(options.controlTimeoutMs)
+    ? options.controlTimeoutMs
+    : taskModeControlTimeoutMs;
+  const pollIntervalMs = Number.isFinite(options.controlPollIntervalMs)
+    ? options.controlPollIntervalMs
+    : taskModeControlPollIntervalMs;
+  const placeholderTimeoutMs = Number.isFinite(options.placeholderTimeoutMs)
+    ? options.placeholderTimeoutMs
+    : taskModePlaceholderTimeoutMs;
   return `(async () => {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const labels = ${JSON.stringify(taskModeLabels)};
+  const placeholderTexts = ${JSON.stringify(taskModePlaceholderTexts)};
   const findButton = () => {
     const direct = document.querySelector(${JSON.stringify(taskModeSelector)});
     if (direct) return direct;
+    const action = [...document.querySelectorAll(${JSON.stringify(taskModeActionSelector)})]
+      .find((el) => labels.includes((el.innerText || el.textContent || "").trim()));
+    if (action) return action;
     return [...document.querySelectorAll(${JSON.stringify(taskModeLabelSelector)})]
       .find((el) => labels.includes((el.innerText || el.textContent || "").trim())) || null;
   };
@@ -60,15 +94,73 @@ export function buildTaskModeJs(mode) {
     const v = el.getAttribute("aria-pressed");
     return v === "true" ? true : (v === "false" ? false : null);
   };
+  // Read the composer's current placeholder: Quill keeps it in
+  // data-placeholder on the editor; fall back to placeholder/aria-label
+  // attrs and to a rendered overlay text inside rich-textarea. Returns
+  // the Task placeholder when present, else the first placeholder-ish
+  // text seen (so a failure can report what the page actually showed),
+  // else null.
+  const readPlaceholder = () => {
+    const seen = [];
+    const fromAttrs = (el) => {
+      if (!el || typeof el.getAttribute !== "function") return;
+      for (const name of ["data-placeholder", "placeholder", "aria-label"]) {
+        const v = el.getAttribute(name);
+        if (typeof v === "string" && v.trim()) seen.push(v.trim());
+      }
+    };
+    fromAttrs(document.querySelector('[contenteditable="true"]'));
+    fromAttrs(document.querySelector("rich-textarea"));
+    for (const el of document.querySelectorAll("[data-placeholder], [placeholder]")) {
+      fromAttrs(el);
+    }
+    for (const text of seen) {
+      if (placeholderTexts.some((want) => text.includes(want))) return text;
+    }
+    const composer = document.querySelector("rich-textarea");
+    if (composer && typeof composer.querySelectorAll === "function") {
+      for (const el of composer.querySelectorAll("*")) {
+        const t = (el.innerText || el.textContent || "").trim();
+        if (t && placeholderTexts.includes(t)) return t;
+      }
+    }
+    return seen[0] || null;
+  };
+  const isTaskPlaceholder = (text) =>
+    typeof text === "string" && placeholderTexts.some((want) => text.includes(want));
+  const confirmTaskPlaceholder = async () => {
+    const deadline = Date.now() + ${JSON.stringify(placeholderTimeoutMs)};
+    let placeholder = readPlaceholder();
+    while (!isTaskPlaceholder(placeholder) && Date.now() < deadline) {
+      await sleep(${JSON.stringify(pollIntervalMs)});
+      placeholder = readPlaceholder();
+    }
+    return placeholder;
+  };
   const editor = document.querySelector('[contenteditable="true"]');
   const typedBeforeClick = editor ? (editor.innerText || editor.textContent || "").trim().length : 0;
-  const button = findButton();
+  // F1: bounded poll — the control renders later than waitForEditor, so
+  // the first find is usually too early. Keep polling at a short
+  // interval until the deadline; only then report it missing.
+  const controlDeadline = Date.now() + ${JSON.stringify(controlTimeoutMs)};
+  let button = findButton();
+  while (!button && Date.now() < controlDeadline) {
+    await sleep(${JSON.stringify(pollIntervalMs)});
+    button = findButton();
+  }
   if (!button) {
     return { success: false, reason: "task_mode_control_not_found", mode: "unknown", typedBeforeClick };
   }
   const wantPressed = ${JSON.stringify(wanted)} === "task";
   const current = pressedOf(button);
   if (current === wantPressed) {
+    if (${JSON.stringify(wanted)} === "task") {
+      const placeholder = await confirmTaskPlaceholder();
+      if (!isTaskPlaceholder(placeholder)) {
+        return { success: false, reason: "task_mode_placeholder_not_confirmed", mode: "unknown", typedBeforeClick, placeholder: placeholder || null };
+      }
+      return { success: true, step: "already", mode: "task", typedBeforeClick, placeholderVerified: true, placeholder };
+    }
     return { success: true, step: "already", mode: ${JSON.stringify(wanted)}, typedBeforeClick };
   }
   button.click();
@@ -76,7 +168,14 @@ export function buildTaskModeJs(mode) {
   while (Date.now() < deadline) {
     const nowPressed = pressedOf(findButton() || button);
     if (nowPressed === wantPressed) {
-      return { success: true, step: "clicked", mode: ${JSON.stringify(wanted)}, typedBeforeClick };
+      if (${JSON.stringify(wanted)} !== "task") {
+        return { success: true, step: "clicked", mode: "chat", typedBeforeClick };
+      }
+      const placeholder = await confirmTaskPlaceholder();
+      if (!isTaskPlaceholder(placeholder)) {
+        return { success: false, reason: "task_mode_placeholder_not_confirmed", mode: "unknown", typedBeforeClick, placeholder: placeholder || null };
+      }
+      return { success: true, step: "clicked", mode: ${JSON.stringify(wanted)}, typedBeforeClick, placeholderVerified: true, placeholder };
     }
     await sleep(100);
   }
@@ -86,7 +185,8 @@ export function buildTaskModeJs(mode) {
 
 // Read back which mode the page is currently in, for the turn record.
 // "unknown" when the control is absent: the caller must not claim a mode
-// it could not observe.
+// it could not observe. `placeholder` is the composer's current
+// placeholder text when one is advertised, else null.
 export function buildGeminiModeStateJs() {
   return `(() => {
   const labels = ${JSON.stringify(taskModeLabels)};
@@ -95,11 +195,21 @@ export function buildGeminiModeStateJs() {
     button = [...document.querySelectorAll(${JSON.stringify(taskModeLabelSelector)})]
       .find((el) => labels.includes((el.innerText || el.textContent || "").trim())) || null;
   }
+  let placeholder = null;
+  const fromAttrs = (el) => {
+    if (placeholder || !el || typeof el.getAttribute !== "function") return;
+    for (const name of ["data-placeholder", "placeholder", "aria-label"]) {
+      const v = el.getAttribute(name);
+      if (typeof v === "string" && v.trim()) { placeholder = v.trim(); return; }
+    }
+  };
+  fromAttrs(document.querySelector('[contenteditable="true"]'));
+  fromAttrs(document.querySelector("rich-textarea"));
   if (!button || typeof button.getAttribute !== "function") {
-    return { mode: "unknown", pressed: null, controlFound: false };
+    return { mode: "unknown", pressed: null, controlFound: false, placeholder };
   }
   const pressed = button.getAttribute("aria-pressed") === "true";
-  return { mode: pressed ? "task" : "chat", pressed, controlFound: true };
+  return { mode: pressed ? "task" : "chat", pressed, controlFound: true, placeholder };
 })()`;
 }
 

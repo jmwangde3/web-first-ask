@@ -17,7 +17,7 @@ import { WfaError } from "../src/errors.js";
 // file is claimed to be verified against a live DOM.
 // ---------------------------------------------------------------------------
 
-function makeElement({ text = "", ariaLabel = null, title = null, download = null, disabled = false, hidden = false } = {}) {
+function makeElement({ text = "", ariaLabel = null, title = null, download = null, disabled = false, hidden = false, placeholder = null } = {}) {
   const el = {
     innerText: text,
     textContent: text,
@@ -30,6 +30,7 @@ function makeElement({ text = "", ariaLabel = null, title = null, download = nul
       if (name === "title") return title;
       if (name === "download") return download;
       if (name === "aria-disabled") return disabled ? "true" : null;
+      if (name === "data-placeholder" || name === "placeholder") return placeholder;
       return null;
     },
     getBoundingClientRect: () => (hidden ? { width: 0, height: 0 } : { width: 12, height: 12 }),
@@ -82,16 +83,18 @@ function createMockStream() {
 // F1 — Gemini Task mode toggle (adapter JS, fake DOM)
 // ---------------------------------------------------------------------------
 
-function makeGeminiModeDocument({ segmentButton = null, labelButtons = [], editor = makeElement({ text: "" }) } = {}) {
+function makeGeminiModeDocument({ segmentButton = null, labelButtons = [], actionButtons = [], editor = null, placeholder = "Describe a task" } = {}) {
+  const editorEl = editor || makeElement({ text: "", placeholder });
   return {
     title: "Gemini",
     querySelector: (selector) => {
       if (selector.includes('gem-segmented-button[data-value="40"]')) return segmentButton;
-      if (selector === '[contenteditable="true"]') return editor;
+      if (selector === '[contenteditable="true"]') return editorEl;
       return null;
     },
     querySelectorAll: (selector) => {
       if (selector === "gem-segmented-button button") return labelButtons;
+      if (selector === geminiAdapter.taskModeActionSelector) return actionButtons;
       return [];
     },
   };
@@ -108,6 +111,51 @@ test("F1 gemini mode toggle: Task not pressed -> clicks, confirms pressed, recor
   assert.equal(res.mode, "task");
   assert.equal(button.clicked, true);
   assert.equal(res.typedBeforeClick, 0);
+  assert.equal(res.placeholderVerified, true);
+  assert.equal(res.placeholder, "Describe a task");
+});
+
+test("F1 gemini mode toggle: Task control appearing late (after the first check) is polled for, clicked and verified", async () => {
+  const button = makeTaskButton(false);
+  const appearAt = Date.now() + 300;
+  const doc = {
+    title: "Gemini",
+    querySelector: (selector) => {
+      if (selector.includes('gem-segmented-button[data-value="40"]')) {
+        return Date.now() >= appearAt ? button : null;
+      }
+      if (selector === '[contenteditable="true"]') return makeElement({ text: "", placeholder: "Describe a task" });
+      return null;
+    },
+    querySelectorAll: () => [],
+  };
+  const res = await runPageJs(geminiAdapter.buildTaskModeJs("task"), doc);
+  assert.equal(res.success, true);
+  assert.equal(res.step, "clicked");
+  assert.equal(res.mode, "task");
+  assert.equal(button.clicked, true);
+  assert.equal(res.placeholderVerified, true);
+  assert.equal(res.placeholder, "Describe a task");
+});
+
+test("F1 gemini mode toggle: button.gem-segmented-button-action with Task text is found when the segment selector misses", async () => {
+  const button = makeTaskButton(false);
+  const res = await runPageJs(
+    geminiAdapter.buildTaskModeJs("task"),
+    makeGeminiModeDocument({ segmentButton: null, labelButtons: [], actionButtons: [button] }),
+  );
+  assert.equal(res.success, true);
+  assert.equal(res.step, "clicked");
+  assert.equal(res.mode, "task");
+  assert.equal(button.clicked, true);
+  assert.equal(res.placeholderVerified, true);
+});
+
+test("F1 gemini mode toggle: the production control poll is bounded to 3–5 s with a short interval", () => {
+  assert.equal(geminiAdapter.taskModeControlTimeoutMs, 5000);
+  assert.ok(geminiAdapter.taskModeControlTimeoutMs >= 3000 && geminiAdapter.taskModeControlTimeoutMs <= 5000);
+  assert.equal(geminiAdapter.taskModeControlPollIntervalMs, 100);
+  assert.equal(geminiAdapter.taskModePlaceholderTimeoutMs, 2000);
 });
 
 test("F1 gemini mode toggle: already on Task -> no click, step already", async () => {
@@ -119,6 +167,21 @@ test("F1 gemini mode toggle: already on Task -> no click, step already", async (
   assert.equal(res.success, true);
   assert.equal(res.step, "already");
   assert.equal(res.mode, "task");
+  assert.equal(button.clicked, false);
+  assert.equal(res.placeholderVerified, true);
+  assert.equal(res.placeholder, "Describe a task");
+});
+
+test("F1 gemini mode toggle: already-pressed Task without the Task placeholder fails closed", async () => {
+  const button = makeTaskButton(true);
+  const res = await runPageJs(
+    geminiAdapter.buildTaskModeJs("task", { placeholderTimeoutMs: 200 }),
+    makeGeminiModeDocument({ segmentButton: button, placeholder: "Ask Gemini" }),
+  );
+  assert.equal(res.success, false);
+  assert.equal(res.reason, "task_mode_placeholder_not_confirmed");
+  assert.equal(res.mode, "unknown");
+  assert.equal(res.placeholder, "Ask Gemini");
   assert.equal(button.clicked, false);
 });
 
@@ -136,12 +199,25 @@ test("F1 gemini mode toggle: back to Chat clicks the pressed switch off", async 
 
 test("F1 gemini mode toggle: no segment control -> fails closed with a distinct reason, no click", async () => {
   const res = await runPageJs(
-    geminiAdapter.buildTaskModeJs("task"),
+    geminiAdapter.buildTaskModeJs("task", { controlTimeoutMs: 200 }),
     makeGeminiModeDocument({ segmentButton: null, labelButtons: [] }),
   );
   assert.equal(res.success, false);
   assert.equal(res.reason, "task_mode_control_not_found");
   assert.equal(res.mode, "unknown");
+});
+
+test("F1 gemini mode toggle: Task pressed but the placeholder never becomes the Task prompt fails closed", async () => {
+  const button = makeTaskButton(false);
+  const res = await runPageJs(
+    geminiAdapter.buildTaskModeJs("task", { placeholderTimeoutMs: 200 }),
+    makeGeminiModeDocument({ segmentButton: button, placeholder: "Ask Gemini" }),
+  );
+  assert.equal(res.success, false);
+  assert.equal(res.reason, "task_mode_placeholder_not_confirmed");
+  assert.equal(res.mode, "unknown");
+  assert.equal(res.placeholder, "Ask Gemini");
+  assert.equal(button.clicked, true);
 });
 
 test("F1 gemini mode toggle: label fallback finds the Task button when the segment selector misses", async () => {
@@ -153,25 +229,26 @@ test("F1 gemini mode toggle: label fallback finds the Task button when the segme
   assert.equal(res.success, true);
   assert.equal(res.step, "clicked");
   assert.equal(button.clicked, true);
+  assert.equal(res.placeholderVerified, true);
 });
 
 test("F1 gemini mode state JS: pressed -> task, unpressed -> chat, absent -> unknown", () => {
   const docTask = makeGeminiModeDocument({ segmentButton: makeTaskButton(true) });
   assert.deepEqual(runPageJs(geminiAdapter.buildGeminiModeStateJs(), docTask),
-    { mode: "task", pressed: true, controlFound: true });
-  const docChat = makeGeminiModeDocument({ segmentButton: makeTaskButton(false) });
+    { mode: "task", pressed: true, controlFound: true, placeholder: "Describe a task" });
+  const docChat = makeGeminiModeDocument({ segmentButton: makeTaskButton(false), placeholder: "Ask Gemini" });
   assert.deepEqual(runPageJs(geminiAdapter.buildGeminiModeStateJs(), docChat),
-    { mode: "chat", pressed: false, controlFound: true });
-  const docAbsent = makeGeminiModeDocument({ segmentButton: null, labelButtons: [] });
+    { mode: "chat", pressed: false, controlFound: true, placeholder: "Ask Gemini" });
+  const docAbsent = makeGeminiModeDocument({ segmentButton: null, labelButtons: [], placeholder: null });
   assert.deepEqual(runPageJs(geminiAdapter.buildGeminiModeStateJs(), docAbsent),
-    { mode: "unknown", pressed: null, controlFound: false });
+    { mode: "unknown", pressed: null, controlFound: false, placeholder: null });
 });
 
 test("F1 gemini mode toggle reports typed text instead of failing on it", async () => {
   const button = makeTaskButton(false);
   const res = await runPageJs(
     geminiAdapter.buildTaskModeJs("task"),
-    makeGeminiModeDocument({ segmentButton: button, editor: makeElement({ text: "draft" }) }),
+    makeGeminiModeDocument({ segmentButton: button, editor: makeElement({ text: "draft", placeholder: "Describe a task" }) }),
   );
   assert.equal(res.success, true);
   assert.equal(res.typedBeforeClick, 5);
@@ -248,8 +325,8 @@ function makeEngineHarness({ toggleResult, stateResult } = {}) {
 test("F1 engine: gemini --gemini-mode task toggles before typing and the turn records task mode", async () => {
   await withTempDir(async (home) => {
     const { deps, counters, evaluated } = makeEngineHarness({
-      toggleResult: { success: true, step: "clicked", mode: "task", typedBeforeClick: 0 },
-      stateResult: { mode: "task", pressed: true, controlFound: true },
+      toggleResult: { success: true, step: "clicked", mode: "task", typedBeforeClick: 0, placeholderVerified: true, placeholder: "Describe a task" },
+      stateResult: { mode: "task", pressed: true, controlFound: true, placeholder: "Describe a task" },
     });
     const result = await runCdpTurn({
       provider: "gemini", prompt: "run the checks", home, geminiMode: "task", deps,
@@ -258,6 +335,8 @@ test("F1 engine: gemini --gemini-mode task toggles before typing and the turn re
     assert.equal(result.geminiMode, "task");
     assert.equal(result.evidence.geminiMode.mode, "task");
     assert.equal(result.evidence.geminiMode.applied, true);
+    assert.equal(result.evidence.geminiMode.placeholderVerified, true);
+    assert.equal(result.evidence.geminiMode.placeholder, "Describe a task");
     assert.equal(counters.typed, 1);
     assert.equal(counters.submitted, 1);
     assert.ok(evaluated.some((e) => e.includes("gem-segmented-button")),
@@ -276,6 +355,24 @@ test("F1 engine: a failed Task toggle fails closed before typing or submitting",
     });
     assert.equal(result.status, "failed");
     assert.equal(result.reason, "gemini_mode_failed");
+    assert.equal(result.text, "");
+    assert.equal(counters.typed, 0);
+    assert.equal(counters.submitted, 0);
+  });
+});
+
+test("F1 engine: Task pressed but the placeholder unconfirmed fails closed before typing or submitting", async () => {
+  await withTempDir(async (home) => {
+    const { deps, counters } = makeEngineHarness({
+      toggleResult: { success: false, reason: "task_mode_placeholder_not_confirmed", mode: "unknown", typedBeforeClick: 0, placeholder: "Ask Gemini" },
+      stateResult: { mode: "chat", pressed: false, controlFound: true, placeholder: "Ask Gemini" },
+    });
+    const result = await runCdpTurn({
+      provider: "gemini", prompt: "run the checks", home, geminiMode: "task", deps,
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(result.reason, "gemini_mode_failed");
+    assert.match(result.evidence.message, /task_mode_placeholder_not_confirmed/);
     assert.equal(result.text, "");
     assert.equal(counters.typed, 0);
     assert.equal(counters.submitted, 0);

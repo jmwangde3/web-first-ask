@@ -60,7 +60,11 @@ export function resolveGeminiMode(provider, value) {
 // actually ran in. Throws GEMINI_MODE_FAILED on any non-success so the
 // turn fails closed before typing — a turn must never claim Task mode it
 // did not confirm. `chat` is a no-op confirmation, not a click, when the
-// page is already on Chat.
+// page is already on Chat. The adapter JS itself polls (bounded 5 s) for
+// the Task control, which renders later than waitForEditor, and for task
+// mode verifies aria-pressed plus the composer placeholder ("Describe a
+// task") before reporting success; this function only relays that
+// outcome and re-checks the mode.
 export async function applyGeminiMode(cdp, sessionId, adapter, mode) {
   if (mode !== "task" && mode !== "chat") {
     throw new WfaError("INVALID_ARGUMENT", `Invalid gemini mode: ${mode}. Must be chat or task.`);
@@ -108,6 +112,10 @@ export async function applyGeminiMode(cdp, sessionId, adapter, mode) {
     mode: confirmedMode,
     step: toggle.step || null,
     typedBeforeClick: Number.isInteger(toggle.typedBeforeClick) ? toggle.typedBeforeClick : null,
+    // F1: placeholder verification from the toggle (task mode only;
+    // false/null when the adapter did not report one).
+    placeholderVerified: toggle.placeholderVerified === true,
+    placeholder: typeof toggle.placeholder === "string" ? toggle.placeholder : null,
   };
 }
 
@@ -666,7 +674,7 @@ export async function runCdpTurn({
             }, sessionId);
             const observed = stateRes?.result?.value;
             if (observed && typeof observed.mode === "string" && observed.mode !== "unknown") {
-              geminiModeResult = { applied: false, already: observed.mode === "chat", mode: observed.mode, step: "observed", typedBeforeClick: null };
+              geminiModeResult = { applied: false, already: observed.mode === "chat", mode: observed.mode, step: "observed", typedBeforeClick: null, placeholderVerified: false, placeholder: typeof observed.placeholder === "string" ? observed.placeholder : null };
             }
           } catch {}
         }
