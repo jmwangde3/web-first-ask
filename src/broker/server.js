@@ -30,6 +30,12 @@ function computeRequestHash(turn, promptSha256) {
       turn.stallTimeoutMs ?? null,
       turn.hardTimeoutMs ?? null,
       turn.minIntervalMs ?? null,
+      // F1/F4: mode-affecting fields are part of the fingerprint, like
+      // mode/settleMs above. A retry of the same requestId with a different
+      // geminiMode or downloadDir is a different request (409), not a
+      // silent idempotent replay of the old turn.
+      turn.geminiMode ?? null,
+      turn.downloadDir ?? null,
     ]))
     .digest("hex");
 }
@@ -48,6 +54,8 @@ function restoreTurnFromResult(record, fallbackCreatedAt) {
     hardTimeoutMs: null,
     minIntervalMs: null,
     chromePath: null,
+    geminiMode: record.geminiMode ?? null,
+    downloadDir: record.downloadDir ?? null,
     createdAt: record.createdAt ?? record.finishedAt ?? fallbackCreatedAt,
     state: record.state,
     startedAt: record.startedAt ?? null,
@@ -77,6 +85,8 @@ function restoreTurnFromStore(record, fallbackCreatedAt) {
     hardTimeoutMs: null,
     minIntervalMs: null,
     chromePath: null,
+    geminiMode: record.geminiMode ?? null,
+    downloadDir: record.downloadDir ?? null,
     prompt: "",
     promptPreview: record.promptPreview ?? "",
     createdAt: record.createdAt ?? fallbackCreatedAt,
@@ -331,6 +341,13 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         ...(body.hardTimeoutMs !== undefined ? { hardTimeoutMs: body.hardTimeoutMs } : {}),
         ...(body.minIntervalMs !== undefined ? { minIntervalMs: body.minIntervalMs } : {}),
         ...(body.chromePath !== undefined ? { chromePath: body.chromePath } : {}),
+        // F1/F4: geminiMode and downloadDir used to be dropped here even
+        // though turns.js, runner.js and the engine all support them, so
+        // `--gemini-mode task` silently ran as Chat and `--download-dir`
+        // never reached the download capture. createTurn validates both
+        // (invalid values -> INVALID_ARGUMENT -> 400), never defaults them.
+        ...(body.geminiMode !== undefined ? { geminiMode: body.geminiMode } : {}),
+        ...(body.downloadDir !== undefined ? { downloadDir: body.downloadDir } : {}),
       });
       const promptSha256 = journal.hashPrompt(turn.prompt);
       let requestHash = null;

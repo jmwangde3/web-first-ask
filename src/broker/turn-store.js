@@ -74,6 +74,10 @@ export async function recordTurn(home, turn) {
     targetId: turn.targetId ?? null,
     reason: turn.reason ?? null,
     evidence: turn.evidence ?? null,
+    // F1/F4: persisted so a broker restart restores a queued turn with its
+    // mode/download target intact instead of silently dropping them.
+    geminiMode: turn.geminiMode ?? null,
+    downloadDir: turn.downloadDir ?? null,
     sendCommittedAt: turn.sendCommittedAt ?? null,
     createdAt: turn.createdAt ?? new Date().toISOString(),
     startedAt: turn.startedAt ?? null,
