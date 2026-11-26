@@ -251,6 +251,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
             : (turns.get(turn.id)?.targetId != null ? { targetId: turns.get(turn.id).targetId } : {})),
           ...(result?.sendCommittedAt != null ? { sendCommittedAt: result.sendCommittedAt } : {}),
           ...(result?.downloads != null ? { downloads: result.downloads } : {}),
+          ...(typeof result?.createdByWfa === "boolean" ? { createdByWfa: result.createdByWfa } : {}),
         });
         const current = turns.get(turn.id);
         if (current && current.state === "failed" && current.sendCommittedAt == null &&

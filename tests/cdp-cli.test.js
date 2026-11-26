@@ -1285,52 +1285,60 @@ test("wfa cdp login: off-origin ticks for two polls then on-origin success - exi
   assert.match(stdout.output, /waiting for the redirect to finish \(on auth\.openai\.com\)/);
 });
 
-test("wfa cdp login: 45s of off-origin ticks - Page.navigate sent once or twice, never more than twice", async () => {
-  const stdout = createMockStream();
-  const stderr = createMockStream();
-  let navigateCount = 0;
-  let virtualTime = 0;
-
-  const mockCdp = {
-    send: async (method) => {
-      if (method === "Runtime.evaluate") {
-        return {
-          result: {
-            value: {
-              loggedIn: false,
-              user: null,
-              title: "Sign in to OpenAI",
-              origin: "https://auth.openai.com",
-              offOrigin: true,
+test("wfa cdp login (D12): default leaves off-origin manual login untouched; --recover-off-origin opts in (max 2 navigates)", async () => {
+  const makeHarness = () => {
+    let navigateCount = 0;
+    let virtualTime = 0;
+    const mockCdp = {
+      send: async (method) => {
+        if (method === "Runtime.evaluate") {
+          return {
+            result: {
+              value: {
+                loggedIn: false,
+                user: null,
+                title: "Sign in to OpenAI",
+                origin: "https://auth.openai.com",
+                offOrigin: true,
+              },
             },
-          },
-        };
-      }
-      if (method === "Page.navigate") {
-        navigateCount++;
+          };
+        }
+        if (method === "Page.navigate") {
+          navigateCount++;
+          return {};
+        }
         return {};
-      }
-      return {};
-    },
-    close: () => {},
+      },
+      close: () => {},
+    };
+    return {
+      getNavigateCount: () => navigateCount,
+      deps: {
+        stdout: createMockStream(),
+        stderr: createMockStream(),
+        recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
+        connectCdp: async () => mockCdp,
+        driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
+        now: () => virtualTime,
+        sleep: async () => { virtualTime += 50000; },
+        pollIntervalMs: 1,
+        offOriginThresholdMs: 45000,
+      },
+    };
   };
 
-  const res = await runCdpCommand(["login", "--provider", "chatgpt", "--timeout", "150"], {
-    stdout,
-    stderr,
-    recoverBrowser: async () => ({ action: "ADOPT", chrome: { pid: 1, port: 9222 } }),
-    connectCdp: async () => mockCdp,
-    driver: { openTab: async () => ({ targetId: "t", sessionId: "s" }) },
-    now: () => virtualTime,
-    sleep: async () => {
-      virtualTime += 50000;
-    },
-    pollIntervalMs: 1,
-    offOriginThresholdMs: 45000,
-  });
+  // Default: never interrupt manual login with Page.navigate
+  const hDefault = makeHarness();
+  const resDefault = await runCdpCommand(["login", "--provider", "chatgpt", "--timeout", "150"], hDefault.deps);
+  assert.equal(resDefault.code, 1);
+  assert.equal(hDefault.getNavigateCount(), 0, "default login must never interrupt off-origin login");
 
-  assert.equal(res.code, 1);
-  assert.equal(navigateCount, 2, "Page.navigate attempted at most twice");
+  // Opt-in: --recover-off-origin navigates back at most twice
+  const hOptIn = makeHarness();
+  const resOptIn = await runCdpCommand(["login", "--provider", "chatgpt", "--timeout", "150", "--recover-off-origin"], hOptIn.deps);
+  assert.equal(resOptIn.code, 1);
+  assert.equal(hOptIn.getNavigateCount(), 2, "opt-in --recover-off-origin attempts Page.navigate at most twice");
 });
 
 test("wfa cdp login: on-origin false forever with 1s timeout - exit 1, no Browser.close, no navigate", async () => {

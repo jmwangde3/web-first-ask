@@ -832,7 +832,13 @@ export async function runCdpTurn({
               awaitPromise: true,
               returnByValue: true,
             }, sessionId);
-            createdCleanup = { status: delRes?.result?.value?.deleted ? "deleted" : "attempted", url: conversationUrl, createdByWfa: true };
+            const delVal = delRes?.result?.value;
+            const delOk = Boolean(delVal && (delVal.success === true || delVal.deleted === true));
+            createdCleanup = delOk
+              ? { status: "deleted", verified: delVal.verified ?? true, url: conversationUrl, createdByWfa: true }
+              : (delVal && delVal.success === false
+                ? { status: "failed", reason: delVal.reason || "delete_failed", url: conversationUrl, createdByWfa: true }
+                : { status: "attempted", url: conversationUrl, createdByWfa: true });
           } catch (cleanupErr) {
             createdCleanup = { status: "failed", reason: cleanupErr?.message || String(cleanupErr), url: conversationUrl, createdByWfa: true };
           }

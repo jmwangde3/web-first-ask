@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getHomeDir } from "../paths.js";
+import { isDebugEnabled, appendDebugIssue } from "../debug-log.js";
+import { pace as defaultPace } from "../browser/pacer.js";
 import { WfaError } from "../errors.js";
 import { recoverBrowser } from "../browser/recovery.js";
 import { connectCdp } from "../browser/cdp.js";
@@ -22,6 +24,7 @@ import { ensureBroker, createTurn, waitForTurn, waitForSubmission } from "../bro
 import { spawnDetachedBroker } from "../broker/cli.js";
 import { stageCdpResponse as defaultStageCdpResponse, extractFileBlocksToDir } from "./cdp-stage.js";
 import * as defaultResultStore from "../broker/result-store.js";
+import * as defaultTurnStore from "../broker/turn-store.js";
 import { expandAttachmentInputs } from "../attachments.js";
 import { readConversation as defaultReadConversation } from "./cdp-read.js";
 
@@ -54,6 +57,9 @@ const VALUE_FLAGS = new Set([
   "out",
   "input",
   "out-dir",
+  "repro",
+  "command",
+  "limit",
 ]);
 
 function parseArgs(argv) {
@@ -123,7 +129,8 @@ Commands:
                  [--provider <chatgpt|gemini>] [--mode background|visible|headless]
                  [--timeout <s>] [--wait <s>] [--no-reopen] [--json] [--out <path>]
   wfa cdp extract (--input <file> | --task-id <id>) --out-dir <dir> [--overwrite] [--json]
-  wfa cdp cleanup (--task-id <id> | --url <url> --provider <chatgpt|gemini|claude>) [--mode background|visible|headless] [--json]
+  wfa cdp cleanup (--task-id <id> | --url <url> --provider <chatgpt|gemini|claude> | --all | --keep-unfinished [--keep-named]) [--mode background|visible|headless] [--json]
+  wfa cdp log-issue --repro "<steps>" [--command "<cmd>"] [--provider <p>] [--task-id <id>] [--json]
   wfa cdp status [--json]
   wfa cdp login  [--provider <chatgpt|gemini|claude>] [--mode visible|background]
                  [--timeout <seconds>] [--json]
@@ -153,6 +160,11 @@ Options:
   --task-id <id>             Broker turn ID for wfa cdp read
   --wait <seconds>           Read-only observation window (default: 0)
   --no-reopen                Do not open a missing conversation tab
+  --recover-off-origin       Opt-in for wfa cdp login to navigate back after 45s off-origin (disabled by default)
+  --no-debug                 Disable automatic debug issue logging (debug mode is ON by default; or set WFA_DEBUG=0)
+  --limit <N>                Maximum conversations to delete in one bulk cleanup run
+  --include-unknown          Allow cleanup of legacy records with unknown createdByWfa (still refuses createdByWfa=false)
+  --dry-run                  Preview bulk cleanup candidates without opening Chrome or deleting
   --out <path>               Write captured answer text to a file
   --workspace <dir>          Target workspace root for staging (default: current directory)
   --help, -h                 Show this help message
@@ -288,6 +300,7 @@ async function handleLogin(argv, deps) {
     }
 
     const pollIntervalMs = deps.pollIntervalMs || 2000;
+    const recoverOffOrigin = Boolean(options["recover-off-origin"]);
     const offOriginThresholdMs = deps.offOriginThresholdMs ?? deps.stallMs ?? 45000;
     const startTime = nowFn();
     const deadline = startTime + timeoutSec * 1000;
@@ -379,14 +392,16 @@ async function handleLogin(argv, deps) {
               }
             }
 
-            if (offOriginSince === null) {
-              offOriginSince = nowFn();
-            } else if (nowFn() - offOriginSince >= offOriginThresholdMs && redirectAttempts < 2) {
-              redirectAttempts++;
-              offOriginSince = nowFn();
-              try {
-                await cdp.send("Page.navigate", { url: targetUrl }, sessionId);
-              } catch {}
+            if (recoverOffOrigin) {
+              if (offOriginSince === null) {
+                offOriginSince = nowFn();
+              } else if (nowFn() - offOriginSince >= offOriginThresholdMs && redirectAttempts < 2) {
+                redirectAttempts++;
+                offOriginSince = nowFn();
+                try {
+                  await cdp.send("Page.navigate", { url: targetUrl }, sessionId);
+                } catch {}
+              }
             }
           } else {
             offOriginSince = null;
@@ -1069,6 +1084,242 @@ async function handleExtract(argv, deps = {}) {
   return { code: 0, result: out };
 }
 
+function normalizeUrlKey(rawUrl) {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) return "";
+  try {
+    const u = new URL(rawUrl.trim());
+    return `${u.origin}${u.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return rawUrl.trim().replace(/\/+$/, "");
+  }
+}
+
+function isUnfinishedRecordState(record) {
+  const state = String(record?.state || record?.status || "").toLowerCase();
+  if (["queued", "running", "stalled", "needs_human", "takeover", "needs_user"].includes(state)) return true;
+  if (state === "failed" && record?.sendCommittedAt != null) return true;
+  return false;
+}
+
+export function parseDeleteEvalResult(evalRes) {
+  const val = evalRes?.result?.value;
+  if (val && (val.success === true || val.deleted === true)) {
+    return { status: "deleted", verified: val.verified ?? true };
+  }
+  if (val && val.success === false) {
+    return { status: "failed", reason: val.reason || "delete_failed" };
+  }
+  return { status: "attempted" };
+}
+
+export async function waitForNavigationReady(cdp, sessionId, targetUrl, {
+  timeoutMs = 15000,
+  pollMs = 200,
+  settleMs = 300,
+  sleepFn = defaultSleep,
+} = {}) {
+  let expectedPath = "";
+  try {
+    expectedPath = new URL(targetUrl).pathname.replace(/\/+$/, "");
+  } catch {
+    return { ready: false, reason: "invalid_target_url" };
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await cdp.send("Runtime.evaluate", {
+        expression: "({ readyState: document.readyState, pathname: location.pathname })",
+        returnByValue: true,
+      }, sessionId);
+      const val = res?.result?.value;
+      if (!val || typeof val.pathname !== "string") {
+        // Synthetic unit-test mock without DOM evaluation
+        await sleepFn(settleMs);
+        return { ready: true, synthetic: true };
+      }
+      const actualPath = val.pathname.replace(/\/+$/, "");
+      if ((actualPath === expectedPath || actualPath.startsWith(`${expectedPath}/`)) && val.readyState !== "loading") {
+        await sleepFn(settleMs);
+        return { ready: true, pathname: val.pathname, readyState: val.readyState };
+      }
+    } catch {
+      // Page context may be transiently destroyed during navigation; keep polling.
+    }
+    await sleepFn(pollMs);
+  }
+  return { ready: false, reason: "navigation_timeout" };
+}
+
+async function readConversationStoreCandidates(home) {
+  const out = [];
+  for (const prov of ["chatgpt", "gemini", "claude"]) {
+    const dir = path.join(home, "conversations", prov);
+    let files;
+    try {
+      files = await readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const rec = JSON.parse(await readFile(path.join(dir, file), "utf8"));
+        if (rec?.conversationUrl) {
+          out.push({
+            turnId: null,
+            provider: prov,
+            conversationId: rec.conversationId || null,
+            conversationUrl: rec.conversationUrl,
+            createdByWfa: true,
+            state: "completed",
+            source: "conversation-store",
+          });
+        }
+        if (Array.isArray(rec?.retired)) {
+          for (const item of rec.retired) {
+            if (item?.conversationUrl && item.cleanupStatus !== "deleted") {
+              out.push({
+                turnId: null,
+                provider: prov,
+                conversationId: rec.conversationId || null,
+                conversationUrl: item.conversationUrl,
+                createdByWfa: true,
+                state: "completed",
+                source: "conversation-store:retired",
+              });
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+  return out;
+}
+
+async function readLegacySessionsCandidates(home) {
+  const out = [];
+  try {
+    const raw = JSON.parse(await readFile(path.join(home, "sessions.json"), "utf8"));
+    const workspaces = raw?.workspaces;
+    if (workspaces && typeof workspaces === "object") {
+      for (const [ws, providers] of Object.entries(workspaces)) {
+        if (!providers || typeof providers !== "object") continue;
+        for (const [prov, url] of Object.entries(providers)) {
+          if (typeof url === "string" && url.trim()) {
+            out.push({
+              turnId: null,
+              provider: String(prov).toLowerCase(),
+              conversationId: ws,
+              conversationUrl: url.trim(),
+              createdByWfa: null,
+              state: "completed",
+              source: "sessions.json",
+            });
+          }
+        }
+      }
+    }
+  } catch {}
+  return out;
+}
+
+export async function collectCleanupCandidates(home, deps = {}) {
+  const readResultsFn = deps.resultStore?.readResults || deps.readResults || defaultResultStore.readResults;
+  const readTurnsFn = deps.turnStore?.readTurns || deps.readTurns || defaultTurnStore.readTurns;
+  const results = await readResultsFn(home).catch(() => []);
+  const turns = deps.resultStore?.readResults || deps.readResults
+    ? (deps.turnStore?.readTurns || deps.readTurns ? await readTurnsFn(home).catch(() => []) : [])
+    : await readTurnsFn(home).catch(() => []);
+  const convSessions = deps.resultStore?.readResults || deps.readResults
+    ? (deps.readConversationCandidates ? await deps.readConversationCandidates(home) : [])
+    : await readConversationStoreCandidates(home);
+  const legacySessions = deps.resultStore?.readResults || deps.readResults
+    ? (deps.readLegacySessions ? await deps.readLegacySessions(home) : [])
+    : await readLegacySessionsCandidates(home);
+
+  const allRaw = [
+    ...(Array.isArray(results) ? results.map((r) => ({ ...r, source: r.source || "turns/results" })) : []),
+    ...(Array.isArray(turns) ? turns.map((r) => ({ ...r, source: r.source || "turns/records" })) : []),
+    ...(Array.isArray(convSessions) ? convSessions : []),
+    ...(Array.isArray(legacySessions) ? legacySessions : []),
+  ];
+
+  // Deduplicate by normalized conversationUrl; keep records without URL separate so they are reported as skipped.
+  const byUrl = new Map();
+  const withoutUrl = [];
+  for (const rec of allRaw) {
+    const key = normalizeUrlKey(rec?.conversationUrl);
+    if (!key) {
+      withoutUrl.push(rec);
+      continue;
+    }
+    const existing = byUrl.get(key);
+    if (!existing) {
+      byUrl.set(key, { ...rec });
+      continue;
+    }
+    // Conservative merge:
+    // - createdByWfa: false always wins; else true wins over null/undefined.
+    let mergedCreated = existing.createdByWfa;
+    if (existing.createdByWfa === false || rec.createdByWfa === false) mergedCreated = false;
+    else if (existing.createdByWfa === true || rec.createdByWfa === true) mergedCreated = true;
+
+    // - state: any unfinished state wins over completed so --keep-unfinished never deletes active/stalled sessions.
+    let mergedState = existing.state || existing.status;
+    let mergedSendCommittedAt = existing.sendCommittedAt ?? rec.sendCommittedAt ?? null;
+    if (isUnfinishedRecordState(rec) && !isUnfinishedRecordState(existing)) {
+      mergedState = rec.state || rec.status;
+      mergedSendCommittedAt = rec.sendCommittedAt ?? mergedSendCommittedAt;
+    }
+
+    byUrl.set(key, {
+      ...existing,
+      turnId: existing.turnId || existing.id || rec.turnId || rec.id || null,
+      provider: existing.provider || rec.provider || null,
+      conversationId: existing.conversationId || rec.conversationId || null,
+      createdByWfa: mergedCreated,
+      state: mergedState,
+      sendCommittedAt: mergedSendCommittedAt,
+    });
+  }
+
+  return [...byUrl.values(), ...withoutUrl];
+}
+
+export function classifyCleanupCandidate(record, {
+  all = false,
+  keepUnfinished = false,
+  keepNamed = false,
+  force = false,
+  includeUnknown = false,
+} = {}) {
+  if (!record || typeof record !== "object") return { eligible: false, reason: "invalid_record" };
+  if (record.createdByWfa === false) return { eligible: false, reason: "preexisting_conversation" };
+  if (record.createdByWfa !== true && !includeUnknown) {
+    return { eligible: false, reason: "created_by_wfa_unknown" };
+  }
+  if (!record.conversationUrl) return { eligible: false, reason: "missing_url" };
+
+  const state = String(record.state || record.status || "").toLowerCase();
+  const isActive = state === "queued" || state === "running";
+  if (isActive && !force) return { eligible: false, reason: "active_turn" };
+
+  if (keepNamed && record.conversationId) {
+    return { eligible: false, reason: "named_conversation_preserved" };
+  }
+
+  if (all) return { eligible: true, reason: "all" };
+
+  if (keepUnfinished) {
+    const isFinished = state === "completed" || (state === "failed" && record.sendCommittedAt == null);
+    return isFinished
+      ? { eligible: true, reason: "finished" }
+      : { eligible: false, reason: `unfinished:${state || "unknown"}` };
+  }
+  return { eligible: true, reason: "explicit" };
+}
+
 async function handleCleanup(argv, deps = {}) {
   const stdout = deps.stdout || process.stdout;
   const home = deps.home || getHomeDir();
@@ -1078,10 +1329,177 @@ async function handleCleanup(argv, deps = {}) {
     return { code: 0 };
   }
 
+  const bulkAll = Boolean(options.all);
+  const bulkKeepUnfinished = Boolean(options["keep-unfinished"]);
+  const includeUnknown = Boolean(options["include-unknown"]);
+  if (bulkAll || bulkKeepUnfinished) {
+    const records = await collectCleanupCandidates(home, deps);
+    const keepNamed = Boolean(options["keep-named"]);
+    const force = Boolean(options.force);
+    const dryRun = Boolean(options["dry-run"]);
+    let limit = null;
+    if (options.limit !== undefined) {
+      const parsedLimit = Number(options.limit);
+      if (!Number.isInteger(parsedLimit) || parsedLimit <= 0) {
+        throw new WfaError("INVALID_ARGUMENT", "Option --limit must be a positive integer.");
+      }
+      limit = parsedLimit;
+    }
+
+    const selected = [];
+    const skipped = [];
+    for (const rec of records) {
+      const decision = classifyCleanupCandidate(rec, {
+        all: bulkAll,
+        keepUnfinished: bulkKeepUnfinished,
+        keepNamed,
+        force,
+        includeUnknown,
+      });
+      if (decision.eligible) selected.push(rec);
+      else skipped.push({ turnId: rec?.turnId || rec?.id || null, url: rec?.conversationUrl || null, source: rec?.source || null, reason: decision.reason });
+    }
+
+    const batchSlice = limit != null ? selected.slice(0, limit) : selected;
+    if (limit != null && selected.length > limit) {
+      for (const rec of selected.slice(limit)) {
+        skipped.push({ turnId: rec?.turnId || rec?.id || null, url: rec?.conversationUrl || null, source: rec?.source || null, reason: "limit_exceeded" });
+      }
+    }
+
+    if (dryRun) {
+      const preview = {
+        mode: bulkAll ? "all" : "keep-unfinished",
+        dryRun: true,
+        totalCandidates: records.length,
+        eligibleCount: batchSlice.length,
+        skippedCount: skipped.length,
+        eligible: batchSlice.map((r) => ({
+          turnId: r.turnId || r.id || null,
+          provider: r.provider || null,
+          url: r.conversationUrl,
+          createdByWfa: r.createdByWfa ?? null,
+          source: r.source || null,
+        })),
+        skipped,
+      };
+      if (options.json) stdout.write(`${JSON.stringify(preview, null, 2)}\n`);
+      else stdout.write(`[cleanup] dry-run mode=${preview.mode} eligible=${preview.eligibleCount} skipped=${preview.skippedCount}\n`);
+      return { code: 0, result: preview };
+    }
+
+    const cleaned = [];
+    const actionable = [];
+    for (const rec of batchSlice) {
+      const prov = rec.provider ? String(rec.provider).toLowerCase() : null;
+      const adapter = prov ? ((deps.adapters && deps.adapters[prov]) || DEFAULT_ADAPTERS[prov]) : null;
+      if (!adapter || typeof adapter.buildDeleteConversationJs !== "function") {
+        cleaned.push({
+          turnId: rec.turnId || rec.id || null,
+          status: "skipped",
+          reason: "adapter_delete_not_supported",
+          provider: prov,
+          url: rec.conversationUrl,
+        });
+      } else {
+        actionable.push({ rec, prov, adapter });
+      }
+    }
+
+    if (actionable.length > 0) {
+      const recoverFn = deps.recoverBrowser || recoverBrowser;
+      const connectFn = deps.connectCdp || connectCdp;
+      const driver = deps.driver || defaultDriver;
+      const paceFn = deps.pace || defaultPace;
+      const sleepFn = deps.sleep || defaultSleep;
+      const waitNavFn = deps.waitForNavigationReady || waitForNavigationReady;
+      const mode = options.mode ? String(options.mode).toLowerCase() : "background";
+      const browserRec = await recoverFn({ home, mode, probes: deps.probes });
+      if (!browserRec?.chrome?.port) {
+        throw new WfaError("BROWSER_UNAVAILABLE", "Chrome is not available for conversation cleanup.");
+      }
+
+      let cdp = null;
+      let tab = null;
+      try {
+        cdp = await connectFn(browserRec.chrome.port);
+        // Open ONE single tab for the entire cleanup batch and navigate sequentially within it.
+        tab = await driver.openTab(cdp, actionable[0].rec.conversationUrl, { timeoutMs: 15000 });
+        for (let i = 0; i < actionable.length; i += 1) {
+          const { rec, prov, adapter } = actionable[i];
+          if (i > 0) {
+            // Batch pacing: 4-6s random between bulk deletions (requirement #23 / D11)
+            await paceFn("batch");
+            await cdp.send("Page.navigate", { url: rec.conversationUrl }, tab.sessionId);
+            const nav = await waitNavFn(cdp, tab.sessionId, rec.conversationUrl, { timeoutMs: 15000, sleepFn });
+            if (!nav?.ready) {
+              cleaned.push({
+                turnId: rec.turnId || rec.id || null,
+                status: "failed",
+                reason: nav?.reason || "navigation_timeout",
+                provider: prov,
+                url: rec.conversationUrl,
+              });
+              continue;
+            }
+          }
+          try {
+            const expr = adapter.buildDeleteConversationJs(rec.conversationUrl);
+            const evalRes = await cdp.send("Runtime.evaluate", {
+              expression: expr,
+              awaitPromise: true,
+              returnByValue: true,
+            }, tab.sessionId);
+            const parsed = parseDeleteEvalResult(evalRes);
+            cleaned.push({
+              turnId: rec.turnId || rec.id || null,
+              ...parsed,
+              provider: prov,
+              url: rec.conversationUrl,
+            });
+          } catch (err) {
+            cleaned.push({
+              turnId: rec.turnId || rec.id || null,
+              status: "failed",
+              reason: err?.message || String(err),
+              provider: prov,
+              url: rec.conversationUrl,
+            });
+          }
+        }
+      } finally {
+        if (cdp && tab?.targetId && typeof driver.closeTab === "function") {
+          try { await driver.closeTab(cdp, tab.targetId); } catch {}
+        }
+        if (cdp && typeof cdp.close === "function") {
+          try { cdp.close(); } catch {}
+        }
+      }
+    }
+
+    const deletedCount = cleaned.filter((c) => c.status === "deleted").length;
+    const failedCount = cleaned.filter((c) => c.status === "failed").length;
+    const attemptedCount = cleaned.filter((c) => c.status === "attempted").length;
+    const summary = {
+      mode: bulkAll ? "all" : "keep-unfinished",
+      totalCandidates: records.length,
+      cleanedCount: deletedCount,
+      deletedCount,
+      failedCount,
+      attemptedCount,
+      skippedCount: skipped.length,
+      cleaned,
+      skipped,
+    };
+    if (options.json) stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+    else stdout.write(`[cleanup] mode=${summary.mode} deleted=${deletedCount} failed=${failedCount} attempted=${attemptedCount} skipped=${summary.skippedCount}\n`);
+    return { code: 0, result: summary };
+  }
+
   const hasTaskId = typeof options["task-id"] === "string" && options["task-id"].trim().length > 0;
   const hasUrl = typeof options.url === "string" && options.url.trim().length > 0;
   if (hasTaskId === hasUrl) {
-    throw new WfaError("INVALID_ARGUMENT", "Specify exactly one of --task-id <id> or --url <url>.");
+    throw new WfaError("INVALID_ARGUMENT", "Specify --task-id <id>, --url <url>, --all, or --keep-unfinished.");
   }
 
   let provider = options.provider ? String(options.provider).trim().toLowerCase() : null;
@@ -1095,6 +1513,9 @@ async function handleCleanup(argv, deps = {}) {
     }
     if (rec.createdByWfa === false) {
       throw new WfaError("REFUSE_PREEXISTING_CONVERSATION", "Refusing to delete a pre-existing conversation not created by wfa.");
+    }
+    if (rec.createdByWfa !== true && !includeUnknown) {
+      throw new WfaError("REFUSE_UNKNOWN_ORIGIN", "Conversation createdByWfa is unknown; pass --include-unknown to delete.");
     }
     provider = provider || (rec.provider ? String(rec.provider).toLowerCase() : null);
     targetUrl = rec.conversationUrl || null;
@@ -1135,8 +1556,8 @@ async function handleCleanup(argv, deps = {}) {
       awaitPromise: true,
       returnByValue: true,
     }, tab.sessionId);
-    const deleted = Boolean(evalRes?.result?.value?.deleted);
-    const out = { status: deleted ? "deleted" : "attempted", provider, url: targetUrl };
+    const parsed = parseDeleteEvalResult(evalRes);
+    const out = { ...parsed, provider, url: targetUrl };
     if (options.json) stdout.write(`${JSON.stringify(out, null, 2)}\n`);
     else stdout.write(`[cleanup] ${out.status}: ${targetUrl}\n`);
     return { code: 0, result: out };
@@ -1148,6 +1569,35 @@ async function handleCleanup(argv, deps = {}) {
       try { cdp.close(); } catch {}
     }
   }
+}
+
+async function handleLogIssue(argv, deps = {}) {
+  const stdout = deps.stdout || process.stdout;
+  const home = deps.home || getHomeDir();
+  const { options } = parseArgs(argv);
+  if (options.help) {
+    printCdpHelp(stdout);
+    return { code: 0 };
+  }
+  const repro = typeof options.repro === "string" ? options.repro.trim() : "";
+  if (!repro) {
+    throw new WfaError("INVALID_ARGUMENT", "Option --repro <steps> is required.");
+  }
+  const entry = await appendDebugIssue({
+    home,
+    command: typeof options.command === "string" ? options.command.trim() : "",
+    provider: typeof options.provider === "string" ? options.provider.trim().toLowerCase() : "",
+    taskId: typeof options["task-id"] === "string" ? options["task-id"].trim() : "",
+    conversationUrl: typeof options.url === "string" ? options.url.trim() : "",
+    status: "agent_reported",
+    repro,
+  });
+  if (options.json) {
+    stdout.write(`${JSON.stringify(entry, null, 2)}\n`);
+  } else {
+    stdout.write(`[debug] issue logged to ${entry.path}\n`);
+  }
+  return { code: 0, result: entry };
 }
 
 export function isRepoUnreadableResponse(text) {
@@ -1193,35 +1643,79 @@ export async function runCdpCommand(argv = [], deps = {}) {
   }
 
   const subcmd = argv[0];
-  if (!subcmd || !["ask", "read", "extract", "cleanup", "status", "login"].includes(subcmd)) {
-    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|read|extract|cleanup|status|login>\n`);
+  if (!subcmd || !["ask", "read", "extract", "cleanup", "log-issue", "status", "login"].includes(subcmd)) {
+    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|read|extract|cleanup|log-issue|status|login>\n`);
     return { code: 2 };
   }
 
+  const debugOpts = {
+    "no-debug": argv.includes("--no-debug"),
+    debug: argv.includes("--debug") ? true : undefined,
+  };
+  const debugOn = deps.debugLog !== false && isDebugEnabled(debugOpts);
+  const debugHome = deps.home || getHomeDir();
+  const safeCommand = `wfa cdp ${argv.join(" ")}`.slice(0, 300);
+
+  const maybeLogFailure = async ({ status = "", errorCode = "", message = "", result = null, details = null } = {}) => {
+    if (!debugOn || subcmd === "log-issue") return;
+    const logged = await appendDebugIssue({
+      home: debugHome,
+      command: safeCommand,
+      status: status || result?.status || result?.state || "",
+      errorCode: errorCode || result?.reason || "",
+      message,
+      provider: result?.provider || "",
+      taskId: result?.id || result?.taskId || "",
+      conversationUrl: result?.conversationUrl || "",
+      details,
+    });
+    if (logged.logged) {
+      stderr.write(`[debug] issue logged to ${logged.path}\n`);
+    }
+  };
+
   try {
+    let outcome;
     if (subcmd === "status") {
       const { options } = parseArgs(argv.slice(1));
       if (options.help) {
         printCdpHelp(stdout);
         return { code: 0 };
       }
-      return await handleStatus(options, deps);
-    }
-    if (subcmd === "login") {
+      outcome = await handleStatus(options, deps);
+    } else if (subcmd === "login") {
       const loginFn = deps.runCdpLogin || handleLogin;
-      return await loginFn(argv.slice(1), deps);
+      outcome = await loginFn(argv.slice(1), deps);
+    } else if (subcmd === "read") {
+      outcome = await handleRead(argv.slice(1), deps);
+    } else if (subcmd === "extract") {
+      outcome = await handleExtract(argv.slice(1), deps);
+    } else if (subcmd === "cleanup") {
+      outcome = await handleCleanup(argv.slice(1), deps);
+    } else if (subcmd === "log-issue") {
+      outcome = await handleLogIssue(argv.slice(1), deps);
+    } else {
+      outcome = await handleAsk(argv.slice(1), deps);
     }
-    if (subcmd === "read") return await handleRead(argv.slice(1), deps);
-    if (subcmd === "extract") return await handleExtract(argv.slice(1), deps);
-    if (subcmd === "cleanup") return await handleCleanup(argv.slice(1), deps);
-    return await handleAsk(argv.slice(1), deps);
+    if (outcome && outcome.code !== 0) {
+      await maybeLogFailure({
+        status: outcome.result?.status || outcome.result?.state || "nonzero_exit",
+        errorCode: outcome.error?.code || outcome.result?.reason || "",
+        message: outcome.error?.message || "",
+        result: outcome.result || null,
+        details: outcome.error?.details || outcome.result?.evidence || null,
+      });
+    }
+    return outcome;
   } catch (error) {
     if (error instanceof WfaError) {
       stderr.write(`wfa: ${error.code}: ${error.message}\n`);
+      await maybeLogFailure({ errorCode: error.code, message: error.message, details: error.details || null });
       return { code: 1, error };
     }
     const message = error instanceof Error ? error.message : String(error);
     stderr.write(`wfa: ${message}\n`);
+    await maybeLogFailure({ errorCode: error?.code || "UNEXPECTED_ERROR", message });
     return { code: 1, error };
   }
 }

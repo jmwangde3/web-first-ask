@@ -71,6 +71,7 @@ export async function recordTurn(home, turn) {
     mode: turn.mode ?? "background",
     state: turn.state,
     conversationUrl: turn.conversationUrl ?? null,
+    createdByWfa: typeof turn.createdByWfa === "boolean" ? turn.createdByWfa : null,
     targetId: turn.targetId ?? null,
     reason: turn.reason ?? null,
     evidence: turn.evidence ?? null,
