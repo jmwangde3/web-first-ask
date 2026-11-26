@@ -38,10 +38,11 @@ problem, not a product failure; file-by-file runs all exit 0.
 |---|---|---|
 | D1 | **pass** | `--no-wait`; broker pid 29816 unchanged at t+35 s; `read --task-id` returned `completed` ("R"). |
 | D2 | **pass** | target tab absent → first `read --url` returned `completed` in 7.5 s, 976 chars, `userTurns=2`. |
-| D3 | **pass (fail-closed)** | `--file d3-probe.zip` → `ATTACH_UPLOAD_FAILED` in 8.2 s, `chipCount=1`, no submission (`sendCommittedAt` absent). Meets the second acceptable outcome. |
+| D3 | **fail (UI layer)** | `--file d3-attachment.txt` → `ATTACH_UPLOAD_FAILED` in 9.3 s, chip not visible within 7000 ms, diagnostics `{"inputFiles":[],"chipCount":1}`; broker accepted `--file` and created the turn (no more `NO_ATTACHMENT_SEEN`). Root cause still unestablished from code — see the D3 status line for the exact live probe. This round (2026-11-26, fix round 3): the failure is now self-diagnosing (`setterInputFiles` read-back immediately after the setter + full diag in the message) and `scripts/d3-live-probe.mjs` ships the probe. |
 | D4 | not run this round | last run on 2026-11-26 11:2x passed (11,909 chars from Gemini). |
-| D5 | **fail — reproduced** | run1: page finished at **29,970 chars** (title "分布式链路追踪解析与实战"), `stopVisible=false`, but the CLI waited to the **900 s** hard timeout and printed `TIMEOUT`. run2 hit Google `/sorry` and was stopped. `WFA_PAUSE_EVENTS_DIR` produced **no files**. |
-| F1 | **fail** | `geminiMode: "task"` now reaches the turn record, but twice failed at ~0.7–3 s with `gemini_mode_failed: task_mode_control_not_found`. DOM probe on the same browser shows the selector is correct (`gem-segmented-button-row[role=group]` exists, Chat/Task buttons present) — the control renders **after** `waitForEditor`, and `ensureProviderMode` checks only once. **Fix (2026-11-26, branch `fix/f1-task-mode-poll`, unpushed):** bounded 5 s / 100 ms in-page poll for the Task control (`button.gem-segmented-button-action` with Task text added as a second lookup; proven segment selector unchanged), click, then verify `aria-pressed="true"` and placeholder `Describe a task` before proceeding; still fail-closed (`task_mode_control_not_found` / new `task_mode_placeholder_not_confirmed`) with `GEMINI_MODE_FAILED` before typing. Awaiting live re-verification on Windows. |
+| D5 | **pass (a) / not live-verified (b)** | (a) `completed_stale_pending` at **453 s**, 14,385 chars, `pendingCount=368` frozen, `modelTextChars=14397`, stable ~420 s — the stale-pending fix works live. (b) Pause pairing NOT live-verified: the broker was started **without** `WFA_PAUSE_EVENTS_DIR`, so `d5-pauses/` was empty (env is read in the broker process, `cdp-engine.js:1006`); unit tests only. See the D5 status line for the runbook correction. |
+| F1 | **fail** | 3/3 `task_mode_placeholder_not_confirmed`. DOM timeline: click succeeds (`aria-pressed` flips at ~2.09 s) but the placeholder shows intermediate "Type @ for connectors, skills and more" 2.4–5.0 s and only becomes "Describe a task" after the ask ends — the 2 s confirm window was too short. **Fix (2026-11-26, fix round 3):** placeholder poll bound 2000 → 5000 ms (100 ms poll, no fixed sleep); intermediate text explicitly never accepted; still fail-closed. Awaiting live re-verification. Caveat: the timeline proves the intermediate persisted *through* 5.0 s, not that it settles *by* 5.0 s. |
+| D10 | **awaiting user design decision** | Every launch passes hardcoded `--restore-last-session` (`launch.js:66`); one launch restored 19 tabs (9 Gemini) and every Gemini navigation went to `/sorry`. User counter-evidence (2026-11-26 17:02): a manually launched Chrome **without** the flag still shows ChatGPT logged in — the "removing the flag breaks login" claim is contested. See the D10 status line. |
 | F4 | **pass** | `--download-dir` captured `sample.csv` (6 B); turn record carries `downloads[]` with path, size, sha256, provider, downloadedAt. CLI stdout does not print the field. |
 | F7 | **pass** | `wfa cdp cleanup --dry-run --json` listed 35 sessions / 2 candidates; filtered dry-run (`--provider gemini --conversation-id d9-muse-20261126`) listed exactly 1; real run deleted it in 2.7 s. |
 | F5 / F8 / F9 | not re-run this round | unchanged from the previous round. |
@@ -365,6 +366,22 @@ two-sample confirmation) untouched; regression tests in
 small-text / stop-visible negatives). Live re-verification: single run after ≥30 min
 cooldown with restored tabs cleared, D4 re-verified in the same round, serial.
 
+**Status (2026-11-26, live result REPORT-8ead8b4b): (a) PASS, (b) not live-verified
+— runbook correction, no code change.** (a) The stale-pending fix works live:
+`completed_stale_pending` at 453 s, 14,385 chars, `pendingCount=368` frozen,
+`modelTextChars=14397`, stable ~420 s. (b) Pause pairing was NOT live-verified:
+the broker was started **without** `WFA_PAUSE_EVENTS_DIR`, so `d5-pauses/` was
+empty and no pause events were recorded — the env is read in the **broker**
+process (`src/engines/cdp-engine.js:1006`), so exporting it only in the shell
+that runs `wfa cdp ask` does nothing if the broker was already started
+elsewhere. Runbook correction for the next live run: start (or restart) the
+broker itself with `WFA_PAUSE_EVENTS_DIR` set, e.g.
+`$env:WFA_PAUSE_EVENTS_DIR = "<EV>/d5-pauses"; wfa broker start`, and confirm
+`<EV>/d5-pauses/<requestId>.jsonl` exists before the run; then run
+`node scripts/summarize-pauses.mjs d5-pauses\*.jsonl` and check no open pause
+exceeds 600 s and any timed-out pause appears as a paired `pause_end` with
+`reason: "pause_timeout"`. (b) remains unit-test-only until that run.
+
 **Measured 2026-11-25.** With the window hidden (`visibility=hidden`):
 
 - `.pending` stayed at 378 for more than five minutes with no text change;
@@ -498,6 +515,19 @@ broker restarts amplify it.
 that still restored 19 tabs, and `ask` runs at 15:25:5x / 15:30:5x plus probes at 15:31 were redirected to
 `/sorry` (landing page and `/app/ceeb4b6cc5ca503d` alike). Run record:
 `reverdict/live-tests/20261126-1520-neon-hotfix/REPORT.md`.
+
+**Status (2026-11-26): evidence only, awaiting the user's design decision — no
+code change, no tests.** Removing the flag breaks ChatGPT persistence per the
+repo's own reasoning, but that claim is now **contested, not verified**: the
+user reports (2026-11-26 17:02) that a manually launched Chrome **without**
+`--restore-last-session` still shows ChatGPT logged in. Likely explanations:
+the profile's "Continue where you left off" setting (set via Chrome UI)
+restores session cookies without the flag, an unclean last exit also preserves
+them, or ChatGPT re-authenticates from a persistent token. Decisive check
+pending (user side): `chrome://settings/onStartup` value + whether `oai-asli`
+is present after a clean no-flag relaunch. If login survives that, the fix
+may be simply dropping the flag, not a config option / per-provider profiles.
+Do not implement any D10 fix until that decision lands.
 
 ---
 
