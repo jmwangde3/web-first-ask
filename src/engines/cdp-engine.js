@@ -848,8 +848,15 @@ export async function runCdpTurn({
         if (typeof deps.onSendIntent === "function") {
           const intentTime = Date.now();
           try {
+            // The journal records the SEND INTENT (an orphan /
+            // reconciliation record: a later crash must not auto-resend
+            // a prompt whose submission is uncertain). It is not proof
+            // the prompt landed, so it no longer stamps submittedAt:
+            // F1 (2026-11-26, live REPORT-5b3e91ee.md) stamped intent
+            // time here, so a no-op click still produced sendCommittedAt
+            // and the CLI warned "prompt was already sent". submittedAt
+            // is set only from submitTurn's verified return below.
             await deps.onSendIntent({ provider: normalizedProvider, prompt, submittedAt: intentTime });
-            submittedAt = intentTime;
           } catch (intentErr) {
             return { intentError: intentErr, journalFailed: true };
           }
@@ -863,9 +870,17 @@ export async function runCdpTurn({
           err.code = "CANCELLED";
           throw err;
         }
-        if (!submittedAt) submittedAt = Date.now();
         try {
-          await driver.submitTurn(cdp, sessionId, adapter);
+          const submitResult = await driver.submitTurn(cdp, sessionId, adapter);
+          // submitTurn only returns once the send verifiably landed
+          // (driver verifies editor-empty / new user turn); stamp the
+          // commit from its return, never from intent time. On any
+          // submit error submittedAt stays null, so the turn record
+          // carries no sendCommittedAt and the CLI never claims the
+          // prompt was sent. The journal orphan is untouched here:
+          // onSendAborted runs only for the proven-no-click errors
+          // below, so an uncertain submission still blocks auto-resend.
+          submittedAt = submitResult?.submittedAt ?? Date.now();
         } catch (submitErr) {
           if (["SEND_BUTTON_MISSING", "SEND_BUTTON_DISABLED", "SEND_BUTTON_AMBIGUOUS"].includes(submitErr?.code)) {
             if (typeof deps.onSendAborted === "function") {

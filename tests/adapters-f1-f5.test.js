@@ -465,6 +465,38 @@ test("F1 engine: Task pressed but the placeholder unconfirmed fails closed befor
   });
 });
 
+test("F1 engine: SEND_UNCONFIRMED carries no sendCommittedAt; the intent journal is kept, not cleared", async () => {
+  // Live 2026-11-26 (REPORT-5b3e91ee.md): the click was a no-op, yet the
+  // turn record carried sendCommittedAt and the CLI warned "prompt was
+  // already sent". submittedAt is stamped only from submitTurn's verified
+  // return now, so an unconfirmed send must not claim a commit — while
+  // the intent journal stays in place (no onSendAborted), so the
+  // uncertain prompt still blocks any auto-resend.
+  await withTempDir(async (home) => {
+    const { deps, counters } = makeEngineHarness({});
+    const journal = { intents: 0, aborts: 0 };
+    deps.onSendIntent = async () => { journal.intents += 1; };
+    deps.onSendAborted = async () => { journal.aborts += 1; };
+    deps.driver.submitTurn = async () => {
+      counters.submitted += 1;
+      throw Object.assign(
+        new Error("Send button clicked but no user turn appeared"),
+        { code: "SEND_UNCONFIRMED" }
+      );
+    };
+    const result = await runCdpTurn({
+      provider: "gemini", prompt: "run the checks", home, deps,
+    });
+    assert.equal(result.status, "needs_human");
+    assert.equal(result.reason, "send_unconfirmed");
+    assert.equal(result.sendCommittedAt, undefined);
+    assert.equal("sendCommittedAt" in result, false);
+    assert.equal(counters.submitted, 1);
+    assert.equal(journal.intents, 1, "the send intent is still journaled");
+    assert.equal(journal.aborts, 0, "an uncertain send is never cleared as aborted");
+  });
+});
+
 test("F1 engine: gemini chat mode performs no toggle evaluation", async () => {
   await withTempDir(async (home) => {
     const { deps, evaluated } = makeEngineHarness({

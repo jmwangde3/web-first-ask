@@ -1366,6 +1366,11 @@ test("submitTurn: polls sendSelector and clicks enabled button", async () => {
           clickTriggered = true;
           return { result: { value: { clicked: true } } };
         }
+        if (params.expression.includes("userTurns")) {
+          // Post-click ACK read: the page clears the editor and renders
+          // the user turn once the click lands.
+          return { result: { value: JSON.stringify({ userTurns: clickTriggered ? 1 : 0, answerTurns: 0, answerText: "", stopVisible: false, editorEmpty: clickTriggered }) } };
+        }
         return { result: { value: { exists: true, visible: true, disabled: false } } };
       }
       return {};
@@ -1596,6 +1601,9 @@ test("T3: submitTurn handles hidden vs visible buttons and rejects SEND_BUTTON_A
           clickCount++;
           return { result: { value: { clicked: true } } };
         }
+        if (params.expression.includes("userTurns")) {
+          return { result: { value: JSON.stringify({ userTurns: clickCount > 0 ? 1 : 0, answerTurns: 0, answerText: "", stopVisible: false, editorEmpty: clickCount > 0 }) } };
+        }
         return { result: { value: { exists: true, visible: true, disabled: false } } };
       }
       return {};
@@ -1711,6 +1719,9 @@ test("ChatGPT adapter: sendSelector matches single submit button in composer for
           clickTriggered = true;
           return { result: { value: { clicked: true } } };
         }
+        if (params.expression.includes("userTurns")) {
+          return { result: { value: JSON.stringify({ userTurns: clickTriggered ? 1 : 0, answerTurns: 0, answerText: "", stopVisible: false, editorEmpty: clickTriggered }) } };
+        }
         assert.ok(params.expression.includes(JSON.stringify(chatgptAdapter.sendSelector)));
         return { result: { value: { exists: true, visible: true, disabled: false, enabledCount: 1 } } };
       }
@@ -1738,6 +1749,9 @@ test("Gemini adapter: sendSelector targets the aria-labelled send button", async
           clickTriggered = true;
           return { result: { value: { clicked: true } } };
         }
+        if (params.expression.includes("userTurns")) {
+          return { result: { value: JSON.stringify({ userTurns: clickTriggered ? 1 : 0, answerTurns: 0, answerText: "", stopVisible: false, editorEmpty: clickTriggered }) } };
+        }
         assert.ok(params.expression.includes(JSON.stringify(geminiAdapter.sendSelector)));
         return { result: { value: { exists: true, visible: true, disabled: false, enabledCount: 1 } } };
       }
@@ -1749,6 +1763,88 @@ test("Gemini adapter: sendSelector targets the aria-labelled send button", async
   assert.equal(res.method, "click");
   assert.equal(clickTriggered, true);
   assert.ok(typeof res.submittedAt === "number");
+});
+
+test("F1 Task mode: a no-op send-button click falls back to Enter and the user turn appears", async () => {
+  // Live 2026-11-26 (REPORT-5b3e91ee.md): Task mode applied (aria-pressed
+  // + "Describe a task"), the send button existed and was enabled, yet the
+  // editor still held the prompt and user-query stayed 0 after the click —
+  // pre-fix submitTurn still returned success. The fake reproduces that:
+  // .click() on the matched button is a no-op, Enter in the editor submits.
+  let clicks = 0;
+  let keyEvents = 0;
+  let userTurns = 0;
+  let editorEmpty = false;
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Input.dispatchKeyEvent") {
+        keyEvents++;
+        if (params.type === "keyDown" && params.key === "Enter") {
+          userTurns = 1;
+          editorEmpty = true;
+        }
+        return {};
+      }
+      if (method === "Runtime.evaluate") {
+        const expression = String(params.expression || "");
+        if (expression.includes("btn.click()")) {
+          clicks++;
+          return { result: { value: { clicked: true } } }; // dispatched, no-op
+        }
+        if (expression.includes("userTurns")) {
+          return { result: { value: JSON.stringify({ userTurns, answerTurns: 0, answerText: "", stopVisible: false, editorEmpty }) } };
+        }
+        return { result: { value: { exists: true, visible: true, disabled: false } } };
+      }
+      return {};
+    },
+  };
+  const res = await submitTurn(mockCdp, "session-1", geminiAdapter, {
+    sendButtonTimeoutMs: 500, pollIntervalMs: 50,
+    submitAckTimeoutMs: 300, submitAckPollIntervalMs: 50,
+  });
+  assert.equal(clicks, 1, "exactly one click attempt");
+  assert.equal(keyEvents, 2, "one Enter keyDown + keyUp fallback");
+  assert.equal(userTurns, 1, "a user turn appears after send");
+  assert.equal(editorEmpty, true);
+  assert.equal(res.method, "enter-fallback");
+  assert.ok(typeof res.submittedAt === "number");
+});
+
+test("F1 Task mode: click no-op and Enter no-op fails closed with SEND_UNCONFIRMED, no second submit", async () => {
+  // Neither submit mechanism lands the prompt: the turn must fail closed
+  // (never a second click, never a second Enter) instead of reporting success.
+  let clicks = 0;
+  let keyEvents = 0;
+  const mockCdp = {
+    send: async (method, params) => {
+      if (method === "Input.dispatchKeyEvent") {
+        keyEvents++;
+        return {};
+      }
+      if (method === "Runtime.evaluate") {
+        const expression = String(params.expression || "");
+        if (expression.includes("btn.click()")) {
+          clicks++;
+          return { result: { value: { clicked: true } } }; // dispatched, no-op
+        }
+        if (expression.includes("userTurns")) {
+          return { result: { value: JSON.stringify({ userTurns: 0, answerTurns: 0, answerText: "", stopVisible: false, editorEmpty: false }) } };
+        }
+        return { result: { value: { exists: true, visible: true, disabled: false } } };
+      }
+      return {};
+    },
+  };
+  await assert.rejects(
+    submitTurn(mockCdp, "session-1", geminiAdapter, {
+      sendButtonTimeoutMs: 500, pollIntervalMs: 50,
+      submitAckTimeoutMs: 300, submitAckPollIntervalMs: 50,
+    }),
+    (err) => err.code === "SEND_UNCONFIRMED"
+  );
+  assert.equal(clicks, 1, "exactly one click attempt");
+  assert.equal(keyEvents, 2, "exactly one Enter keyDown + keyUp fallback");
 });
 
 test("isPromptTextMatch: collapses ProseMirror multi-newline expansion while preserving exact line content", () => {

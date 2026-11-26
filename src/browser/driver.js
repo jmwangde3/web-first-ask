@@ -822,9 +822,58 @@ export async function confirmAttachmentsPostSubmit(cdp, sessionId, adapter, file
 export async function submitTurn(cdp, sessionId, adapter, {
   sendButtonTimeoutMs = 2000,
   pollIntervalMs = 100,
+  // F1 (2026-11-26, live REPORT-5b3e91ee.md): a dispatched .click() is not
+  // proof the prompt was sent — in Gemini Task mode the click returned
+  // clicked:true while the editor still held the prompt and no user turn
+  // appeared, yet the old code returned success and the engine stamped
+  // sendCommittedAt. After a click, poll the same ACK the completion wait
+  // uses (editor emptied or a new user turn) for at most this long.
+  submitAckTimeoutMs = 5000,
+  submitAckPollIntervalMs = 200,
   now = () => Date.now(),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
 } = {}) {
+  // Post-submit ACK, via the adapter's page-state read when it has one.
+  // Adapters without buildReadStateJs (e.g. test legacy adapters) cannot
+  // be verified: submitTurn keeps the old return-on-dispatch behaviour
+  // for them. A failed read is treated as "cannot verify", never as an
+  // ACK and never as proof of a landing.
+  const canVerifyAck = typeof adapter?.buildReadStateJs === "function";
+  const readAckState = async () => {
+    if (!canVerifyAck) return null;
+    try {
+      return await readTurnState(cdp, sessionId, adapter);
+    } catch {
+      return null;
+    }
+  };
+  const isAcked = (state, baselineUserTurns) =>
+    Boolean(state) &&
+    (state.editorEmpty === true || (state.userTurns ?? 0) > baselineUserTurns);
+  const waitForAck = async (baselineUserTurns) => {
+    const deadline = now() + submitAckTimeoutMs;
+    while (now() < deadline) {
+      if (isAcked(await readAckState(), baselineUserTurns)) return true;
+      await sleep(submitAckPollIntervalMs);
+    }
+    return false;
+  };
+  const dispatchEnter = async () => {
+    await cdp.send("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      windowsVirtualKeyCode: 13,
+      key: "Enter",
+      code: "Enter",
+      text: "\r",
+    }, sessionId);
+    await cdp.send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      windowsVirtualKeyCode: 13,
+      key: "Enter",
+      code: "Enter",
+    }, sessionId);
+  };
+
   if (adapter.sendSelector) {
     const startTime = now();
     let lastProbe = null;
@@ -865,6 +914,10 @@ export async function submitTurn(cdp, sessionId, adapter, {
       lastProbe = val;
 
       if (val?.exists && val.visible && !val.disabled) {
+        // Baseline for the post-click ACK: read before the click so a
+        // pre-existing user turn cannot be mistaken for this send.
+        const baseline = await readAckState();
+        const baselineUserTurns = baseline?.userTurns ?? 0;
         const clickExpr = `(() => {
           const all = [...document.querySelectorAll(${JSON.stringify(adapter.sendSelector)})];
           const isVisible = (el) => {
@@ -912,7 +965,34 @@ export async function submitTurn(cdp, sessionId, adapter, {
 
         const outcome = clickRes.result?.value;
         if (outcome?.clicked === true) {
-          return { submittedAt: now(), method: "click" };
+          // A dispatched click is not a landed send (see the header
+          // comment): verify the ACK, and only then report success.
+          // When the page state cannot be read at all, keep the old
+          // return-on-dispatch behaviour rather than failing a send
+          // that may have landed.
+          if (!canVerifyAck || baseline == null) {
+            return { submittedAt: now(), method: "click" };
+          }
+          if (await waitForAck(baselineUserTurns)) {
+            return { submittedAt: now(), method: "click" };
+          }
+          // The click dispatched but the page shows no landing: the
+          // editor still holds the prompt and no new user turn
+          // appeared within the bound. That is positive evidence of a
+          // no-op click under the completion wait's own ACK standard,
+          // so — and only so — one Enter attempt is a new first
+          // submit, not a retry. This never runs when the click
+          // outcome itself was unknown (throw/empty/invalid result):
+          // those paths throw SEND_UNCONFIRMED below with no Enter,
+          // per the T4 invariant.
+          await dispatchEnter();
+          if (await waitForAck(baselineUserTurns)) {
+            return { submittedAt: now(), method: "enter-fallback" };
+          }
+          throw new WfaError(
+            "SEND_UNCONFIRMED",
+            "Send button clicked but no user turn appeared and the editor still holds the prompt; Enter fallback also did not submit; automatic retry forbidden"
+          );
         }
 
         if (outcome?.clicked === false) {
@@ -942,21 +1022,22 @@ export async function submitTurn(cdp, sessionId, adapter, {
     throw new WfaError("SEND_BUTTON_MISSING", `Send button could not be clicked for ${adapter.id}`);
   }
 
-  // Fallback path ONLY for adapters lacking sendSelector
-  await cdp.send("Input.dispatchKeyEvent", {
-    type: "keyDown",
-    windowsVirtualKeyCode: 13,
-    key: "Enter",
-    code: "Enter",
-    text: "\r",
-  }, sessionId);
+  // Fallback path ONLY for adapters lacking sendSelector. Same ACK
+  // verification as the click path when the adapter can report page
+  // state; adapters that cannot are unchanged (return on dispatch).
+  const enterBaseline = await readAckState();
+  const enterBaselineUserTurns = enterBaseline?.userTurns ?? 0;
+  await dispatchEnter();
 
-  await cdp.send("Input.dispatchKeyEvent", {
-    type: "keyUp",
-    windowsVirtualKeyCode: 13,
-    key: "Enter",
-    code: "Enter",
-  }, sessionId);
+  if (canVerifyAck && enterBaseline != null) {
+    if (await waitForAck(enterBaselineUserTurns)) {
+      return { submittedAt: now(), method: "enter" };
+    }
+    throw new WfaError(
+      "SEND_UNCONFIRMED",
+      "Enter dispatched but no user turn appeared and the editor still holds the prompt; automatic retry forbidden"
+    );
+  }
 
   return { submittedAt: now(), method: "enter" };
 }
