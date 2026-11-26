@@ -137,7 +137,11 @@ test("D2: a genuinely empty reopened conversation still returns unconfirmed afte
   assert.ok(clock.sleeps.every((ms) => ms > 0 && ms <= 500));
 });
 
-test("D2: an already-open tab with no messages returns immediately; the settle applies only to reopened tabs", async () => {
+test("D2 (fix): an already-open tab with no messages waits the bounded settle instead of returning immediately", async () => {
+  // REPORT-7b9e1ceb path A: a restored-session shell tab is already in the
+  // target list, so attachTab cannot tell it from a loaded-but-empty tab.
+  // Both now enter the settle; a genuinely empty tab still returns
+  // unconfirmed, only after the bounded 10 s wait instead of at once.
   const clock = virtualClock();
   const cdp = makeCdp({
     targets: [{ targetId: "existing-empty", type: "page", url: "https://chatgpt.com/c/d2-existing-empty" }],
@@ -160,8 +164,9 @@ test("D2: an already-open tab with no messages returns immediately; the settle a
 
   assert.equal(result.status, "unconfirmed");
   assert.equal(result.reason, "no_positive_completion_signal");
-  assert.equal(result.elapsedMs, 0);
-  assert.equal(clock.sleeps.length, 0);
+  assert.equal(result.elapsedMs, 10000);
+  assert.ok(clock.sleeps.length > 0);
+  assert.ok(clock.sleeps.every((ms) => ms > 0 && ms <= 500));
 });
 
 test("D2: a reopened tab that needs login returns needs_user immediately without waiting for render", async () => {

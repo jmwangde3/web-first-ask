@@ -22,10 +22,16 @@ import { sleep as defaultSleep } from "../util.js";
 const ADAPTERS = Object.freeze({ chatgpt: chatgptAdapter, gemini: geminiAdapter, claude: claudeAdapter });
 const POLL_INTERVAL_MS = 500;
 const STALL_AFTER_MS = 30000;
-// D2: after reopening a tab the message list may not have rendered yet. Poll
-// until message nodes appear, or this bound, before deciding the read is
-// empty. Driven by the injectable clock/timer (deps.now / deps.sleep), never
-// a fixed sleep.
+// D2: after (re)attaching to a tab the message list may not have rendered
+// yet. Poll until answer text appears, or this bound, before deciding the
+// read is empty. Driven by the injectable clock/timer (deps.now /
+// deps.sleep), never a fixed sleep. Applies to both branches: a tab opened
+// by this read (openTab) and a tab already in the target list (attachTab) —
+// a restored-session shell tab is indistinguishable from a loaded one at
+// attach time (REPORT-7b9e1ceb path A), so both must settle. The settle
+// completes only on non-empty answerText, not on message nodes or the
+// action bar: ChatGPT renders user turns, then the answer shell / action
+// bar, then the body text (REPORT-7b9e1ceb path B).
 const REOPEN_SETTLE_TIMEOUT_MS = 10000;
 // D4: a completed candidate must prove its text stable across two consecutive
 // samples. The action bar can appear a beat before the final text lands, so a
@@ -443,8 +449,8 @@ export async function readConversation({
   let sessionId = null;
   let selectedTargetId = targetId;
   let openedOnce = false;
-  // D2: deadline (via nowFn) until which a freshly reopened tab is polled
-  // for message nodes; null when no tab was reopened in this read.
+  // D2: deadline (via nowFn) until which an attached or freshly opened tab
+  // is polled for answer text; null when no tab was (re)attached in this read.
   let reopenSettleDeadline = null;
   let reopenSettled = false;
   // D4: text of a completed candidate awaiting a confirming second sample,
@@ -540,6 +546,14 @@ export async function readConversation({
           conversationUrl = conversationUrl || (normalizeConversationUrl(target.url, resolvedProvider) ? target.url : null);
           const attached = await attachTabFn(cdp, target.targetId, { timeoutMs });
           sessionId = attached.sessionId;
+          // D2 (fix, REPORT-7b9e1ceb path A): a target already in the list
+          // may be a restored-session shell whose page has not loaded yet.
+          // It cannot be told apart from a loaded tab here, so it enters
+          // the same settle as a freshly opened tab. A loaded tab settles
+          // on the first sample (answerText already present), so this
+          // costs a rendered tab nothing.
+          reopenSettleDeadline = nowFn() + REOPEN_SETTLE_TIMEOUT_MS;
+          reopenSettled = false;
         } else if (!openedOnce && conversationUrl && !effectiveNoReopen) {
           openedOnce = true;
           const opened = await openTabFn(cdp, conversationUrl, { timeoutMs });
@@ -587,15 +601,17 @@ export async function readConversation({
             targetId: selectedTargetId,
             requiresCompletionActions: adapter.requiresCompletionActions === true,
           });
-          // D2: a reopened tab counts as settled once any message node (or
-          // answer text) has rendered; until then the read must keep polling
-          // instead of reporting an empty conversation.
+          // D2 (fix, REPORT-7b9e1ceb path B): a reopened tab counts as
+          // settled only once non-empty answer text has rendered. Message
+          // nodes and the action bar render before the body text, so
+          // userTurns/answerTurns/actionsVisible alone must not end the
+          // settle — until then the read keeps polling instead of
+          // reporting an empty conversation. A genuinely empty
+          // conversation never produces text, so it still returns
+          // unconfirmed when the bounded settle expires.
           if (reopenSettleDeadline !== null && !reopenSettled) {
-            const hasMessageNodes =
-              (lastPageState?.userTurns ?? 0) > 0 ||
-              (lastPageState?.answerTurns ?? 0) > 0 ||
-              (lastPageState?.answerText ?? "").trim().length > 0;
-            if (hasMessageNodes) reopenSettled = true;
+            const hasAnswerText = (lastPageState?.answerText ?? "").trim().length > 0;
+            if (hasAnswerText) reopenSettled = true;
           }
         } catch (error) {
           lastResult = {
@@ -657,8 +673,8 @@ export async function readConversation({
         };
       }
 
-      // The observation window is extended while a reopened tab has not
-      // rendered any message nodes (D2) or a completed candidate is awaiting
+      // The observation window is extended while a (re)attached tab has not
+      // rendered answer text yet (D2) or a completed candidate is awaiting
       // its confirming sample (D4); both extensions are bounded.
       const effectiveDeadline = Math.max(
         deadline,
