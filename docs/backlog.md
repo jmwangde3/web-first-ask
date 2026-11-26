@@ -7,8 +7,43 @@
 This is the **wfa-side** list: defects in the native CDP engine (`wfa cdp`), the broker (`wfa broker`) and the
 provider adapters. Upstream ask-bridge defects (U1–U19) live in [`known-issues.md`](known-issues.md).
 
-State of `main` when this list was written: `f3d104e`, `npm test` = **503 tests, 503 pass**, Node.js >= 22.15,
-zero runtime dependencies.
+State of `main` when this list was updated: `3e12485` (implementation & verification tracked on branch `neon`,
+538+ tests on Node.js >= 22.15, zero runtime dependencies).
+
+## Status summary (2026-11-26, branch `neon`)
+
+| ID | Summary | Status on `neon` | Notes |
+|---|---|---|---|
+| **D1** | `--no-wait` broker idle exit | **Live pass** | Broker stays alive past idle window; `read --task-id` returns `completed` |
+| **D2** | First read after reopen returns `unconfirmed` | **Live pass** | Bounded hydration poll; first read returns `completed` in ~3.1 s |
+| **D3** | Attachment upload false positive | **Live pass (CDP) / fixed (broker)** | Fixed 0-height wrapper false positive, broker `POST /turns` `files` drop, `broker ask --file`, and full upload diagnostics |
+| **D4** | Long answer truncated to first line | **Live pass** | Gemini `div.collapsible-content-wrapper` `textContent` fallback; 15,866 / 15,866 exact readback |
+| **D5** | Gemini background multi-minute pause | **Root cause merged into D4; needs >=5 runs** | Previous 420 s stalls were D4 collapsed `innerText` misreads; added stale-pending fallback; single run 35.4 s with 0 pauses |
+| **D6** | Continuation `composer_stop_state` | **Not reproduced; diagnostics added** | Preserves G1 R2 gate and captures `stopDiagnostics` if it recurs |
+| **D7** | Cloudflare / Google `/sorry` interstitial | **Unit pass + `/sorry` fast-fail live** | Parks tab to `about:blank`; `/sorry` fast-failed at 3.6 s |
+| **D8** | Background tab hang / focus steal | **Live pass** | `Emulation.setFocusEmulationEnabled` + activate fallback; 1.9 s read, foreground unchanged |
+| **D9** | Gemini ignores reused `--conversation-id` | **Closed (not reproduced)** | Verified twice (`live-d9-test-1`, `d9-neon-2601`): `userTurns` 1→2 on same URL |
+| **D10** | `--restore-last-session` triggers `/sorry` | **Live pass (resolved)** | Flag removed; ChatGPT & Google persistent cookies survive normal close and `taskkill /F /T` with 0 restored tabs |
+| **F1** | Gemini Task mode over CDP | **Live pass** | Segmented button toggle + Task ACK confirmation; new Gemini sessions default to `task` |
+| **F2** | Concurrent multi-provider runs | **Live pass** | `--providers chatgpt,gemini` (and default when `--provider` omitted) writes separate artifacts |
+| **F3** | Extract `FILE:` blocks with integrity check | **Live pass** | `wfa cdp extract` writes verified files and rejects unclosed fences / bad diff hunks |
+| **F4** | Download provider-produced attachments | **Unit pass; live pending** | `--download-dir` + download link trigger + CDP capture & SHA-256 |
+| **F5** | Claude web adapter | **Unit pass; live pending** | `src/browser/adapters/claude.js` wired; profile currently has 0 `claude.ai` cookies |
+| **F6** | Configurable human-like pacing | **Unit pass; live pending** | `pacer.js` configurable 1–2 s casual / 4–6 s batch jitter |
+| **F7** | Clean up `wfa`-created conversations | **Live pass** | `wfa cdp cleanup` (`--task-id` / `--all` / `--keep-unfinished` / `--keep-named`); one-shot asks auto-clean on `completed` |
+| **F8** | `REPO_UNREADABLE` auto-fallback | **Unit pass; live pending** | `--fallback-bundle` wired in `cdp-cli.js` (terminal `completed` only); `--code-task` attaches repo bundle upfront |
+| **F9** | Skill slimming | **Static pass** | `skills/web-first/SKILL.md` slimmed; includes #10 Q&A rule and mandatory code-bundle contract |
+
+## Verified provider sandbox capabilities (2026-11-26)
+
+| Provider / mode | GitHub access | Verified sandbox runtime | Code modification & test capability |
+|---|---|---|---|
+| **ChatGPT Web** | GitHub API reads files/trees at a commit; **cannot `git clone`** (container cannot resolve `github.com`, forced IP also fails) | Git `2.47.3`, Node `22.16.0`, npm `10.9.2` | Given a `git bundle` or `.git` zip, can clone locally, run `git apply --check` / `--stat`, and run full `npm test` |
+| **Gemini Chat** | **Cannot read GitHub** | Python `3.10` only (no `node`, `npm`, `git`, or `patch`) | Can unzip source archive, edit code, and emit `diff -u` patches; **cannot run `npm test`** |
+| **Gemini Task** | **Pro accounts can `git clone`**; Free accounts cannot | Node `18.20.4`, npm `9.2.0` (no internet for installing deps) | Can run offline checks in sandbox (note Node 18 vs `>=22.15` engine requirement) |
+
+**Default code-task rule:** for any task that modifies code, pass a repository bundle (`git bundle` or `.git` zip,
+e.g. `wfa cdp ask --code-task`) and explicitly instruct the provider to run `git apply --check` and full `npm test`.
 
 Everything below was reproduced on a real Chrome with logged-in ChatGPT and Gemini accounts unless marked
 otherwise. Items marked *(unverified)* were reported but not re-confirmed with a controlled experiment.
@@ -210,7 +245,9 @@ a new conversation and stores its URL; later uses with the *same key* reuse that
 two consecutive `ask` calls with the same key returned `userTurns: 2` and kept the conversation title. The
 Gemini case has not been re-tested with this same-key method.
 
-**Next step.** Run the two-ask test against Gemini before treating this as a defect.
+**Status (2026-11-26).** Closed (not reproduced). Controlled two-ask runs with the same local key
+(`live-d9-test-1` and `d9-neon-2601`) on Gemini both stayed on the same `conversationUrl`, incremented
+`userTurns` 1→2, and recalled the round-1 token accurately (matching ChatGPT).
 
 ---
 
@@ -241,6 +278,10 @@ broker restarts amplify it.
 Gemini). `ask` runs at 15:25:5x and 15:30:5x and read-only probes at 15:31 were all redirected to `/sorry` —
 landing page and `/app/ceeb4b6cc5ca503d` alike. Run record:
 `reverdict/live-tests/20261126-1520-neon-hotfix/REPORT.md`.
+
+**Resolution on `neon` (2026-11-26).** Removed `--restore-last-session` from `src/browser/launch.js`. Live checks
+after both clean `Browser.close` and `taskkill /F /T` confirmed persistent cookies keep ChatGPT and Gemini signed
+in while restoring zero historical tabs.
 
 ---
 

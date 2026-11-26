@@ -3,6 +3,7 @@
 > **范围**：只保留必须由 ask-bridge（Rust 二进制）修的问题。wfa 侧能提前拦截、标注或绕过的，已落实的规避方案见文末「wfa 侧已做」，不占本清单。
 > **环境**：Windows 11 24H2 zh-CN / Git Bash / ask-bridge 0.4.0（`7d4731f`）/ wfa 0.2.2→0.2.10 / Chrome stable / providers: ChatGPT + Gemini。
 > **证据**：2026-11-21 与 2026-11-22 两次单机实测，命令与耗时均为真实运行结果。U1、U7 已于 11-22 用对照实验与源码复核修正（见各条）。
+> **2026-11-26 状态更新**：`wfa` 原生 CDP 引擎 + broker（当前 `neon` 分支，538+ 项单测）已全面取代 `ask-bridge` 成为主路径。下方 U1–U19 仅作遗留 `ask-bridge` 后端历史归档，不再阻塞原生 CDP 路径；原生 CDP 侧实测确认的外部 provider 能力边界与限制见文末新增章节。
 
 ## 汇总
 
@@ -544,3 +545,26 @@ wfa 0.2.3 起：
 - `detached` 任务的 `batch.stdout.log` 只要打印过任何一行就必须判 `interrupted_unknown`，不能因为「没出现本 job id」就当没提交（`recovery.test.js`）。
 
 **同时把委派规则写死进 Skill 和 README**：代码问题一律先交给 wfa 双 provider 出完整文件或补丁，本地只做集成、跑测试、汇报；唯一例外是用户明确说这次不要用 agents。
+
+---
+
+## 原生 CDP 路径下的外部 Provider 能力边界与已知限制（2026-11-26 实测）
+
+以下为脱离 `ask-bridge` 后，在 Windows 11 / Chrome 158 真机上核实的外部网页端 provider 自身限制与 DOM 行为特征（与 `docs/backlog.md` 及 `docs/provider-capabilities.md` 同步）：
+
+### 1. Provider 沙箱能力差异（影响代码修改任务派发）
+
+| Provider / 模式 | 读取 GitHub | 实测沙箱环境 | 代码修改与验证边界 |
+| --- | --- | --- | --- |
+| **ChatGPT 网页版** | 可用 GitHub API 读指定 commit 的文件与目录树；**不能 `git clone`**（执行容器解析不了 `github.com`，强指 IP 同样失败） | Git `2.47.3`、Node `22.16.0`、npm `10.9.2` | 传入 `git bundle` 或带 `.git` 的 zip 后，可自建 clone、执行 `git apply --check` / `--stat` 与**完整 `npm test`** |
+| **Gemini Chat 模式** | **不能读 GitHub** | 仅 Python `3.10`（无 `node` / `npm` / `git` / `patch`） | 能解压源码 zip、改代码、用 `diff -u` 出补丁；**无法运行 `npm test`** |
+| **Gemini Task 模式** | **Pro 账户可 `git clone` 仓库**；免费版账户不可以 | Node `18.20.4`、npm `9.2.0`（不能联网装依赖） | 可执行离线命令，但 Node 版本（18.20.4）低于要求 `>=22.15` 的项目 |
+
+**wfa 侧默认规则**：凡涉及代码修改的任务，必须直接传给 provider 代码包（`git bundle` 或带 `.git` 的 zip），并在提示词中指定执行 `git apply --check` 与完整 `npm test`（`wfa cdp ask --code-task`）。
+
+### 2. 网页端 DOM 与风控实测特征
+
+- **Gemini 折叠长回答**：长回答正文常被包在 `div.collapsible-content-wrapper`（折叠态高 ~36 px）内，`innerText` 仅返回 25–39 字标题行且 `.pending` 冻结；原生 CDP 适配器已改为检测折叠容器并回退 `textContent` 重建代码围栏（`neon` 实测 15,866/15,866 零截断）。
+- **Gemini 新会话默认回退 Chat**：每次新开 Gemini 会话都会重置为 Chat 模式；`wfa` 对新 Gemini 会话默认自动切换为 Task 模式（`gem-segmented-button-row`），可用 `--gemini-mode chat` 覆盖。
+- **ChatGPT DOM 锚点变化**：`[data-message-author-role]` 与 `<article>` 在当前版本已不存在，读取层锚定 `h4`；停止按钮在生成期实测可能为 `0x0`。
+- **Chrome 重启恢复历史标签触发 Google `/sorry`**：旧版为保活 ChatGPT 传入 `--restore-last-session` 会批量恢复历史标签并诱发 Google `/sorry` 风控。实测证实 ChatGPT（`__Secure-next-auth.session-token.0/.1`）与 Google（`SID`/`HSID`/`SSID`/`APISID`/`SAPISID`/`__Secure-1PSID`/`__Secure-3PSID`）均使用持久 Cookie，正常退出与强杀重启均无需 `--restore-last-session`（已在 `neon` 移除，且命中 `/sorry` 3.6 s 快速驻停 `about:blank`）。
