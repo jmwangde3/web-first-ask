@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.2.0 - Unreleased (backlog/d1-f9)
+
+Backlog D1–D9 / F1–F9 (`docs/backlog.md`). No live-browser validation was run
+for this branch — every item that needs a real Chrome is marked awaiting live
+verification in the backlog, with the manual command to run on Windows.
+`npm test`: 657 tests, 655 pass, 1 fail (pre-existing Linux-only
+`cdp-stage.test.js:107`), 1 skipped. Zero runtime dependencies, unchanged.
+
+- D1: broker no longer idles out while it owns a non-terminal turn
+  (`hasNonTerminalTurn` + idle grace in `src/broker/server.js`).
+- D2: first read after reopening a tab polls until message nodes appear
+  (bounded 10 s, no fixed sleep); empty conversations still `unconfirmed`.
+- D3: Gemini attachment verification now checks the filename (it previously
+  threw `ReferenceError` in-page and could match the attach button);
+  fail-closed with `ATTACH_UPLOAD_FAILED`, no submission.
+- D4: `pending > 0` blocks `completed`; a `completed` candidate needs a
+  second identical sample; every read result carries `partial: true/false`.
+- D5: pause-measurement harness (`src/stall-measurement.js`,
+  `scripts/summarize-pauses.mjs`), wired into the completion poll loop
+  (opt-in via `WFA_PAUSE_EVENTS_DIR`); 420 s stall default kept
+  provisionally pending distribution data.
+- D6: composer stop-state capture (`src/browser/composer-capture.js`) wired
+  at the composer-gate and `PROMPT_NOT_TYPED` call sites; gate unchanged.
+- D7: Cloudflare interstitial tabs are parked to `about:blank` and reported
+  (`parkChallengedTab`).
+- D8: background tabs are activated (`Target.activateTarget`, not
+  `Page.bringToFront`) before reading; window focus behaviour unverified.
+- D9: two-ask Gemini conversation-reuse test procedure + harness
+  (`docs/gemini-conversation-reuse-test.md`,
+  `scripts/gemini-conversation-reuse.mjs`); no code changed.
+- F1: Gemini Task mode over CDP (`--gemini-mode chat|task`, adapter toggle
+  + turn state, fail-closed `GEMINI_MODE_FAILED`); selectors unverified.
+- F2: `wfa cdp ask --providers chatgpt,gemini` fan-out with per-provider
+  artifacts and single-provider retry (`--retry-provider`); 1 in-flight
+  per provider, at most 2 across providers.
+- F3: `FILE:` block extraction with integrity self-check
+  (`src/stage.js`) + `wfa cdp extract` CLI; truncated answers refused.
+- F4: provider-download capture (`src/browser/downloads.js`, size + SHA-256
+  verified) via `wfa cdp ask --download-dir <dir>`, recorded as
+  `downloads[]` on the turn.
+- F5: Claude web adapter (`src/browser/adapters/claude.js`) registered
+  end-to-end (engine, CLI, broker, turn store, conversation store, read);
+  selectors unverified against the live Claude DOM.
+- F6: configurable human-like pacing (`pace` in `DEFAULT_CONFIG` /
+  `loadConfig`, broker starter passes `deps.config`).
+- F7: created-by-run conversation tracking (`createdByRun`/`createdRunId`)
+  + store-level cleanup of exactly that set; no auto-delete wired —
+  the cleanup trigger is still to be decided.
+- F8: `REPO_UNREADABLE` classification + fallback decision/record
+  (`src/repo-fallback.js`, archive preferred); automatic submit not wired.
+- F9: packaged Skill slimmed 41 → 32 lines.
+
 ## 1.0.0 - Unreleased
 
 First stable release. The native CDP engine (`wfa cdp`) and its front-end queue

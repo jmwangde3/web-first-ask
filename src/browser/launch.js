@@ -81,6 +81,12 @@ export function buildChromeArgs({ userDataDir, mode = "headless" } = {}) {
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
   ];
   if (mode === "headless") args.push("--headless=new");
+  // D8: background/headful windows start off-screen so a read-time tab
+  // activation (Target.activateTarget in src/browser/driver.js) does not
+  // have a visible window to steal. Whether Chrome also raises/focuses
+  // the window when a tab is activated is UNVERIFIED on Windows — no
+  // Page.bringToFront is used anywhere, and no focus behaviour may be
+  // claimed until that is checked live. See backlog D8.
   if (mode === "background" || mode === "headful") args.push("--window-size=1440,1200", "--window-position=-2000,-2000");
   if (mode === "visible") args.push("--window-size=1440,1200", "--window-position=100,100");
   return args;

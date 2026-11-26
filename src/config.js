@@ -3,6 +3,7 @@ import { WfaError } from "./errors.js";
 import { normalizeProviders, validateConcurrency } from "./jobs.js";
 import { getPaths } from "./paths.js";
 import { readJson, writeJsonAtomic } from "./util.js";
+import { resolvePaceConfig } from "./browser/pacer.js";
 
 function validateBrowserMode(mode) {
   if (mode !== "headless" && mode !== "headful") {
@@ -28,6 +29,8 @@ export async function loadConfig(home) {
     ...userConfig,
     browserMode: validateBrowserMode(userConfig.browserMode ?? DEFAULT_CONFIG.browserMode),
     geminiMode: validateGeminiMode(userConfig.geminiMode ?? DEFAULT_CONFIG.geminiMode),
+    // F6: pacing ranges; invalid bounds fall back to defaults.
+    pace: resolvePaceConfig(userConfig.pace ?? DEFAULT_CONFIG.pace),
     defaultProviders: normalizeProviders(
       Array.isArray(configuredProviders) ? configuredProviders : [configuredProviders],
       DEFAULT_CONFIG.defaultProviders,

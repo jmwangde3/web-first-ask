@@ -212,6 +212,27 @@ export async function archiveRepository({ cwd = process.cwd(), excludes = [], ou
   };
 }
 
+// F8 — probe whether the attached-archive fallback transport is available,
+// without building the zip. A fallback retry must know this before it
+// decides: archiving a non-Git directory, or one with no eligible tracked
+// files, cannot carry the sources.
+export async function probeArchiveFallback({ cwd = process.cwd(), excludes = [] } = {}) {
+  try {
+    const { root, selected, skipped } = await collectTrackedSources({ cwd, excludes });
+    if (!selected.length) {
+      return { available: false, transport: "zip", root, files: 0,
+        reason: "No eligible tracked files to archive." };
+    }
+    return { available: true, transport: "zip", root, files: selected.length,
+      skipped: skipped.length, reason: null };
+  } catch (error) {
+    if (error instanceof WfaError) {
+      return { available: false, transport: "zip", files: 0, reason: error.message };
+    }
+    throw error;
+  }
+}
+
 export function repositoryArchiveBlock(archive, repository) {
   const name = path.basename(archive.file);
   const commit = repository?.commit ? ` at commit ${repository.commit}` : "";

@@ -33,10 +33,16 @@ export function createTurn({
   hardTimeoutMs = null,
   minIntervalMs = null,
   chromePath = null,
+  // F1/F5 (coordinator wiring): Gemini page mode (chat|task) and the
+  // provider-download directory. The CLI used to forward geminiMode, but
+  // createTurn dropped unknown fields, so F1 never reached runCdpTurn
+  // through the broker; claude was rejected outright.
+  geminiMode = null,
+  downloadDir = null,
   createdAt = new Date().toISOString(),
 } = {}) {
   if (typeof id !== "string" || !id.trim() ||
-      !["chatgpt", "gemini"].includes(provider) ||
+      !["chatgpt", "gemini", "claude"].includes(provider) ||
       typeof prompt !== "string" || !prompt.trim() ||
       (conversationId !== null && (typeof conversationId !== "string" || !conversationId.trim())) ||
       typeof mode !== "string" || !mode.trim() ||
@@ -46,12 +52,15 @@ export function createTurn({
       (hardTimeoutMs !== null && (!Number.isFinite(hardTimeoutMs) || hardTimeoutMs <= 0)) ||
       (minIntervalMs !== null && (!Number.isSafeInteger(minIntervalMs) || minIntervalMs < 0)) ||
       (chromePath !== null && (typeof chromePath !== "string" || !chromePath.trim())) ||
+      (geminiMode !== null && geminiMode !== "chat" && geminiMode !== "task") ||
+      (downloadDir !== null && (typeof downloadDir !== "string" || !downloadDir.trim())) ||
       typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) {
     throw invalid("Invalid turn arguments");
   }
   return {
     id, provider, prompt, conversationId, mode, requestId,
     settleMs, stallTimeoutMs, hardTimeoutMs, minIntervalMs, chromePath,
+    geminiMode, downloadDir,
     createdAt,
     state: "queued", startedAt: null, finishedAt: null,
     cooldownWaitMs: null, cooldownWaitAt: null,

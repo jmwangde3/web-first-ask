@@ -1,3 +1,5 @@
+import { matchRepoUnreadable } from "./repository.js";
+
 const RATE_LIMIT_PATTERNS = [
   /\b429\b/i,
   /\brate[ -]?limit(?:ed|ing)?\b/i,
@@ -47,12 +49,46 @@ export function stderrForJob(stderr = "", jobId) {
     .join("\n");
 }
 
-export function classifyProviderError({ error = "", stderr = "", jobId, state, hasResponse = false } = {}) {
+export function classifyProviderError({ error = "", stderr = "", jobId, state, hasResponse = false, answerText = null } = {}) {
+  // F8 — REPO_UNREADABLE is a provider *answer*, not a failure: the turn
+  // completed with a refusal to read the repository. It must be classified
+  // before the completed-response guard below, which would otherwise return
+  // a null errorCode for exactly this case. The strict sentinel match (same
+  // matcher as src/repository.js) avoids quoted or explanatory false
+  // positives; a bare token in error/stderr text is only a signal when the
+  // turn did not complete with a response, so stale error text cannot
+  // downgrade a finished answer.
+  const answerMatch = answerText === null ? null : matchRepoUnreadable(answerText);
+  if (answerMatch) {
+    return {
+      errorCode: "REPO_UNREADABLE",
+      repoUnreadable: true,
+      repoUnreadableEvidence: answerMatch,
+      fallbackRecommended: true,
+      recoveryHint: "Repository unreadable. Retry as a NEW turn with the repository bundled (inline bundle or attached archive) under a new request_id, continuing the same conversation; do not resend the original prompt.",
+      retryAfterSeconds: null,
+      retryAfterAt: null,
+      retryAfterEstimated: false,
+    };
+  }
   if (state === "completed" && hasResponse) {
     return { errorCode: null, recoveryHint: null, retryAfterSeconds: null, retryAfterAt: null, retryAfterEstimated: false };
   }
   const text = [error, stderrForJob(stderr, jobId)].filter(Boolean).join("\n").trim();
   if (!text) return { errorCode: null, recoveryHint: null, retryAfterSeconds: null, retryAfterAt: null, retryAfterEstimated: false };
+
+  if (/\bREPO_UNREADABLE\b/.test(text)) {
+    return {
+      errorCode: "REPO_UNREADABLE",
+      repoUnreadable: true,
+      repoUnreadableEvidence: { matched: "REPO_UNREADABLE", kind: "error-text" },
+      fallbackRecommended: true,
+      recoveryHint: "Repository unreadable. Retry as a NEW turn with the repository bundled (inline bundle or attached archive) under a new request_id, continuing the same conversation; do not resend the original prompt.",
+      retryAfterSeconds: null,
+      retryAfterAt: null,
+      retryAfterEstimated: false,
+    };
+  }
 
   // ask-bridge can finish the answer and then fail to finalize metadata.json
   // (Windows "os error 5": a filter driver, AV scanner or a leftover handle on

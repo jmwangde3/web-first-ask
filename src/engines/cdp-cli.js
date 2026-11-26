@@ -8,6 +8,7 @@ import { connectCdp } from "../browser/cdp.js";
 import * as defaultDriver from "../browser/driver.js";
 import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
+import * as claudeAdapter from "../browser/adapters/claude.js";
 import { sleep as defaultSleep } from "../util.js";
 import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
 import { ensureBroker, createTurn, waitForTurn, waitForSubmission } from "../broker/client.js";
@@ -15,17 +16,30 @@ import { spawnDetachedBroker } from "../broker/cli.js";
 import { stageCdpResponse as defaultStageCdpResponse } from "./cdp-stage.js";
 import { expandAttachmentInputs } from "../attachments.js";
 import { readConversation as defaultReadConversation } from "./cdp-read.js";
+import { runCdpFanout as defaultRunCdpFanout, retryFanoutProvider as defaultRetryFanoutProvider, normalizeGeminiMode } from "./cdp-engine.js";
+import { extractFileBlocksToDisk as defaultExtractFileBlocks } from "../stage.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
   gemini: geminiAdapter,
+  // F5: Claude adapter registered here (login + ask validation). The
+  // broker turn validation and conversation store still only accept
+  // chatgpt/gemini — see the F5 note in cdp-engine.js.
+  claude: claudeAdapter,
 };
 
 const VALUE_FLAGS = new Set([
   "provider",
+  "providers",
+  "retry-provider",
+  "run-dir",
+  "out-dir",
+  "download-dir",
+  "input",
   "prompt",
   "prompt-file",
   "mode",
+  "gemini-mode",
   "timeout",
   "settle",
   "chrome-path",
@@ -98,23 +112,51 @@ function printCdpHelp(stdout = process.stdout) {
   stdout.write(`web-first-ask (wfa) — CDP Browser Kernel Engine
 
 Commands:
-  wfa cdp ask    --provider <chatgpt|gemini> (--prompt <text> | --prompt-file <path> | stdin)
-                 [--mode background|visible|headless] [--conversation-id <id>] [--request-id <id>] [--json]
+  wfa cdp ask    --provider <chatgpt|gemini|claude> (--prompt <text> | --prompt-file <path> | stdin)
+                 [--mode background|visible|headless] [--gemini-mode chat|task] [--conversation-id <id>] [--request-id <id>] [--json]
+                 [--timeout <s>] [--settle <ms>] [--min-interval <ms>]
+                 [--file <path|glob|dir>] [--download-dir <dir>] [--no-stage] [--no-wait] [--workspace <dir>]
+  wfa cdp ask    --providers <chatgpt,gemini> (--prompt <text> | --prompt-file <path> | stdin)
+                 [--mode background|visible|headless] [--serial] [--out-dir <dir>] [--json]
                  [--timeout <s>] [--settle <ms>] [--min-interval <ms>]
                  [--file <path|glob|dir>] [--no-stage] [--no-wait] [--workspace <dir>]
+                 Fan-out (F2): same brief to each provider in parallel (one
+                 in-flight turn per provider, at most two across providers),
+                 each answer to <runDir>/<provider>/response.md, run record
+                 <runDir>/fanout.json. --serial forces global serial execution.
+  wfa cdp ask    --retry-provider <chatgpt|gemini> --run-dir <dir>
+                 (--prompt <text> | --prompt-file <path> | stdin) [--json]
+                 Retry exactly one failed provider of a recorded fan-out run.
+                 The prompt must hash to the recorded brief, and only a
+                 definite pre-submit failure may be retried.
   wfa cdp read   (--url <conversation-url> | --task-id <id>)
-                 [--provider <chatgpt|gemini>] [--mode background|visible|headless]
+                 [--provider <chatgpt|gemini|claude>] [--mode background|visible|headless]
                  [--timeout <s>] [--wait <s>] [--no-reopen] [--json] [--out <path>]
   wfa cdp status [--json]
-  wfa cdp login  [--provider <chatgpt|gemini>] [--mode visible|background]
+  wfa cdp login  [--provider <chatgpt|gemini|claude>] [--mode visible|background]
                  [--timeout <seconds>] [--json]
+  wfa cdp extract --input <answer.md> --out-dir <dir> [--json]
+                 Extract FILE: blocks from a provider answer to disk (F3),
+                 with an integrity self-check; a truncated answer is
+                 refused, nothing is written. Never writes into a repo.
 
 Options:
-  --provider <name>          chatgpt or gemini
+  --provider <name>          chatgpt, gemini, or claude
+  --download-dir <dir>       F4: after a completed turn, capture provider-produced
+                             downloads into this directory (size + SHA-256 verified);
+                             recorded on the turn as downloads[]
+  --providers <a,b>          Fan-out (F2): comma-separated providers for one brief
+  --serial                   Fan-out (F2): run providers one after another
+  --out-dir <dir>            Fan-out (F2): run directory for per-provider files (default: <home>/runs/<runId>)
+  --retry-provider <name>    Fan-out retry (F2): retry one provider of a recorded run; requires --run-dir
+  --run-dir <dir>            Fan-out retry (F2): run directory holding fanout.json
   --prompt <text>            Prompt string
   --prompt-file <path>       Path to prompt file
   --file <path|glob|dir>     Repeatable attachment; native CDP uploads via DOM.setFileInputFiles
   --mode <mode>              background (default for ask, visible for login), visible, or headless
+  --gemini-mode <chat|task>   F1, Gemini only: Chat (default) or Task mode (sandboxed code runs).
+                             --mode stays the window mode; --gemini-mode task is rejected for
+                             non-Gemini providers and for fan-out runs.
   --conversation-id <id>     Optional conversation ID to serialize same-session turns
   --request-id <id>          Optional idempotency key (auto-generated UUID if omitted)
   --json                     Output machine-readable JSON
@@ -178,8 +220,8 @@ async function handleLogin(argv, deps) {
   }
 
   const provider = options.provider ? String(options.provider).toLowerCase() : "chatgpt";
-  if (provider !== "chatgpt" && provider !== "gemini") {
-    throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt or gemini.`);
+  if (provider !== "chatgpt" && provider !== "gemini" && provider !== "claude") {
+    throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt, gemini, or claude.`);
   }
 
   let mode = "visible";
@@ -445,8 +487,8 @@ async function handleRead(argv, deps) {
   }
 
   const provider = options.provider === undefined ? undefined : String(options.provider).toLowerCase();
-  if (provider !== undefined && !["chatgpt", "gemini"].includes(provider)) {
-    throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt or gemini.`);
+  if (provider !== undefined && !["chatgpt", "gemini", "claude"].includes(provider)) {
+    throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt, gemini, or claude.`);
   }
 
   const mode = options.mode === undefined ? "background" : String(options.mode).toLowerCase();
@@ -496,6 +538,177 @@ async function handleRead(argv, deps) {
   return { code: 0, result };
 }
 
+// F2 — one provider turn through the broker, shaped like a runCdpTurn
+// result so the engine fan-out can drive it. The broker record is ensured
+// once by the caller and shared across providers; the engine's
+// 1-per-provider / 2-total cap is the phase-one rule and the broker's own
+// scheduler is the backstop. Per-provider request ids come from the engine
+// (`<base>:<provider>`, `<base>:<provider>:retry:<n>`), so broker
+// idempotency is preserved per attempt.
+function makeBrokerRunTurn({ home, deps, ensureRecord, noWait = false }) {
+  const createTurnFn = deps.createTurn || createTurn;
+  const waitFn = deps.waitForTurn || waitForTurn;
+  const waitSubmissionFn = deps.waitForSubmission || waitForSubmission;
+  return async (turnArgs) => {
+    const startTime = Date.now();
+    const { provider, prompt, mode, requestId, conversationId, files,
+      settleMs, stallTimeoutMs, hardTimeoutMs, minIntervalMs, geminiMode, downloadDir } = turnArgs;
+    const record = await ensureRecord();
+    const created = await createTurnFn(record, {
+      provider, prompt, mode, requestId, settleMs, stallTimeoutMs, hardTimeoutMs,
+      ...(conversationId != null ? { conversationId } : {}),
+      ...(Array.isArray(files) && files.length ? { files } : {}),
+      ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
+      // F1/F4 (coordinator wiring): forwarded now that the broker accepts them.
+      ...(geminiMode === "chat" || geminiMode === "task" ? { geminiMode } : {}),
+      ...(typeof downloadDir === "string" && downloadDir.trim() ? { downloadDir } : {}),
+    });
+    const createdJson = created?.json;
+    const failed = (reason) => ({
+      id: createdJson?.turnId ?? null, status: "failed",
+      reason: String(reason).toLowerCase(), text: "", conversationUrl: "",
+      sendCommittedAt: null, elapsedMs: Date.now() - startTime,
+    });
+    if (created?.status !== undefined && ![200, 202].includes(created.status)) {
+      return failed(createdJson?.error || createdJson?.code || "broker_error");
+    }
+    const turnId = createdJson?.id;
+    if (!turnId) return failed("broker_error");
+    if (noWait) {
+      let submitted = createdJson;
+      if (submitted?.sendCommittedAt == null) {
+        try {
+          submitted = await waitSubmissionFn({
+            record, turnId, home, timeoutMs: deps.submissionTimeoutMs ?? 60000, deps,
+          });
+        } catch (error) {
+          return failed(error?.code || "submission_not_confirmed");
+        }
+      }
+      if (submitted?.sendCommittedAt == null) return failed("submission_not_confirmed");
+      return {
+        id: turnId, status: submitted?.state ?? "running",
+        reason: submitted?.reason ?? null, text: "",
+        conversationUrl: submitted?.conversationUrl ?? "",
+        sendCommittedAt: submitted.sendCommittedAt,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+    const turn = await waitFn({ record, turnId, home, timeoutMs: hardTimeoutMs, deps });
+    const startedAtMs = Date.parse(turn.startedAt || turn.createdAt || "");
+    const finishedAtMs = Date.parse(turn.finishedAt || "");
+    return {
+      id: turn.id ?? turnId, status: turn.state, reason: turn.reason ?? null,
+      text: turn.text ?? "", conversationUrl: turn.conversationUrl ?? "",
+      sendCommittedAt: turn.sendCommittedAt ?? null,
+      elapsedMs: Number.isFinite(startedAtMs) && Number.isFinite(finishedAtMs)
+        ? Math.max(0, finishedAtMs - startedAtMs) : Math.max(0, Date.now() - startTime),
+    };
+  };
+}
+
+function makeEnsureRecord({ home, deps, mode, stdout }) {
+  const ensureFn = deps.ensureBroker || ensureBroker;
+  const spawnFn = deps.spawnBroker || (() => spawnDetachedBroker({ home, mode, deps, stdout }));
+  let cached = null;
+  return () => {
+    if (!cached) cached = ensureFn({ home, spawnBroker: spawnFn });
+    return cached;
+  };
+}
+
+function fanoutResultSummary(result) {
+  const { text = "", ...rest } = result;
+  const firstLine = text.split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0) || "";
+  return {
+    ...rest,
+    summary: firstLine.length > 200 ? `${firstLine.slice(0, 200)}...` : firstLine,
+    textBytes: Buffer.byteLength(text, "utf8"),
+  };
+}
+
+async function stageFanoutResults({ fanout, options, home, deps, stderr }) {
+  if (options["no-stage"]) return;
+  const stageFn = deps.stageCdpResponse || defaultStageCdpResponse;
+  const workspaceRoot = options.workspace ? path.resolve(String(options.workspace)) : process.cwd();
+  for (const result of fanout.results) {
+    // A retry result carries no text: the answer lives in its artifact file.
+    let text = result.text;
+    if (!text && result.status === "completed" && result.resultPath) {
+      text = await readFile(result.resultPath, "utf8").catch(() => "");
+    }
+    if (result.status !== "completed" || !text || !result.turnId) continue;
+    try {
+      result.staged = await stageFn({
+        home, runId: result.turnId, provider: result.provider, text, workspaceRoot,
+      });
+    } catch (error) {
+      stderr.write(`[cdp] stage skipped for ${result.provider}: ${error?.code || error?.message || String(error)}\n`);
+    }
+  }
+}
+
+function printFanout({ fanout, options, stdout }) {
+  if (options.json) {
+    stdout.write(`${JSON.stringify({
+      runId: fanout.runId, runDir: fanout.runDir, state: fanout.state,
+      promptSha256: fanout.promptSha256,
+      results: fanout.results.map((result) => fanoutResultSummary(result)),
+    }, null, 2)}\n`);
+    return;
+  }
+  stdout.write(`[cdp] fanout ${fanout.runId} state=${fanout.state} providers=${fanout.results.map((r) => r.provider).join(",")}\n`);
+  for (const result of fanout.results) {
+    stdout.write(`[cdp] ${result.provider}: ${result.status}${result.reason ? ` (${result.reason})` : ""}${result.resultPath ? ` -> ${result.resultPath}` : ""}\n`);
+    if (result.staged) stdout.write(`[cdp] ${result.provider} stageRoot: ${result.staged.stageRoot}\n`);
+    if (result.status !== "completed") {
+      stdout.write(`[cdp] retry ${result.provider} with: wfa cdp ask --retry-provider ${result.provider} --run-dir ${fanout.runDir} --prompt-file <brief>\n`);
+    }
+  }
+  stdout.write(`[cdp] run record: ${path.join(fanout.runDir, "fanout.json")}\n`);
+}
+
+async function handleFanout({ options, prompt, attachedFiles, mode, hardTimeoutMs, stallTimeoutMs, settleMs, minIntervalMs, conversationId, requestId, home, deps, stdout, stderr }) {
+  if (options.provider !== undefined) {
+    throw new WfaError("INVALID_ARGUMENT", "Use exactly one of --provider or --providers.");
+  }
+  const fanoutFn = deps.runCdpFanout || defaultRunCdpFanout;
+  const ensureRecord = makeEnsureRecord({ home, deps, mode, stdout });
+  const runTurn = makeBrokerRunTurn({ home, deps, ensureRecord, noWait: Boolean(options["no-wait"]) });
+  const outDir = options["out-dir"] ? path.resolve(String(options["out-dir"])) : null;
+  const fanout = await fanoutFn({
+    providers: String(options.providers).split(","),
+    prompt, home, baseRequestId: requestId,
+    ...(outDir ? { outDir } : {}),
+    serial: Boolean(options.serial), mode,
+    ...(conversationId !== null ? { conversationId } : {}),
+    files: attachedFiles, settleMs, stallTimeoutMs, hardTimeoutMs,
+    ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
+    runTurn,
+  });
+  await stageFanoutResults({ fanout, options, home, deps, stderr });
+  printFanout({ fanout, options, stdout });
+  return { code: fanout.state === "completed" ? 0 : 1, result: fanout };
+}
+
+async function handleFanoutRetry({ options, prompt, home, deps, stdout, stderr }) {
+  if (!options["run-dir"]) {
+    throw new WfaError("INVALID_ARGUMENT", "--retry-provider requires --run-dir <dir> holding fanout.json.");
+  }
+  const retryFn = deps.retryFanoutProvider || defaultRetryFanoutProvider;
+  const ensureRecord = makeEnsureRecord({ home, deps, mode: "background", stdout });
+  const runTurn = makeBrokerRunTurn({ home, deps, ensureRecord, noWait: false });
+  const { record, result, runDir } = await retryFn({
+    runDir: path.resolve(String(options["run-dir"])),
+    provider: String(options["retry-provider"]),
+    prompt, home, runTurn,
+  });
+  const fanout = { runId: record.runId, runDir, state: record.state, promptSha256: record.promptSha256, results: [result] };
+  await stageFanoutResults({ fanout, options, home, deps, stderr });
+  printFanout({ fanout, options, stdout });
+  return { code: result.status === "completed" ? 0 : 1, result };
+}
+
 async function handleAsk(argv, deps) {
   const stdout = deps.stdout || process.stdout;
   const stderr = deps.stderr || process.stderr;
@@ -506,14 +719,6 @@ async function handleAsk(argv, deps) {
   if (options.help) {
     printCdpHelp(stdout);
     return { code: 0 };
-  }
-
-  if (!options.provider) {
-    throw new WfaError("INVALID_ARGUMENT", "Option --provider is required. Must be chatgpt or gemini.");
-  }
-  const provider = String(options.provider).toLowerCase();
-  if (provider !== "chatgpt" && provider !== "gemini") {
-    throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt or gemini.`);
   }
 
   let prompt = "";
@@ -550,6 +755,39 @@ async function handleAsk(argv, deps) {
     if (!["background", "visible", "headless"].includes(mode)) {
       throw new WfaError("INVALID_ARGUMENT", `Invalid mode: ${options.mode}. Must be background, visible, or headless.`);
     }
+  }
+
+  // F1: --mode is the window mode; the Gemini Chat/Task switch is the
+  // separate --gemini-mode flag. Rejected for fan-out (that path does not
+  // forward it yet) and for task mode on a non-Gemini provider. The
+  // value is forwarded in the broker turn payload for the broker to
+  // pass to runCdpTurn.
+  let geminiMode = "chat";
+  if (options["gemini-mode"] !== undefined) {
+    geminiMode = normalizeGeminiMode(options["gemini-mode"]);
+    if (geminiMode === null) {
+      throw new WfaError("INVALID_ARGUMENT", `Invalid --gemini-mode: ${options["gemini-mode"]}. Must be chat or task.`);
+    }
+    if (geminiMode === "task" && (options.providers !== undefined || options["retry-provider"] !== undefined)) {
+      throw new WfaError("INVALID_ARGUMENT", "--gemini-mode task is not supported for fan-out runs yet.");
+    }
+    if (geminiMode === "task" && options.provider !== undefined && String(options.provider).toLowerCase() !== "gemini") {
+      throw new WfaError("INVALID_ARGUMENT", "--gemini-mode task only applies to --provider gemini.");
+    }
+  }
+
+  // F4: directory for provider-produced downloads; forwarded in the
+  // broker turn payload, single-provider runs only for now.
+  let downloadDir = null;
+  if (options["download-dir"] !== undefined) {
+    const raw = String(options["download-dir"]).trim();
+    if (!raw) {
+      throw new WfaError("INVALID_ARGUMENT", "Option --download-dir must be a non-empty path.");
+    }
+    if (options.providers !== undefined || options["retry-provider"] !== undefined) {
+      throw new WfaError("INVALID_ARGUMENT", "--download-dir is not supported for fan-out runs yet.");
+    }
+    downloadDir = path.resolve(raw);
   }
 
   let hardTimeoutMs = 900000;
@@ -601,6 +839,28 @@ async function handleAsk(argv, deps) {
     requestId = deps.requestId || randomUUID();
   }
 
+  // F2 — fan-out and single-provider retry branch off here; they share the
+  // prompt, files, mode and timeout parsing above. The single-provider
+  // --provider requirement moves below, so --providers/--retry-provider do
+  // not have to name a single provider.
+  if (options["retry-provider"] !== undefined) {
+    return await handleFanoutRetry({ options, prompt, home, deps, stdout, stderr });
+  }
+  if (options.providers !== undefined) {
+    return await handleFanout({
+      options, prompt, attachedFiles, mode, hardTimeoutMs, stallTimeoutMs, settleMs,
+      minIntervalMs, conversationId, requestId, home, deps, stdout, stderr,
+    });
+  }
+
+  if (!options.provider) {
+    throw new WfaError("INVALID_ARGUMENT", "Option --provider is required. Must be chatgpt, gemini, or claude.");
+  }
+  const provider = String(options.provider).toLowerCase();
+  if (provider !== "chatgpt" && provider !== "gemini" && provider !== "claude") {
+    throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt, gemini, or claude.`);
+  }
+
   const startTime = Date.now();
   const ensureFn = deps.ensureBroker || ensureBroker;
   const spawnFn = deps.spawnBroker || (() => spawnDetachedBroker({ home, mode, deps, stdout }));
@@ -619,6 +879,11 @@ async function handleAsk(argv, deps) {
     ...(attachedFiles.length > 0 ? { files: attachedFiles } : {}),
     ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
     ...(options["chrome-path"] ? { chromePath: options["chrome-path"] } : {}),
+    // F1: forwarded for the broker to pass to runCdpTurn (broker accepts
+    // geminiMode since the coordinator wiring; previously dropped).
+    ...(geminiMode !== "chat" ? { geminiMode } : {}),
+    // F4: download directory for provider-produced attachments.
+    ...(typeof downloadDir === "string" && downloadDir.trim() ? { downloadDir } : {}),
   });
 
   const created = turnRes?.json;
@@ -807,6 +1072,44 @@ async function handleAsk(argv, deps) {
   return { code: result.status === "completed" ? 0 : 1, result };
 }
 
+// F3: extract FILE: blocks from a saved provider answer to disk, with
+// the integrity self-check from stage.js. A truncated answer is refused
+// and nothing is written. Never writes into a repository: the extractor
+// itself refuses an output dir inside repositoryRoot.
+async function handleExtract(argv, deps = {}) {
+  const stdout = deps.stdout || process.stdout;
+  const stderr = deps.stderr || process.stderr;
+  const { options } = parseArgs(argv);
+  if (options.help) {
+    printCdpHelp(stdout);
+    return { code: 0 };
+  }
+  const input = options.input !== undefined ? String(options.input).trim() : "";
+  const outDir = options["out-dir"] !== undefined ? String(options["out-dir"]).trim() : "";
+  if (!input) {
+    throw new WfaError("INVALID_ARGUMENT", "Option --input is required for wfa cdp extract.");
+  }
+  if (!outDir) {
+    throw new WfaError("INVALID_ARGUMENT", "Option --out-dir is required for wfa cdp extract.");
+  }
+  const text = await readFile(path.resolve(input), "utf8");
+  const extractFn = deps.extractFileBlocksToDisk || defaultExtractFileBlocks;
+  const result = await extractFn(text, {
+    outputDir: path.resolve(outDir),
+    ...(options.workspace ? { repositoryRoot: path.resolve(String(options.workspace)) } : {}),
+  });
+  if (options.json) {
+    stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else {
+    stdout.write(`[cdp] extracted ${result.blockCount} blocks to ${result.outputDir}\n`);
+    for (const file of result.files || []) {
+      stdout.write(`  - ${file.path} (${file.bytes} bytes, sha256:${(file.sha256 || "").slice(0, 12)})\n`);
+    }
+    stdout.write(`[cdp] manifest: ${result.manifestPath}\n`);
+  }
+  return { code: 0, ...result };
+}
+
 export async function runCdpCommand(argv = [], deps = {}) {
   const stdout = deps.stdout || process.stdout;
   const stderr = deps.stderr || process.stderr;
@@ -817,8 +1120,8 @@ export async function runCdpCommand(argv = [], deps = {}) {
   }
 
   const subcmd = argv[0];
-  if (!subcmd || !["ask", "read", "status", "login"].includes(subcmd)) {
-    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|read|status|login>\n`);
+  if (!subcmd || !["ask", "read", "status", "login", "extract"].includes(subcmd)) {
+    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|read|status|login|extract>\n`);
     return { code: 2 };
   }
 
@@ -836,6 +1139,7 @@ export async function runCdpCommand(argv = [], deps = {}) {
       return await loginFn(argv.slice(1), deps);
     }
     if (subcmd === "read") return await handleRead(argv.slice(1), deps);
+    if (subcmd === "extract") return await handleExtract(argv.slice(1), deps);
     return await handleAsk(argv.slice(1), deps);
   } catch (error) {
     if (error instanceof WfaError) {

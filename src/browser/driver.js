@@ -17,6 +17,67 @@ function buildEvidence(state, lastProgressAgoMs) {
 const anchorTargetByBrowser = new Map();
 const anchorCreationByBrowser = new Map();
 
+// D7: the interstitial detector is the adapter's own pattern —
+// turnChallengeTitlePattern first, then challengeTitlePattern. The literal
+// below is only the fallback this file already used in waitForEditor and
+// waitForCompletion; it is not a second detector.
+const FALLBACK_CHALLENGE_PATTERN = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
+
+export function challengePatternFor(adapter) {
+  return adapter?.turnChallengeTitlePattern || adapter?.challengeTitlePattern || FALLBACK_CHALLENGE_PATTERN;
+}
+
+// D7: same challenged condition waitForCompletion already used: the adapter
+// reports a challenge (password field or challenge title) and no composer
+// is usable on the page. A page with a live editor is not challenged even
+// if its title happens to match.
+export function isChallengedState(state, adapter) {
+  if (!state || typeof state !== "object") return false;
+  const composerReady = (state.editorEmpty !== null && state.editorEmpty !== undefined) ||
+    Boolean(state.hasProseMirror);
+  return (Boolean(state.hasChallenge) || challengePatternFor(adapter).test(state.title || "")) &&
+    !composerReady;
+}
+
+// D7: park a challenged tab on about:blank so a retry never inherits the
+// interstitial page (the blank tab no longer matches the conversation URL,
+// so the next read/ask opens a fresh tab). Best-effort: a failed navigate
+// must not mask the human_verification_required report it accompanies.
+export async function parkChallengedTab(cdp, sessionId) {
+  if (!cdp || typeof cdp.send !== "function" || typeof sessionId !== "string" || !sessionId) {
+    return { parked: false, reason: "invalid_args" };
+  }
+  try {
+    await cdp.send("Page.navigate", { url: "about:blank" }, sessionId);
+    return { parked: true, url: "about:blank" };
+  } catch {
+    return { parked: false, reason: "navigate_failed" };
+  }
+}
+
+// D8: activate the TAB (Target.activateTarget) so a throttled/frozen
+// background tab can be read. This deliberately does NOT call
+// Page.bringToFront: per the chrome-devtools-mcp N2 semantics, tab
+// activation and window focus are different things, and whether Chrome
+// also raises the window when a tab is activated is UNVERIFIED on Windows
+// (see the note in src/browser/launch.js) — do not claim background mode
+// is preserved until that is checked live.
+export async function activateTab(cdp, targetId, { timeoutMs = 15000 } = {}) {
+  if (!cdp || typeof cdp.send !== "function") {
+    throw new WfaError("CDP_REQUIRED", "A CDP client is required to activate a tab");
+  }
+  if (typeof targetId !== "string" || !targetId) {
+    throw new WfaError("TARGET_ID_REQUIRED", "A targetId is required to activate a tab");
+  }
+  await cdp.send(
+    "Target.activateTarget",
+    { targetId },
+    undefined,
+    { timeoutMs },
+  );
+  return { targetId, activated: true };
+}
+
 export async function listPageTargets(cdp) {
   if (!cdp || typeof cdp.send !== "function") {
     throw new WfaError("CDP_REQUIRED", "A CDP client is required to list page targets");
@@ -152,7 +213,7 @@ export async function waitForEditor(cdp, sessionId, adapter, {
   let lastHasPassword = false;
   let consecutiveChallenged = 0;
 
-  const challengePattern = adapter.turnChallengeTitlePattern || adapter.challengeTitlePattern || /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
+  const challengePattern = challengePatternFor(adapter);
 
   while (now() - startTime < timeoutMs) {
     if (signal?.aborted) {
@@ -187,10 +248,13 @@ export async function waitForEditor(cdp, sessionId, adapter, {
         if (isPollChallenged) {
           consecutiveChallenged += 1;
           if (consecutiveChallenged >= 2) {
+            // D7: park the challenged tab before reporting, so a retry
+            // opens a fresh tab instead of inheriting the interstitial.
+            const park = await parkChallengedTab(cdp, sessionId);
             const err = new WfaError(
               "HUMAN_VERIFICATION_REQUIRED",
               `Human verification required for ${adapter.id} (title: "${lastTitle}")`,
-              { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength } }
+              { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength, parked: park.parked } }
             );
             err.title = lastTitle;
             throw err;
@@ -208,10 +272,13 @@ export async function waitForEditor(cdp, sessionId, adapter, {
   const isChallenge = Boolean(lastHasPassword || challengePattern.test(lastTitle));
 
   if (isChallenge) {
+    // D7: park the challenged tab before reporting, so a retry opens a
+    // fresh tab instead of inheriting the interstitial.
+    const park = await parkChallengedTab(cdp, sessionId);
     const err = new WfaError(
       "HUMAN_VERIFICATION_REQUIRED",
       `Human verification required for ${adapter.id} (title: "${lastTitle}")`,
-      { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength } }
+      { details: { title: lastTitle, adapter: adapter.id, challenge: true, bodyLength: lastBodyLength, parked: park.parked } }
     );
     err.title = lastTitle;
     throw err;
@@ -752,7 +819,16 @@ export async function submitTurn(cdp, sessionId, adapter, {
   return { submittedAt: now(), method: "enter" };
 }
 
-export async function readTurnState(cdp, sessionId, adapter) {
+export async function readTurnState(cdp, sessionId, adapter, { targetId } = {}) {
+  // D8: activate the tab before reading so a throttled/frozen background
+  // tab does not hang or return stale state. Best-effort: a failed
+  // activation must not fail the read — the evaluate below still reports
+  // whatever the page shows. No activation happens when the caller does
+  // not know the targetId.
+  if (targetId) {
+    try { await activateTab(cdp, targetId); } catch {}
+  }
+
   const expression = adapter.buildReadStateJs();
   const res = await cdp.send("Runtime.evaluate", {
     expression,
@@ -777,6 +853,8 @@ export async function readTurnState(cdp, sessionId, adapter) {
       signedIn: false,
       signedOut: false,
       pageError: null,
+      // D7: no page state was read, so nothing was parked.
+      parked: false,
     };
   }
 
@@ -792,7 +870,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       };
     }
 
-    return {
+    const state = {
       userTurns: Number(parsed.userTurns) || 0,
       answerTurns: Number(parsed.answerTurns) || 0,
       answerText: typeof parsed.answerText === "string" ? parsed.answerText : "",
@@ -810,7 +888,19 @@ export async function readTurnState(cdp, sessionId, adapter) {
       signedIn: Boolean(parsed.signedIn),
       signedOut: Boolean(parsed.signedOut),
       pageError,
+      parked: false,
     };
+
+    // D7: a challenged tab is parked on about:blank immediately, while the
+    // state returned here is still the challenged one — so callers report
+    // human_verification_required and a retry opens a fresh tab instead
+    // of inheriting the interstitial. Detection is the adapter's own
+    // (isChallengedState), not a second detector.
+    if (isChallengedState(state, adapter)) {
+      const park = await parkChallengedTab(cdp, sessionId);
+      state.parked = park.parked;
+    }
+    return state;
   } catch {
     return {
       userTurns: 0,
@@ -828,6 +918,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       signedIn: false,
       signedOut: false,
       pageError: null,
+      parked: false,
     };
   }
 }
@@ -846,6 +937,14 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   now = () => Date.now(),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   signal,
+  // D8: targetId of the tab being read, when the caller knows it. The tab
+  // is activated once before the first read so a throttled background tab
+  // does not hang the wait. Callers that do not know the targetId omit it
+  // and behaviour is unchanged.
+  targetId = null,
+  // D5 (coordinator wiring): pause tracker from stall-measurement.js.
+  // Sampled once per poll; a throwing tracker must never break the wait.
+  pauseTracker = null,
 } = {}) {
   const startTime = now();
   let lastProgressAt = startTime;
@@ -862,7 +961,13 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   // 停止按钮不参与完成判定（实测 0x0 且回答结束后长期不翻转）。
   const requiresActions = adapter.requiresCompletionActions === true;
 
-  const challengePattern = adapter.turnChallengeTitlePattern || adapter.challengeTitlePattern || /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
+  // D8: activate the tab once, before the first read — not on every poll,
+  // so the window is not repeatedly disturbed while the turn runs.
+  // Best-effort: a failed activation must not fail the completion wait;
+  // the reads that follow still report whatever the page shows.
+  if (targetId) {
+    try { await activateTab(cdp, targetId); } catch {}
+  }
 
   while (true) {
     if (signal?.aborted) {
@@ -883,6 +988,18 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 
     const state = await readTurnState(cdp, sessionId, adapter);
     lastState = state;
+
+    // D5: one pause-tracker sample per poll (pending count, answer
+    // length, answer turns). Best-effort: never breaks the wait.
+    if (pauseTracker && typeof pauseTracker.sample === "function") {
+      try {
+        pauseTracker.sample({
+          pendingCount: Number.isInteger(state.pendingCount) ? state.pendingCount : null,
+          answerChars: typeof state.answerText === "string" ? state.answerText.length : null,
+          answerTurns: Number.isInteger(state.answerTurns) ? state.answerTurns : null,
+        });
+      } catch {}
+    }
 
     // 真机证据（2026-11-24）：续聊时 userTurns 已+1 但 answerTurns 未增，页面唯一文本是上一轮
     // 旧答案（smoke-actions2: answerTurns=1, 20575 字符旧答案却返回 completed）。
@@ -905,16 +1022,22 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       stopVisibleSince = null;
     }
 
-    const composerReady = (state.editorEmpty !== null && state.editorEmpty !== undefined) || Boolean(state.hasProseMirror);
-    const challenged = (state.hasChallenge || challengePattern.test(state.title || "")) && !composerReady;
+    const challenged = isChallengedState(state, adapter);
 
     if (challenged) {
+      // D7: readTurnState already parks a challenged tab; retry the park
+      // once here only if that park did not succeed, so the challenged
+      // page is not left in place for a retry to inherit.
+      const parked = state.parked === true
+        ? true
+        : (await parkChallengedTab(cdp, sessionId)).parked;
       return {
         status: "needs_human",
         reason: "human_verification_required",
         text: belongs ? (state.answerText || "") : "",
         elapsedMs: now() - startTime,
-        evidence: buildEvidence(state, now() - lastProgressAt),
+        parked,
+        evidence: { ...buildEvidence(state, now() - lastProgressAt), parked },
       };
     }
 

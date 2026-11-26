@@ -37,7 +37,7 @@ function isValidTurnRecord(record) {
     record.kind === TURN_KIND &&
     typeof record.turnId === "string" &&
     record.turnId.trim() &&
-    ["chatgpt", "gemini"].includes(record.provider) &&
+    ["chatgpt", "gemini", "claude"].includes(record.provider) &&
     TURN_STATES.includes(record.state) &&
     typeof record.createdAt === "string" &&
     Number.isFinite(Date.parse(record.createdAt)) &&
@@ -50,7 +50,7 @@ export async function recordTurn(home, turn) {
   const turnId = turn?.id ?? turn?.turnId;
   assertValidTurnId(turnId);
 
-  if (!turn || !["chatgpt", "gemini"].includes(turn.provider) ||
+  if (!turn || !["chatgpt", "gemini", "claude"].includes(turn.provider) ||
       !TURN_STATES.includes(turn.state)) {
     throw new Error("INVALID_TURN_RECORD");
   }

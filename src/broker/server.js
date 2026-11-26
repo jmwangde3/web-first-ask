@@ -111,10 +111,12 @@ async function parseBody(req) {
 }
 
 export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 60000,
+  idleGraceMs = 5000,
   maxPerProvider = DEFAULT_MAX_PER_PROVIDER, maxTotal = DEFAULT_MAX_TOTAL,
   onIdle = async () => {}, log = () => {}, deps = {} } = {}) {
   if (!["off", "tray"].includes(mode) || !runner || typeof runner.run !== "function" ||
       !Number.isFinite(idleTimeoutMs) || idleTimeoutMs < 1 ||
+      !Number.isFinite(idleGraceMs) || idleGraceMs < 0 ||
       typeof onIdle !== "function" || typeof log !== "function") {
     throw coded("INVALID_ARGUMENT", "Invalid broker options");
   }
@@ -140,13 +142,34 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   let closing = false;
   let idleSince = Date.now();
   let idleTriggered = false;
+  // D1: wall-clock time the most recent turn reached a terminal state, or
+  // null when no turn owned by this broker has terminalized yet. Idle-out
+  // must wait idleGraceMs past this point, never kill the broker the moment
+  // the last turn finishes.
+  let lastTerminalAt = null;
   let boundPort = null;
   let resolveClosed;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
 
+  // D1: the scheduler alone cannot tell whether the broker still owns work.
+  // A turn that left the scheduler is still owned while it is non-terminal:
+  // needs_human / takeover wait for a human or a takeover, and a queued or
+  // running turn restored from disk never re-enters the scheduler. Only a
+  // terminal turn (completed / failed / stalled) releases the broker.
+  function hasNonTerminalTurn() {
+    for (const turn of turns.values()) {
+      if (!TERMINAL_STATES.includes(turn.state)) return true;
+    }
+    return false;
+  }
+
   function hasWork() {
     const state = snapshot(scheduler);
-    return state.runningTotal > 0 || state.queued.length > 0;
+    return state.runningTotal > 0 || state.queued.length > 0 || hasNonTerminalTurn();
+  }
+
+  function idleGraceElapsed() {
+    return lastTerminalAt === null || Date.now() - lastTerminalAt >= idleGraceMs;
   }
 
   function trackIdle() {
@@ -179,6 +202,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   function finish(id, state, patch = {}) {
     const current = turns.get(id);
     if (current?.state !== "running") return;
+    if (TERMINAL_STATES.includes(state)) lastTerminalAt = Date.now();
     turns.set(id, transition(current, state, {
       cooldownWaitMs: null,
       cooldownWaitAt: null,
@@ -228,6 +252,11 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
             ? { targetId: result.targetId }
             : (turns.get(turn.id)?.targetId != null ? { targetId: turns.get(turn.id).targetId } : {})),
           ...(result?.sendCommittedAt != null ? { sendCommittedAt: result.sendCommittedAt } : {}),
+          // F4/F1 (coordinator wiring): the runner result used to lose
+          // downloads and geminiMode here, so turn records stayed null
+          // even when the engine captured them.
+          ...(result?.downloads != null ? { downloads: result.downloads } : {}),
+          ...(result?.geminiMode != null ? { geminiMode: result.geminiMode } : {}),
         });
         const current = turns.get(turn.id);
         if (current && current.state === "failed" && current.sendCommittedAt == null &&
@@ -392,6 +421,7 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         }
         const cancelled = transition(turn, "failed", { reason: "cancelled", finishedAt: new Date().toISOString() });
         turns.set(id, cancelled);
+        lastTerminalAt = Date.now();
         await persistTurnSnapshot(cancelled);
         if (turn.state === "running") {
           controllers.get(id)?.abort();
@@ -523,13 +553,13 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     ]);
     idleTimer = setInterval(() => {
       if (mode === "off" && !closing && !idleTriggered && idleSince !== null &&
-          Date.now() - idleSince >= idleTimeoutMs) {
+          Date.now() - idleSince >= idleTimeoutMs && idleGraceElapsed()) {
         void (async () => {
-          if (!hasWork() && !closing) {
+          if (!hasWork() && !closing && idleGraceElapsed()) {
             idleTriggered = true;
             try {
               await onIdle();
-              if (!hasWork()) await close();
+              if (!hasWork() && idleGraceElapsed()) await close();
             } finally {
               if (!closing) idleTriggered = false;
             }

@@ -203,6 +203,18 @@ export function createCdpRunner({
         settleMs: effectiveSettleMs,
         stallTimeoutMs: effectiveStallTimeoutMs,
         hardTimeoutMs: effectiveHardTimeoutMs,
+        // F1/F5/F4 (coordinator wiring): the broker used to drop these
+        // turn fields, so geminiMode never reached runCdpTurn, claude was
+        // rejected upstream, and downloadDir had nowhere to go.
+        ...(typeof turn?.requestId === "string" && turn.requestId.trim()
+          ? { requestId: turn.requestId }
+          : (turn?.id ? { requestId: turn.id } : {})),
+        ...(turn?.geminiMode === "chat" || turn?.geminiMode === "task"
+          ? { geminiMode: turn.geminiMode }
+          : {}),
+        ...(typeof turn?.downloadDir === "string" && turn.downloadDir.trim()
+          ? { downloadDir: turn.downloadDir }
+          : {}),
         ...(typeof turn?.conversationId === "string" && turn.conversationId.trim()
           ? { conversationId: turn.conversationId }
           : {}),

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { runProcess, spawnDetached, resolveAskBridge } from "./ask-bridge.js";
 import { readBatchMetadata } from "./metadata.js";
 import { classifyProviderError } from "./provider-errors.js";
-import { detectSessionIsolationWarning, mapProviderErrorState, rememberSession, summarizeTask } from "./state.js";
+import { detectSessionIsolationWarning, isConfirmedUnsubmittedFailure, mapProviderErrorState, rememberSession, summarizeTask, workspaceHasBlockingTask } from "./state.js";
 import { guardedBatch, refreshTask } from "./runner-stall.js";
 import { Store } from "./store.js";
 import { loadConfig } from "./config.js";
@@ -401,4 +401,62 @@ export async function runDetachedBatchWorker(taskId, workerToken, { home, store 
       }
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// F2 — single-provider retry for the legacy ask-bridge path.
+// Retries exactly one provider of a finished task, reusing its original job
+// (same job id, same request id) through the existing runOne single-batch
+// path, and leaves every other provider untouched. The gate is the same
+// definite-failure rule as the CDP fan-out: only a provider that provably
+// never submitted may be retried. timed_out, recoverable,
+// interrupted_unknown, stalled, and any child carrying a thread URL, a
+// result, or a completion proof are refused — a retry there would risk a
+// double send, so the caller must inspect and resolve instead.
+// ---------------------------------------------------------------------------
+
+export function isRetryableLegacyProvider(child) {
+  if (!child) return false;
+  if (child.state === "failed_before_start") return true;
+  return isConfirmedUnsubmittedFailure(child);
+}
+
+export async function retryTaskProvider({ taskId, provider, home, store = new Store(home), config, runProcess: runProcessDep, input = {} } = {}) {
+  const settings = config ?? await loadConfig(home);
+  const snapshot = await store.snapshot();
+  const task = snapshot.tasks.tasks[taskId];
+  if (!task) throw new WfaError("TASK_NOT_FOUND", `Task not found: ${taskId}`);
+  const normalized = String(provider ?? "").trim().toLowerCase();
+  const child = task.children?.[normalized];
+  if (!child) {
+    throw new WfaError("INVALID_ARGUMENT", `Task ${taskId} has no provider ${normalized || "(missing)"}.`);
+  }
+  if (task.executionPending) {
+    throw new WfaError("RETRY_REFUSED", `Task ${taskId} is still running; wait for it to settle before retrying ${normalized}.`);
+  }
+  if (!isRetryableLegacyProvider(child)) {
+    throw new WfaError("RETRY_REFUSED",
+      `Provider ${normalized} of task ${taskId} ended in state=${child.state}`
+      + `${child.errorCode ? ` (${child.errorCode})` : ""}. Only a definite pre-submit failure may be retried;`
+      + " inspect the provider tab or run `wfa resolve` before resending.");
+  }
+  const blocking = workspaceHasBlockingTask(snapshot.tasks.tasks, task.workspace, [normalized], taskId);
+  if (blocking) {
+    throw new WfaError("WORKSPACE_PROVIDER_LOCKED",
+      `Workspace "${task.workspace}" is locked by ${blocking.provider} task ${blocking.taskId} (${blocking.state}).`);
+  }
+  const jobs = (await readFile(task.inputFile, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+  const job = jobs.find((item) => item.provider === normalized);
+  if (!job) throw new WfaError("TASK_NOT_FOUND", `Task ${taskId} has no stored job for provider ${normalized}.`);
+  const command = resolveAskBridge(settings);
+  const run = (cmd, args, options) => guardedBatch(
+    runProcessDep ?? runProcess, cmd, args, options, store,
+    task.stallTimeoutSeconds ?? DEFAULT_STALL_TIMEOUT_SECONDS,
+  );
+  const { result, processResult } = await runOne({
+    command, task, job, config: settings, timeoutSeconds: task.timeoutSeconds,
+    store, run, input, retry: true,
+  });
+  const refreshed = await refreshTask(taskId, { home: store.paths.home, store });
+  return { task: refreshed, child: refreshed.children[normalized], retried: true, result, processResult };
 }

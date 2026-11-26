@@ -5,6 +5,7 @@ import { connectCdp as defaultConnectCdp } from "../browser/cdp.js";
 import * as defaultDriver from "../browser/driver.js";
 import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
+import * as claudeAdapter from "../browser/adapters/claude.js";
 import * as defaultResultStore from "../broker/result-store.js";
 import * as defaultTurnStore from "../broker/turn-store.js";
 import * as defaultJournal from "../broker/journal.js";
@@ -15,9 +16,23 @@ import {
 } from "../broker/client.js";
 import { sleep as defaultSleep } from "../util.js";
 
-const ADAPTERS = Object.freeze({ chatgpt: chatgptAdapter, gemini: geminiAdapter });
+// F5 (coordinator wiring): Claude registered here too — the read path
+// rejected claude before this even though the CLI accepted it. Selectors
+// remain UNVERIFIED against the live Claude DOM (adapters/claude.js).
+const ADAPTERS = Object.freeze({ chatgpt: chatgptAdapter, gemini: geminiAdapter, claude: claudeAdapter });
 const POLL_INTERVAL_MS = 500;
 const STALL_AFTER_MS = 30000;
+// D2: after reopening a tab the message list may not have rendered yet. Poll
+// until message nodes appear, or this bound, before deciding the read is
+// empty. Driven by the injectable clock/timer (deps.now / deps.sleep), never
+// a fixed sleep.
+const REOPEN_SETTLE_TIMEOUT_MS = 10000;
+// D4: a completed candidate must prove its text stable across two consecutive
+// samples. The action bar can appear a beat before the final text lands, so a
+// single sample can return only the first line(s) of a long answer as
+// "completed". Bound the extra wait; a candidate still changing at the bound
+// is returned as streaming with partial:true instead of completed.
+const COMPLETION_SETTLE_MS = 2000;
 
 function coded(code, message = code, cause) {
   const error = new WfaError(code, message, cause ? { cause } : undefined);
@@ -37,6 +52,8 @@ function providerFromUrl(value) {
   const host = parsed.hostname.toLowerCase();
   if (host === "chatgpt.com" || host === "www.chatgpt.com") return "chatgpt";
   if (host === "gemini.google.com") return "gemini";
+  // F5 (coordinator wiring): claude.ai maps to the new Claude adapter.
+  if (host === "claude.ai") return "claude";
   throw coded("INVALID_ARGUMENT", `Unsupported conversation URL host: ${host}`);
 }
 
@@ -73,11 +90,15 @@ function directResult(record) {
     reason: record.reason ?? "completed",
     evidence: record.evidence ?? null,
     source: "result-store",
+    partial: false,
   };
 }
 
 function turnStateResult(turn, taskId) {
   const turnState = turn?.state;
+  // A broker/persisted turn that carries text without a terminal state is
+  // still in flight: its text is a partial snapshot, not a final answer.
+  const turnPartial = typeof turn?.text === "string" && turn.text.trim().length > 0;
   if (turnState === "queued") {
     return {
       status: "pending",
@@ -89,6 +110,7 @@ function turnStateResult(turn, taskId) {
       text: typeof turn.text === "string" ? turn.text : "",
       reason: turn.reason ?? "queued",
       evidence: turn.evidence ?? null,
+      partial: turnPartial,
     };
   }
   if (turnState === "running") {
@@ -102,6 +124,7 @@ function turnStateResult(turn, taskId) {
       text: typeof turn.text === "string" ? turn.text : "",
       reason: turn.reason ?? "waiting_for_answer",
       evidence: turn.evidence ?? null,
+      partial: turnPartial,
     };
   }
   if (turnState === "stalled") {
@@ -115,6 +138,7 @@ function turnStateResult(turn, taskId) {
       text: typeof turn.text === "string" ? turn.text : "",
       reason: turn.reason ?? "stalled",
       evidence: turn.evidence ?? null,
+      partial: turnPartial,
     };
   }
   if (turnState === "needs_human" || turnState === "takeover") {
@@ -128,6 +152,7 @@ function turnStateResult(turn, taskId) {
       text: typeof turn.text === "string" ? turn.text : "",
       reason: turn.reason ?? turnState,
       evidence: turn.evidence ?? null,
+      partial: turnPartial,
     };
   }
   if (turnState === "failed") {
@@ -141,6 +166,7 @@ function turnStateResult(turn, taskId) {
       text: typeof turn.text === "string" ? turn.text : "",
       reason: turn.reason ?? "turn_failed",
       evidence: turn.evidence ?? null,
+      partial: turnPartial,
     };
   }
   return null;
@@ -149,16 +175,28 @@ function turnStateResult(turn, taskId) {
 function mapPageState(page, turn, taskId, metadata) {
   const text = typeof page?.answerText === "string" ? page.answerText : "";
   const nonEmptyText = text.trim().length > 0;
+  const pendingCount = Number.isInteger(page?.pendingCount) ? page.pendingCount : 0;
+  // D4: Gemini reports pending nodes in the last model-response while the
+  // answer is still streaming. An action bar seen while pending > 0 is not a
+  // completion signal: the text sampled then is only the streamed prefix.
+  // Gated on !requiresCompletionActions to match waitForCompletion: ChatGPT
+  // never reports pendingCount and its stop/action signals are judged
+  // differently, so its behaviour is unchanged.
+  const requiresCompletionActions = metadata?.requiresCompletionActions === true;
   const base = {
     taskId: taskId ?? null,
     provider: metadata.provider,
     conversationUrl: metadata.conversationUrl ?? null,
     targetId: metadata.targetId ?? null,
     text,
+    // partial marks a non-empty text that is not a confirmed final answer.
+    // A short string returned with partial:true must not be read as complete.
+    partial: nonEmptyText,
     evidence: {
       userTurns: page?.userTurns ?? 0,
       answerTurns: page?.answerTurns ?? 0,
       answerActionsVisible: page?.answerActionsVisible ?? null,
+      pendingCount,
       stopVisible: Boolean(page?.stopVisible),
       title: page?.title ?? "",
       pageError: page?.pageError ?? null,
@@ -175,7 +213,10 @@ function mapPageState(page, turn, taskId, metadata) {
   }
 
   if (nonEmptyText && page?.answerActionsVisible === true) {
-    return { ...base, status: "completed", state: "completed", reason: "completed" };
+    if (!requiresCompletionActions && pendingCount > 0) {
+      return { ...base, status: "streaming", state: "streaming", reason: "streaming_pending" };
+    }
+    return { ...base, status: "completed", state: "completed", reason: "completed", partial: false };
   }
 
   if (nonEmptyText && page?.answerActionsVisible === false) {
@@ -402,6 +443,14 @@ export async function readConversation({
   let sessionId = null;
   let selectedTargetId = targetId;
   let openedOnce = false;
+  // D2: deadline (via nowFn) until which a freshly reopened tab is polled
+  // for message nodes; null when no tab was reopened in this read.
+  let reopenSettleDeadline = null;
+  let reopenSettled = false;
+  // D4: text of a completed candidate awaiting a confirming second sample,
+  // and the bound for that confirmation.
+  let completedCandidateText = null;
+  let completedCandidateDeadline = null;
   let lastPageState = null;
   let lastResult = null;
   let lastProgressAt = startTime;
@@ -476,6 +525,7 @@ export async function readConversation({
             reason: recovery?.reason || "browser_unavailable",
             evidence: recovery?.evidence ?? null,
             elapsedMs: nowFn() - startTime,
+            partial: false,
           };
         }
         cdp = await connectFn(recovery.chrome.port);
@@ -495,6 +545,10 @@ export async function readConversation({
           const opened = await openTabFn(cdp, conversationUrl, { timeoutMs });
           selectedTargetId = opened.targetId;
           sessionId = opened.sessionId;
+          // D2: the page has just started loading; do not decide the read is
+          // empty until the message list has had a chance to render.
+          reopenSettleDeadline = nowFn() + REOPEN_SETTLE_TIMEOUT_MS;
+          reopenSettled = false;
         } else if (effectiveNoReopen || !conversationUrl) {
           return {
             status: "tab_missing",
@@ -507,6 +561,7 @@ export async function readConversation({
             reason: "SESSION_TAB_MISSING",
             evidence: null,
             elapsedMs: nowFn() - startTime,
+            partial: false,
           };
         }
       }
@@ -519,6 +574,7 @@ export async function readConversation({
             lastPageState?.answerTurns ?? 0,
             lastPageState?.answerText ?? "",
             lastPageState?.answerActionsVisible ?? null,
+            lastPageState?.pendingCount ?? 0,
             Boolean(lastPageState?.stopVisible),
           ]);
           if (signature !== lastProgressSignature) {
@@ -529,7 +585,18 @@ export async function readConversation({
             provider: resolvedProvider,
             conversationUrl,
             targetId: selectedTargetId,
+            requiresCompletionActions: adapter.requiresCompletionActions === true,
           });
+          // D2: a reopened tab counts as settled once any message node (or
+          // answer text) has rendered; until then the read must keep polling
+          // instead of reporting an empty conversation.
+          if (reopenSettleDeadline !== null && !reopenSettled) {
+            const hasMessageNodes =
+              (lastPageState?.userTurns ?? 0) > 0 ||
+              (lastPageState?.answerTurns ?? 0) > 0 ||
+              (lastPageState?.answerText ?? "").trim().length > 0;
+            if (hasMessageNodes) reopenSettled = true;
+          }
         } catch (error) {
           lastResult = {
             status: "unconfirmed",
@@ -541,6 +608,7 @@ export async function readConversation({
             text: lastPageState?.answerText || "",
             reason: error?.code || "page_read_failed",
             evidence: null,
+            partial: Boolean((lastPageState?.answerText || "").trim()),
           };
         }
       } else {
@@ -554,11 +622,28 @@ export async function readConversation({
           text: "",
           reason: "conversation_locator_pending",
           evidence: null,
+          partial: false,
         };
       }
 
-      if (lastResult?.status === "completed" || lastResult?.status === "needs_user") {
+      // D4: a completed result is only returned once its text has been seen
+      // unchanged on two consecutive samples. The first sighting arms a
+      // bounded confirmation window anchored at that sighting; text changes
+      // inside the window update the candidate but do not extend it, so a
+      // still-growing answer cannot hold the read open indefinitely.
+      if (lastResult?.status === "completed") {
+        if (completedCandidateText !== null && lastResult.text === completedCandidateText) {
+          return { ...lastResult, elapsedMs: nowFn() - startTime };
+        }
+        if (completedCandidateText === null) {
+          completedCandidateDeadline = nowFn() + COMPLETION_SETTLE_MS;
+        }
+        completedCandidateText = lastResult.text;
+      } else if (lastResult?.status === "needs_user") {
         return { ...lastResult, elapsedMs: nowFn() - startTime };
+      } else {
+        completedCandidateText = null;
+        completedCandidateDeadline = null;
       }
 
       if (["thinking", "streaming"].includes(lastResult?.status) &&
@@ -572,24 +657,45 @@ export async function readConversation({
         };
       }
 
-      if (nowFn() >= deadline) {
+      // The observation window is extended while a reopened tab has not
+      // rendered any message nodes (D2) or a completed candidate is awaiting
+      // its confirming sample (D4); both extensions are bounded.
+      const effectiveDeadline = Math.max(
+        deadline,
+        reopenSettleDeadline !== null && !reopenSettled ? reopenSettleDeadline : -Infinity,
+        completedCandidateDeadline !== null ? completedCandidateDeadline : -Infinity,
+      );
+      if (nowFn() >= effectiveDeadline) {
+        let result = lastResult || {
+          status: "unconfirmed",
+          state: "unconfirmed",
+          taskId: hasTaskId ? taskId : null,
+          provider: resolvedProvider,
+          conversationUrl,
+          targetId: selectedTargetId,
+          text: "",
+          reason: "observation_window_elapsed",
+          evidence: null,
+          partial: false,
+        };
+        // D4: a completed candidate whose text was still changing when the
+        // window closed is a partial stream, not a completed answer.
+        if (completedCandidateText !== null && result?.status === "completed") {
+          result = {
+            ...result,
+            status: "streaming",
+            state: "streaming",
+            reason: "completion_unsettled",
+            partial: true,
+          };
+        }
         return {
-          ...(lastResult || {
-            status: "unconfirmed",
-            state: "unconfirmed",
-            taskId: hasTaskId ? taskId : null,
-            provider: resolvedProvider,
-            conversationUrl,
-            targetId: selectedTargetId,
-            text: "",
-            reason: "observation_window_elapsed",
-            evidence: null,
-          }),
+          ...result,
           elapsedMs: nowFn() - startTime,
         };
       }
 
-      await sleepFn(Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - nowFn())));
+      await sleepFn(Math.min(POLL_INTERVAL_MS, Math.max(0, effectiveDeadline - nowFn())));
     }
   } finally {
     if (cdp) {

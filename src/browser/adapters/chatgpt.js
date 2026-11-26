@@ -51,6 +51,35 @@ export function buildAttachmentVerifyJs(fileNames) {
 })()`;
 }
 
+// F4：provider 产物的下载入口（best-effort 选择器，尚未在真机 DOM 上核实，
+// 仅作点击钩子；无匹配控件时返回 clicked:false，调用方不伪造下载记录）。
+export const downloadTriggerSelector = 'button[aria-label*="Download"], button[aria-label*="下载"], a[download], [data-testid*="download"]';
+export function buildDownloadClickJs(fileName) {
+  const wanted = typeof fileName === "string" && fileName.trim()
+    ? String(fileName).split(/[\\/]/).pop()
+    : "";
+  return `(() => {
+  const wanted = ${JSON.stringify(wanted)};
+  const labelOf = (el) => {
+    const attr = (name) => (typeof el.getAttribute === "function" ? el.getAttribute(name) : null);
+    return [el.innerText, el.textContent, attr("aria-label"), attr("title"), attr("download")].filter(Boolean).join(" ");
+  };
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    return !r || (r.width > 0 && r.height > 0);
+  };
+  const controls = [...document.querySelectorAll(${JSON.stringify(downloadTriggerSelector)})].filter(isVisible);
+  const named = wanted ? controls.filter((el) => labelOf(el).includes(wanted)) : [];
+  const target = named[0] || (wanted ? null : controls[0]) || null;
+  if (!target) {
+    return { clicked: false, reason: "download_control_not_found", matchedCount: controls.length, fileName: wanted || null };
+  }
+  target.click();
+  return { clicked: true, matchedCount: controls.length, fileName: wanted || null, label: labelOf(target).slice(0, 120) };
+})()`;
+}
+
 export function buildLoginProbeJs() {
   return `(() => (async () => {
   const host = location.hostname;

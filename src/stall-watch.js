@@ -27,10 +27,11 @@ function metadataSignature(info) {
   return info?.isFile() ? `${info.mtimeMs}:${info.size}:${info.ino}` : null;
 }
 
-export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = () => Date.now()) {
+export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = () => Date.now(), options = {}) {
+  const onStallEvent = typeof options.onStallEvent === "function" ? options.onStallEvent : null;
   const observed = new Map(jobs.map((job) => [job.provider, {
     id: job.id, active: false, lastLife: clock(), lastProgressLine: null,
-    metadataMtime: null, metadataKey: null, metadataState: undefined,
+    metadataMtime: null, metadataKey: null, metadataState: undefined, stallReported: false,
   }]));
 
   function progress(line) {
@@ -38,6 +39,7 @@ export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = 
     for (const item of observed.values()) {
       if (!message.includes(item.id)) continue;
       item.lastLife = clock();
+      item.stallReported = false;
       item.lastProgressLine = message.slice(0, 500);
       if (/\brunning\b|\bstarted\b|\bin_progress\b/i.test(message)) item.active = true;
     }
@@ -61,6 +63,7 @@ export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = 
         item.metadataMtime = info.mtimeMs;
         item.metadataKey = signature;
         item.lastLife = now;
+        item.stallReported = false;
         try {
           item.metadataState = JSON.parse(await readFile(metadataPath, "utf8")).state;
         } catch {
@@ -79,6 +82,21 @@ export function createStallWatch(jobs, outputDir, timeoutSeconds = 300, clock = 
           silentSeconds: Math.floor((now - item.lastLife) / 1000),
           metadataMtime: item.metadataMtime,
         };
+        // D5: one stall-declared event per silence episode, for the pause
+        // measurement log. A failing sink must never break the watch.
+        if (onStallEvent && !item.stallReported) {
+          item.stallReported = true;
+          try {
+            onStallEvent({
+              type: "stall_declared",
+              provider,
+              at: new Date(now).toISOString(),
+              silentSeconds: stalled[provider].silentSeconds,
+              lastProgressLine: item.lastProgressLine,
+              metadataMtime: item.metadataMtime,
+            });
+          } catch {}
+        }
       }
     }
     return Object.keys(stalled).length ? stalled : null;

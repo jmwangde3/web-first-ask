@@ -171,6 +171,176 @@ async function loadCompletedCodeTask(taskId, provider, { home, store }) {
   return { task, child, selected, runDir, resultPath, workspaceRoot, responseHash };
 }
 
+// F3 — integrity self-check for FILE: block extraction.
+//
+// parseFileBlocks is authoritative, but it reports only the first failure it
+// hits. This verifier additionally counts what the answer declares (FILE:
+// headers outside fenced bodies, fence opens vs closes, per-block hunk line
+// counts) so a truncated answer is rejected with expected-vs-found numbers
+// instead of being written as a partial file. Pure: no I/O.
+export function verifyFileBlockIntegrity(markdown = "") {
+  const lines = String(markdown ?? "").replace(/\r\n?/g, "\n").split("\n");
+  let fileHeaders = 0;
+  let fenceOpens = 0;
+  let fenceCloses = 0;
+  let closedHeaders = 0;
+  let inFence = false;
+  let fenceMarker = null;
+  let pendingHeader = false;
+  for (const line of lines) {
+    if (!inFence) {
+      if (/^FILE:\s*(.+?)\s*$/.test(line)) {
+        fileHeaders += 1;
+        pendingHeader = true;
+      }
+      const fence = line.match(/^(`{3,})([A-Za-z0-9_+.-]*)\s*$/);
+      if (fence) {
+        inFence = true;
+        fenceMarker = fence[1];
+        fenceOpens += 1;
+      }
+    } else if (line === fenceMarker) {
+      inFence = false;
+      fenceMarker = null;
+      fenceCloses += 1;
+      if (pendingHeader) {
+        pendingHeader = false;
+        closedHeaders += 1;
+      }
+    }
+  }
+
+  let blocks = [];
+  let parseError = null;
+  try {
+    blocks = parseFileBlocks(markdown);
+  } catch (error) {
+    parseError = error;
+  }
+
+  const blockLineCounts = blocks.map((block) => (block.kind === "replace"
+    ? { path: block.filePath, kind: block.kind,
+      anchorLines: block.anchor.split("\n").length - 1,
+      replacementLines: block.replacement.split("\n").length - 1 }
+    : { path: block.filePath, kind: block.kind,
+      lines: block.content.split("\n").length - 1 }));
+
+  const checks = [
+    { name: "fence-pairing", expected: fenceOpens, found: fenceCloses,
+      ok: fenceOpens === fenceCloses && !inFence,
+      detail: inFence ? "Answer ends inside an unterminated code fence." : null },
+    { name: "block-count", expected: fileHeaders, found: parseError ? 0 : blocks.length,
+      ok: !parseError && blocks.length === fileHeaders,
+      detail: parseError ? `${parseError.code ?? "PARSE_ERROR"}: ${parseError.message}` : null },
+    { name: "hunk-line-counts", expected: fileHeaders, found: parseError ? 0 : blockLineCounts.length,
+      ok: !parseError && blockLineCounts.every((item) => (item.kind === "replace"
+        ? item.anchorLines > 0 && item.replacementLines > 0 : item.lines > 0)),
+      detail: parseError ? "Block line counts could not be verified because parsing failed." : null },
+    { name: "trailing-truncation", expected: fileHeaders, found: closedHeaders,
+      ok: !inFence && !pendingHeader,
+      detail: (inFence || pendingHeader)
+        ? "Answer ends with a FILE: header or fence that was never closed; the answer looks truncated."
+        : null },
+  ];
+  const failures = checks.filter((check) => !check.ok);
+  return { ok: failures.length === 0, fileHeaders, fenceOpens, fenceCloses,
+    blocks: blocks.length, blockLineCounts, checks, failures,
+    parseErrorCode: parseError?.code ?? null };
+}
+
+// F3 — extract FILE: blocks from an answer to disk.
+//
+// Writes only to the explicit outputDir (a staging area), never into the
+// target repository: pass repositoryRoot to refuse an output dir inside it.
+// Replace blocks need the original file contents via `originals` (a Map or
+// plain object keyed by the FILE: path); without them the extraction refuses
+// instead of writing a guessed file. Nothing is written when the integrity
+// check fails, and every written file is re-read and hash/line-count verified
+// before the manifest is written.
+export async function extractFileBlocksToDisk(markdown = "", {
+  outputDir, originals = {}, repositoryRoot = null, allowInsideRepo = false,
+} = {}) {
+  if (!outputDir) throw new WfaError("INVALID_ARGUMENT", "extractFileBlocksToDisk requires an explicit outputDir.");
+  const outRoot = path.resolve(outputDir);
+  if (repositoryRoot && !allowInsideRepo && isInside(repositoryRoot, outRoot)) {
+    throw new WfaError("EXTRACT_OUTPUT_INSIDE_REPO", `Refusing to extract provider output into the target repository: ${outRoot}. Pass a staging outputDir outside the repository.`);
+  }
+  const report = verifyFileBlockIntegrity(markdown);
+  if (!report.ok) {
+    const summary = report.failures.map((check) =>
+      `${check.name} (expected ${check.expected}, found ${check.found}${check.detail ? `: ${check.detail}` : ""})`).join("; ");
+    throw new WfaError("FILE_BLOCK_INTEGRITY_FAILED", `Refusing to extract FILE: blocks: ${summary}`, { details: report });
+  }
+  const blocks = parseFileBlocks(markdown);
+
+  // Prepare every file's final content in memory first, so a missing
+  // original or ambiguous anchor aborts before anything is written.
+  const prepared = new Map();
+  for (const block of blocks) {
+    const safe = assertSafeRelativePath(block.filePath, outRoot);
+    const key = process.platform === "win32" ? safe.normalized.toLowerCase() : safe.normalized;
+    let item = prepared.get(key);
+    if (!item) {
+      item = { ...safe, content: null };
+      prepared.set(key, item);
+    }
+    if (block.kind === "replace") {
+      const original = originals instanceof Map
+        ? (originals.get(safe.normalized) ?? originals.get(block.filePath))
+        : (originals[safe.normalized] ?? originals[block.filePath]);
+      if (typeof original !== "string") {
+        throw new WfaError("EXTRACT_REPLACE_NEEDS_ORIGINAL", `Cannot extract ANCHOR/REPLACE block for ${safe.normalized} without the original file contents; refusing to write a guessed file.`);
+      }
+      const eol = original.includes("\r\n") ? "\r\n" : "\n";
+      const anchor = block.anchor.replaceAll("\n", eol);
+      const replacement = block.replacement.replaceAll("\n", eol);
+      const first = original.indexOf(anchor);
+      if (first === -1) throw new WfaError("ANCHOR_NOT_FOUND", `Exact ANCHOR is absent from the supplied original for ${safe.normalized}; do not guess the replacement location.`);
+      if (original.indexOf(anchor, first + 1) !== -1) {
+        throw new WfaError("ANCHOR_AMBIGUOUS", `Exact ANCHOR appears more than once in the supplied original for ${safe.normalized}; add more surrounding context.`);
+      }
+      item.content = original.slice(0, first) + replacement + original.slice(first + anchor.length);
+    } else {
+      item.content = block.content;
+    }
+  }
+
+  await mkdir(outRoot, { recursive: true });
+  await assertNoSymlinkComponents(outRoot, outRoot);
+  const files = [];
+  const written = [];
+  try {
+    for (const item of prepared.values()) {
+      await assertNoSymlinkComponents(outRoot, item.target);
+      const stagedPath = path.join(outRoot, ...item.normalized.split("/"));
+      await mkdir(path.dirname(stagedPath), { recursive: true });
+      await writeFile(stagedPath, item.content, { encoding: "utf8", mode: 0o600 });
+      written.push(stagedPath);
+      // Write-path self-check: re-read and verify hash + line count match
+      // the prepared content before reporting success.
+      const onDisk = await readFile(stagedPath, "utf8");
+      const diskSha256 = sha256(onDisk);
+      const expectedSha256 = sha256(item.content);
+      const diskLines = onDisk.split("\n").length - 1;
+      const expectedLines = item.content.split("\n").length - 1;
+      if (diskSha256 !== expectedSha256 || diskLines !== expectedLines) {
+        throw new WfaError("FILE_BLOCK_WRITE_MISMATCH", `Written file failed its self-check: ${item.normalized} (sha256 ${diskSha256} vs ${expectedSha256}, lines ${diskLines} vs ${expectedLines}).`);
+      }
+      files.push({ path: item.normalized, bytes: Buffer.byteLength(item.content, "utf8"),
+        lines: expectedLines, sha256: expectedSha256 });
+    }
+  } catch (error) {
+    for (const filePath of written) await rm(filePath, { force: true }).catch(() => {});
+    throw error;
+  }
+  const manifest = { version: 1, kind: "file-extract", sourceSha256: sha256(String(markdown ?? "")),
+    createdAt: new Date().toISOString(), files };
+  const manifestPath = path.join(outRoot, "manifest.json");
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  return { outputDir: outRoot, sourceSha256: manifest.sourceSha256,
+    blockCount: blocks.length, files, manifestPath };
+}
+
 export async function readTaskResult(taskId, {
   provider, stdout = false, home, store = new Store(home),
 } = {}) {

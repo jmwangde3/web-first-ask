@@ -302,6 +302,16 @@ export async function refreshTask(taskId, { home, store = new Store(home) } = {}
       if (stall && !["completed", "repo_unreadable", "abandoned", "stalled"].includes(child.state)) {
         child.state = "stalled";
         child.stall = stall;
+        // D5: keep a bounded stall-declared history on the run record
+        // (counts and lengths only — no prompt/response content).
+        child.stallEvents ??= [];
+        child.stallEvents.push({
+          type: "stall_declared",
+          at: new Date().toISOString(),
+          silentSeconds: stall.silentSeconds,
+          lastProgressLine: stall.lastProgressLine ?? null,
+        });
+        if (child.stallEvents.length > 20) child.stallEvents = child.stallEvents.slice(-20);
         child.error = `No progress line or metadata update for ${stall.silentSeconds} seconds, and ask-bridge's browser log was silent for the same period. Submission may have occurred; check the conversation before resending. A long generation looks identical from here, so raise --stall-timeout if the answer was still being written.`;
         child.recoveryHint = `Run wfa collect ${taskId} --provider ${provider} or wfa resolve ${taskId} --provider ${provider} --confirm after checking the browser.`;
       }

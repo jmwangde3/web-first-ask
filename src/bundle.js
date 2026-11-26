@@ -6,6 +6,23 @@ import { WfaError } from "./errors.js";
 
 export const MAX_BRIEF_CHARS = 12000;
 export const MAX_BUNDLE_BYTES = 12 * 1024 * 1024;
+// Inline bundle ceiling from bundleRepository (src/repository.js): sources
+// pasted into the prompt above this are truncated upstream, so a fallback
+// retry must use the attached archive instead.
+export const INLINE_BUNDLE_MAX_BYTES = 30 * 1024;
+
+// F8 — pick the transport for a repo-read-failure fallback retry. The attached
+// archive travels outside the prompt, so it is preferred whenever it is
+// available; the inline bundle is the fallback only when it fits the prompt
+// ceiling. Returns "none" when neither transport can carry the sources.
+export function selectRepoFallbackTransport({ inlineBytes = null, archiveAvailable = false } = {}) {
+  if (archiveAvailable) return { transport: "zip", reason: "Attached archive travels outside the prompt, so prompt truncation cannot corrupt it." };
+  if (inlineBytes !== null && inlineBytes <= INLINE_BUNDLE_MAX_BYTES) {
+    return { transport: "inline", reason: `Inline bundle is ${inlineBytes} bytes, within the ${INLINE_BUNDLE_MAX_BYTES} byte prompt ceiling.` };
+  }
+  if (inlineBytes === null) return { transport: "none", reason: "No attached archive is available and the inline bundle size is unknown." };
+  return { transport: "none", reason: `Inline bundle is ${inlineBytes} bytes, over the ${INLINE_BUNDLE_MAX_BYTES} byte prompt ceiling, and no attached archive is available.` };
+}
 
 export async function resolveBriefText({
   briefFile,

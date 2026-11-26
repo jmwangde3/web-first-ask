@@ -11,8 +11,9 @@ import { connectCdp } from "../browser/cdp.js";
 import * as defaultDriver from "../browser/driver.js";
 import * as chatgptAdapter from "../browser/adapters/chatgpt.js";
 import * as geminiAdapter from "../browser/adapters/gemini.js";
+import * as claudeAdapter from "../browser/adapters/claude.js";
 
-const ADAPTERS = Object.freeze({ chatgpt: chatgptAdapter, gemini: geminiAdapter });
+const ADAPTERS = Object.freeze({ chatgpt: chatgptAdapter, gemini: geminiAdapter, claude: claudeAdapter });
 
 function coded(code, cause) {
   const error = new Error(code, cause ? { cause } : undefined);
@@ -187,7 +188,7 @@ function normalizeUrlForMatch(value, provider) {
   const host = parsed.hostname.toLowerCase();
   const actualProvider = (host === "chatgpt.com" || host === "www.chatgpt.com")
     ? "chatgpt"
-    : (host === "gemini.google.com" ? "gemini" : null);
+    : (host === "gemini.google.com" ? "gemini" : (host === "claude.ai" ? "claude" : null));
   if (!actualProvider || (provider && actualProvider !== provider)) return null;
   const pathname = parsed.pathname.replace(/\/+$/, "") || "/";
   return `${host}${pathname}${parsed.hash}`;
@@ -239,7 +240,9 @@ async function probeLivePage({ home, provider, conversationUrl, targetId, deps =
     const target = findMatchingLiveTarget(targets, targetId, conversationUrl, normalizedProvider);
     if (!target) return null;
     const attached = await attachTabFn(cdp, target.targetId, { timeoutMs: LIVE_PAGE_PROBE_TIMEOUT_MS });
-    const pageState = await readStateFn(cdp, attached.sessionId, adapter);
+    // D8: hand the targetId to the read so the tab is activated before it
+    // is sampled; a throttled background tab must not hang the probe.
+    const pageState = await readStateFn(cdp, attached.sessionId, adapter, { targetId: target.targetId });
     return {
       targetId: target.targetId,
       url: target.url || conversationUrl || null,

@@ -5,9 +5,12 @@ import { getHomeDir } from "../paths.js";
 
 export const CONVERSATION_SCHEMA = 1;
 
-const PROVIDERS = new Set(["chatgpt", "gemini"]);
+const PROVIDERS = new Set(["chatgpt", "gemini", "claude"]);
 const CHATGPT_CONVERSATION_PATH = /^\/c\/[a-zA-Z0-9-]+\/?$/;
 const GEMINI_CONVERSATION_PATH = /^\/app\/[a-zA-Z0-9_-]+\/?$/;
+// F5 (coordinator wiring): Claude conversation URLs are /chat/<id>;
+// UNVERIFIED against the live Claude DOM — see adapters/claude.js.
+const CLAUDE_CONVERSATION_PATH = /^\/chat\/[a-zA-Z0-9-]+\/?$/;
 
 function assertIdentity(provider, conversationId) {
   if (!PROVIDERS.has(provider)) {
@@ -47,6 +50,11 @@ export function isValidConversationUrl(provider, value) {
       GEMINI_CONVERSATION_PATH.test(parsed.pathname);
   }
 
+  if (provider === "claude") {
+    return parsed.hostname === "claude.ai" &&
+      CLAUDE_CONVERSATION_PATH.test(parsed.pathname);
+  }
+
   return false;
 }
 
@@ -64,6 +72,9 @@ function isValidRetiredEntry(item, provider) {
   if (item.deletedAt !== null && (typeof item.deletedAt !== "string" || !Number.isFinite(Date.parse(item.deletedAt)))) return false;
   if (item.cleanupStatus !== null && typeof item.cleanupStatus !== "string") return false;
   if (item.cleanupAttemptedAt !== null && (typeof item.cleanupAttemptedAt !== "string" || !Number.isFinite(Date.parse(item.cleanupAttemptedAt)))) return false;
+  // F7：仅本工具创建的会话才可清理；缺失即视为既有会话（永不删除）。
+  if (item.createdByRun !== undefined && typeof item.createdByRun !== "boolean") return false;
+  if (item.createdRunId !== undefined && item.createdRunId !== null && typeof item.createdRunId !== "string") return false;
   return true;
 }
 
@@ -106,6 +117,10 @@ function isValidStoredSession(record, provider, conversationId) {
     }
   }
 
+  // F7：createdByRun / createdRunId 可选（旧记录缺失即视为既有会话）。
+  if (record.createdByRun !== undefined && typeof record.createdByRun !== "boolean") return false;
+  if (record.createdRunId !== undefined && record.createdRunId !== null && typeof record.createdRunId !== "string") return false;
+
   return true;
 }
 
@@ -122,6 +137,9 @@ export async function loadSession(home, provider, conversationId) {
     if (!Array.isArray(record.retired)) {
       record.retired = [];
     }
+    // F7：旧记录缺失创建来源时默认为既有会话，绝不进入清理集合。
+    if (record.createdByRun === undefined) record.createdByRun = false;
+    if (record.createdRunId === undefined) record.createdRunId = null;
     return record;
   } catch {
     return null;
@@ -168,6 +186,25 @@ export async function saveSession(home, provider, conversationId, patch = {}) {
     throw new Error("INVALID_CONVERSATION_INVALIDATED_REASON");
   }
 
+  // F7：创建来源。只在打开新会话时由调用方传入（createdByRun: true，
+  // createdRunId: 本次运行的 requestId/taskId）；复用既有会话时不传，
+  // 沿用旧值。URL 变化时若未传入则 fail-closed：新 URL 视为既有会话
+  // （绝不删除），旧 URL 的来源随 retired 条目保留。
+  const urlChanged = Boolean(
+    existing?.conversationUrl && conversationUrl &&
+    existing.conversationUrl !== conversationUrl,
+  );
+  const createdByRun = patch.createdByRun ?? (urlChanged ? false : (existing?.createdByRun ?? false));
+  if (typeof createdByRun !== "boolean") {
+    throw new Error("INVALID_CONVERSATION_CREATED_BY_RUN");
+  }
+  const createdRunId = patch.createdRunId !== undefined
+    ? patch.createdRunId
+    : (urlChanged ? null : (existing?.createdRunId ?? null));
+  if (createdRunId !== null && typeof createdRunId !== "string") {
+    throw new Error("INVALID_CONVERSATION_CREATED_RUN_ID");
+  }
+
   const now = new Date().toISOString();
   const createdAt = patch.createdAt ?? existing?.createdAt ?? now;
   if (typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) {
@@ -192,6 +229,8 @@ export async function saveSession(home, provider, conversationId, patch = {}) {
         deletedAt: null,
         cleanupStatus: null,
         cleanupAttemptedAt: null,
+        createdByRun: existing.createdByRun ?? false,
+        createdRunId: existing.createdRunId ?? null,
       });
     }
   }
@@ -205,6 +244,8 @@ export async function saveSession(home, provider, conversationId, patch = {}) {
     invalidated,
     invalidatedReason,
     retired,
+    createdByRun,
+    createdRunId,
     createdAt,
     updatedAt: now,
   };
@@ -260,6 +301,8 @@ export async function markDeleted(home, provider, conversationId, targetUrl, sta
       deletedAt: status === "deleted" ? now : null,
       cleanupStatus: status,
       cleanupAttemptedAt: now,
+      createdByRun: existing.createdByRun ?? false,
+      createdRunId: existing.createdRunId ?? null,
     });
     updated = true;
   }
@@ -291,4 +334,120 @@ export async function markInvalid(home, provider, conversationId, reason) {
     retired: existing?.retired ?? [],
     ...(existing?.createdAt ? { createdAt: existing.createdAt } : {}),
   });
+}
+
+// F7 — 仅清理本工具创建的会话。
+// 清理集合的唯一来源是 createdByRun === true 的记录（当前 URL + 未删的
+// retired 条目）；既有会话（createdByRun 为 false 或缺失）永远不在其中。
+// 传 runId 时进一步限定为该次运行打开的会话；不传则为该 key 下全部
+// 本工具创建且尚未删除的会话。
+export async function listCreatedConversations(home, provider, conversationId, { runId } = {}) {
+  assertIdentity(provider, conversationId);
+  const session = await loadSession(home, provider, conversationId);
+  if (!session) return [];
+
+  const matchesRun = (entry) => runId === undefined || entry?.createdRunId === runId;
+  const targets = [];
+
+  const retiredDeleted = new Set(
+    (Array.isArray(session.retired) ? session.retired : [])
+      .filter((r) => r?.deletedAt != null)
+      .map((r) => r.conversationUrl),
+  );
+  if (
+    session.createdByRun === true &&
+    matchesRun(session) &&
+    isValidConversationUrl(provider, session.conversationUrl) &&
+    !retiredDeleted.has(session.conversationUrl)
+  ) {
+    targets.push({
+      conversationUrl: session.conversationUrl,
+      createdRunId: session.createdRunId ?? null,
+      retired: false,
+    });
+  }
+
+  for (const entry of Array.isArray(session.retired) ? session.retired : []) {
+    if (
+      entry?.createdByRun === true &&
+      matchesRun(entry) &&
+      entry.deletedAt == null &&
+      isValidConversationUrl(provider, entry.conversationUrl) &&
+      !targets.some((t) => t.conversationUrl === entry.conversationUrl)
+    ) {
+      targets.push({
+        conversationUrl: entry.conversationUrl,
+        createdRunId: entry.createdRunId ?? null,
+        retired: true,
+      });
+    }
+  }
+
+  return targets;
+}
+
+// 删除 listCreatedConversations 返回的集合，且仅此集合。
+// deleteConversation 由调用方注入，签名 ({ provider, conversationUrl }) =>
+// { success: true } | { success: false, reason }，引擎侧用适配器的
+// buildDeleteConversationJs + CDP Runtime.evaluate 实现（chatgpt/gemini
+// 均已提供该函数）；未注入时不删除任何会话，只报告 wouldDelete 与缺失的 hook。
+// dryRun 同样只报告。每次删除后经 markDeleted 记账，重复调用不再重复删。
+export async function cleanupCreatedConversations(home, provider, conversationId, {
+  runId,
+  deleteConversation,
+  dryRun = false,
+  onResult,
+} = {}) {
+  assertIdentity(provider, conversationId);
+  const targets = await listCreatedConversations(home, provider, conversationId, { runId });
+  const result = {
+    status: "done",
+    dryRun: Boolean(dryRun),
+    deleted: [],
+    failed: [],
+    skipped: [],
+    wouldDelete: targets.map((t) => t.conversationUrl),
+  };
+
+  if (dryRun) return result;
+
+  if (typeof deleteConversation !== "function") {
+    return {
+      ...result,
+      status: "missing_delete_hook",
+      reason: "no deleteConversation hook: wire adapter.buildDeleteConversationJs via CDP Runtime.evaluate",
+    };
+  }
+
+  result.wouldDelete = [];
+  for (const target of targets) {
+    const url = target.conversationUrl;
+    if (!isValidConversationUrl(provider, url)) {
+      result.skipped.push({ conversationUrl: url, reason: "invalid_url" });
+      continue;
+    }
+    let outcome;
+    try {
+      outcome = await deleteConversation({ provider, conversationUrl: url });
+    } catch (err) {
+      outcome = { success: false, reason: err?.message || String(err) };
+    }
+    const entry = { conversationUrl: url };
+    if (outcome && outcome.success) {
+      await markDeleted(home, provider, conversationId, url, "deleted").catch(() => {});
+      result.deleted.push(url);
+      entry.status = "deleted";
+    } else {
+      const reason = outcome?.reason || "delete_failed";
+      await markDeleted(home, provider, conversationId, url, "failed").catch(() => {});
+      result.failed.push({ conversationUrl: url, reason });
+      entry.status = "failed";
+      entry.reason = reason;
+    }
+    if (typeof onResult === "function") {
+      try { await onResult(entry); } catch {}
+    }
+  }
+  if (result.failed.length > 0) result.status = "partial";
+  return result;
 }

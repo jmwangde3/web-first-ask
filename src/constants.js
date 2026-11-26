@@ -59,6 +59,17 @@ export const DEFAULT_CONFIG = Object.freeze({
   // still selects Chat for one request.
   geminiMode: "task",
 
+  // F6 (coordinator wiring): human-like pacing between CDP actions.
+  // Defaults match the hard-coded behaviour: 1-2s per action, 4-6s per
+  // batch, randomised. Set enabled:false (or WFA_NO_PACE=1) to disable.
+  pace: {
+    enabled: true,
+    casualMinMs: 1000,
+    casualMaxMs: 2000,
+    batchMinMs: 4000,
+    batchMaxMs: 6000,
+  },
+
   downloadImages: false,
 });
 

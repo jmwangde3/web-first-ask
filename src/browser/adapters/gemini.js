@@ -20,6 +20,89 @@ export const sendSelector = 'button[aria-label="Send message"], button[aria-labe
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证|sign in|log in|登录/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
+// ---------------------------------------------------------------------------
+// F1 — Gemini Chat/Task mode (2026-11-26).
+// Selectors carried over verbatim from the removed src/gemini-mode.js
+// (ask-bridge era; measured on Windows then: a gem-segmented-button with
+// data-value="40", labels Task / 任务, aria-pressed state). UNVERIFIED
+// against the current Gemini DOM on the CDP path — the segment value, the
+// label fallback and the aria-pressed flip must all be checked live before
+// a Task turn is trusted (see the F1 manual verification in the report).
+// Mode is page state, not URL or localStorage: a reload returns to Chat,
+// so the toggle must run after the editor is ready and before typing.
+// ---------------------------------------------------------------------------
+export const GEMINI_MODES = Object.freeze(["chat", "task"]);
+export const GEMINI_DEFAULT_MODE = "chat";
+// Segment value from the removed gemini-mode.js (TASK_SEGMENT_VALUE = "40").
+export const taskModeSegmentValue = "40";
+export const taskModeSelector = 'gem-segmented-button[data-value="40"] button[aria-pressed]';
+export const taskModeLabelSelector = "gem-segmented-button button";
+export const taskModeLabels = Object.freeze(["Task", "任务"]);
+
+// Find the Task switch, click it only when the requested mode differs from
+// the current one, and confirm aria-pressed flipped. Never throws in-page:
+// every outcome is a plain object so the engine can fail closed with a
+// distinct reason instead of guessing whether the click landed.
+// mode "chat" clicks back from Task; "task" clicks into Task.
+export function buildTaskModeJs(mode) {
+  const wanted = mode === "task" ? "task" : "chat";
+  return `(async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const labels = ${JSON.stringify(taskModeLabels)};
+  const findButton = () => {
+    const direct = document.querySelector(${JSON.stringify(taskModeSelector)});
+    if (direct) return direct;
+    return [...document.querySelectorAll(${JSON.stringify(taskModeLabelSelector)})]
+      .find((el) => labels.includes((el.innerText || el.textContent || "").trim())) || null;
+  };
+  const pressedOf = (el) => {
+    if (!el || typeof el.getAttribute !== "function") return null;
+    const v = el.getAttribute("aria-pressed");
+    return v === "true" ? true : (v === "false" ? false : null);
+  };
+  const editor = document.querySelector('[contenteditable="true"]');
+  const typedBeforeClick = editor ? (editor.innerText || editor.textContent || "").trim().length : 0;
+  const button = findButton();
+  if (!button) {
+    return { success: false, reason: "task_mode_control_not_found", mode: "unknown", typedBeforeClick };
+  }
+  const wantPressed = ${JSON.stringify(wanted)} === "task";
+  const current = pressedOf(button);
+  if (current === wantPressed) {
+    return { success: true, step: "already", mode: ${JSON.stringify(wanted)}, typedBeforeClick };
+  }
+  button.click();
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const nowPressed = pressedOf(findButton() || button);
+    if (nowPressed === wantPressed) {
+      return { success: true, step: "clicked", mode: ${JSON.stringify(wanted)}, typedBeforeClick };
+    }
+    await sleep(100);
+  }
+  return { success: false, reason: "task_mode_not_confirmed", mode: "unknown", typedBeforeClick };
+})()`;
+}
+
+// Read back which mode the page is currently in, for the turn record.
+// "unknown" when the control is absent: the caller must not claim a mode
+// it could not observe.
+export function buildGeminiModeStateJs() {
+  return `(() => {
+  const labels = ${JSON.stringify(taskModeLabels)};
+  let button = document.querySelector(${JSON.stringify(taskModeSelector)});
+  if (!button) {
+    button = [...document.querySelectorAll(${JSON.stringify(taskModeLabelSelector)})]
+      .find((el) => labels.includes((el.innerText || el.textContent || "").trim())) || null;
+  }
+  if (!button || typeof button.getAttribute !== "function") {
+    return { mode: "unknown", pressed: null, controlFound: false };
+  }
+  const pressed = button.getAttribute("aria-pressed") === "true";
+  return { mode: pressed ? "task" : "chat", pressed, controlFound: true };
+})()`;
+}
+
 // 批次 D 附件上传契约：Gemini 需点击 trigger 展开菜单，并点击 menuitem 后由 DOM 插入 input
 export const uploadTriggerSelector = 'button[aria-label="Upload & tools"]';
 export const uploadMenuItemSelector = '[role="menuitem"][aria-label^="Upload files"]';
@@ -64,13 +147,6 @@ export function buildUploadJs() {
 
   const inputReady = await waitFor(() => {
     const input = document.querySelector(${JSON.stringify(fileInputSelector)});
-  const sendBtns = [...document.querySelectorAll(${JSON.stringify(sendSelector)})];
-  const isVisible = (el) => {
-    if (!el) return false;
-    const r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
-    return !r || (r.width > 0 && r.height > 0);
-  };
-  const sendReady = sendBtns.some((b) => isVisible(b) && !b.disabled && b.getAttribute("aria-disabled") !== "true");
     return Boolean(input);
   }, 6000);
   if (!inputReady) {
@@ -82,24 +158,83 @@ export function buildUploadJs() {
 }
 
 
-// 附件成功判据（2026-11-24 真机）：Gemini 上传后出现 div.attachment-preview-wrapper，
-// 其 innerText 常为空（文件名在子结构/异步加载），故以 chip 出现为成功信号，不强求文本匹配。
+// 附件成功判据（D3，2026-11-26）：按文件名逐个验证。
+// 旧实现有两个缺陷：(1) `sendReady` 与 `bases` 在页面作用域内未定义，
+// 求值恒抛 ReferenceError，driver 永远拿不到返回值、超时后一律报
+// ATTACH_UPLOAD_FAILED；(2) `matched` 只是 `chips.length > 0` 的复写，
+// 任意 chip（含 attach 按钮本身）都算匹配。现要求每个待传文件名都出现在
+// 某 chip 的文本中（子结构文本、aria-label/title 均计入，因 Gemini 的
+// 文件名常在子结构/异步加载中），且发送按钮可用；缺失任一文件名即判失败。
 // input.files 仅诊断，不作判据。
-export const attachmentChipSelector = '[class*="attachment-preview"], [class*="file-chip"], gem-attachment-chip, [data-testid*="attachment"]';
+// 注意：旧选择器 `[data-testid*="attachment"]` 会命中 attach 按钮本身，已移除。
+export const attachmentChipSelector = '.attachment-preview-wrapper, [class*="attachment-preview"], gem-attachment-chip, [class*="file-chip"]';
 export function buildAttachmentVerifyJs(fileNames) {
   const bases = fileNames.map((fp) => String(fp).split(/[\\/]/).pop());
   return `(() => {
+  const bases = ${JSON.stringify(bases)};
   const chips = [...document.querySelectorAll(${JSON.stringify(attachmentChipSelector)})];
-  const texts = chips.map((el) => String((el && (el.innerText || el.textContent)) || "").trim());
+  const chipText = (el) => {
+    const parts = [
+      el.innerText,
+      el.textContent,
+      typeof el.getAttribute === "function" ? el.getAttribute("aria-label") : null,
+      typeof el.getAttribute === "function" ? el.getAttribute("title") : null,
+    ];
+    if (el.querySelectorAll) {
+      for (const d of el.querySelectorAll("[aria-label], [title]")) {
+        parts.push(typeof d.getAttribute === "function" ? d.getAttribute("aria-label") : null);
+        parts.push(typeof d.getAttribute === "function" ? d.getAttribute("title") : null);
+      }
+    }
+    return parts.filter(Boolean).join(" ");
+  };
+  const texts = chips.map((el) => String(chipText(el) || "").trim());
+  const matched = bases.map((b) => texts.some((t) => t.includes(b)));
   const input = document.querySelector(${JSON.stringify(fileInputSelector)});
+  const sendBtns = [...document.querySelectorAll(${JSON.stringify(sendSelector)})];
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    return !r || (r.width > 0 && r.height > 0);
+  };
+  const sendReady = sendBtns.some((b) => isVisible(b) && !b.disabled && b.getAttribute("aria-disabled") !== "true");
   return {
-    present: chips.length > 0 && sendReady,
-    matched: bases.map(() => chips.length > 0),
+    present: chips.length > 0 && matched.every(Boolean) && sendReady,
+    matched,
     chipCount: chips.length,
     chipTexts: texts.slice(0, 8),
     sendReady,
     inputFiles: input && input.files ? [...input.files].map((f) => f.name) : [],
   };
+})()`;
+}
+
+// F4：provider 产物的下载入口（best-effort 选择器，尚未在真机 DOM 上核实，
+// 仅作点击钩子；无匹配控件时返回 clicked:false，调用方不伪造下载记录）。
+export const downloadTriggerSelector = 'button[aria-label*="Download"], button[aria-label*="下载"], a[download], [data-testid*="download"]';
+export function buildDownloadClickJs(fileName) {
+  const wanted = typeof fileName === "string" && fileName.trim()
+    ? String(fileName).split(/[\\/]/).pop()
+    : "";
+  return `(() => {
+  const wanted = ${JSON.stringify(wanted)};
+  const labelOf = (el) => {
+    const attr = (name) => (typeof el.getAttribute === "function" ? el.getAttribute(name) : null);
+    return [el.innerText, el.textContent, attr("aria-label"), attr("title"), attr("download")].filter(Boolean).join(" ");
+  };
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    return !r || (r.width > 0 && r.height > 0);
+  };
+  const controls = [...document.querySelectorAll(${JSON.stringify(downloadTriggerSelector)})].filter(isVisible);
+  const named = wanted ? controls.filter((el) => labelOf(el).includes(wanted)) : [];
+  const target = named[0] || (wanted ? null : controls[0]) || null;
+  if (!target) {
+    return { clicked: false, reason: "download_control_not_found", matchedCount: controls.length, fileName: wanted || null };
+  }
+  target.click();
+  return { clicked: true, matchedCount: controls.length, fileName: wanted || null, label: labelOf(target).slice(0, 120) };
 })()`;
 }
 

@@ -10,6 +10,36 @@ export const DEFAULT_MIN_INTERVAL_MS = {
   gemini: 2000,
 };
 
+// F6：从配置解析某 provider 的最小间隔。接受：
+//   - 数字：所有 provider 共用；
+//   - { chatgpt: ms, gemini: ms } 按 provider 的映射；
+//   - { cooldown: {...} | 数字 } 或 { minIntervalMs: 数字 }。
+// 非法/缺失值回退到 DEFAULT_MIN_INTERVAL_MS。
+export function resolveMinIntervalMs(provider, config) {
+  const normalized = String(provider || "").toLowerCase();
+  const fallback = DEFAULT_MIN_INTERVAL_MS[normalized] ?? 2000;
+  if (config === undefined || config === null) return fallback;
+  if (typeof config === "number") {
+    return Number.isFinite(config) && config >= 0 ? Math.floor(config) : fallback;
+  }
+  if (typeof config !== "object") return fallback;
+  const inner = config.cooldown !== undefined ? config.cooldown : config;
+  if (typeof inner === "number") {
+    return Number.isFinite(inner) && inner >= 0 ? Math.floor(inner) : fallback;
+  }
+  if (inner && typeof inner === "object") {
+    const perProvider = inner[normalized];
+    if (perProvider !== undefined) {
+      return Number.isFinite(perProvider) && perProvider >= 0 ? Math.floor(perProvider) : fallback;
+    }
+    if (inner.minIntervalMs !== undefined) {
+      const v = inner.minIntervalMs;
+      return Number.isFinite(v) && v >= 0 ? Math.floor(v) : fallback;
+    }
+  }
+  return fallback;
+}
+
 export function getLastTurnPath(home) {
   return path.join(home || getHomeDir(), "last-turn.json");
 }
@@ -27,6 +57,7 @@ async function readLastTurnMap(filePath) {
 
 export async function enforceCooldown(home, provider, {
   minIntervalMs,
+  config,
   now = Date.now,
   sleep: sleepFn = sleep,
   onWait,
@@ -34,7 +65,7 @@ export async function enforceCooldown(home, provider, {
   const normalized = String(provider || "").toLowerCase();
   const targetInterval = minIntervalMs !== undefined
     ? Number(minIntervalMs)
-    : (DEFAULT_MIN_INTERVAL_MS[normalized] ?? 2000);
+    : resolveMinIntervalMs(normalized, config);
 
   if (targetInterval <= 0) {
     return { sleptMs: 0 };

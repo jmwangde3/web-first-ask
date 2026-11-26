@@ -19,6 +19,7 @@ import {
 import { TURN_STATES } from "./turns.js";
 import { clearBrokerRecord, readBrokerRecord } from "./lifecycle.js";
 import * as defaultJournal from "./journal.js";
+import { loadConfig } from "../config.js";
 
 const VALUE_FLAGS = new Set(["mode", "state", "timeout", "provider", "prompt", "prompt-file", "request-id"]);
 
@@ -187,7 +188,21 @@ async function handleStart(argv, deps) {
   }
 
   const makeRunner = deps.createCdpRunner || createCdpRunner;
-  const runner = makeRunner({ home, mode: runnerMode, deps });
+  // F6 (coordinator wiring): load the user config once so the runner
+  // (and runCdpTurn via deps.config) sees pace/cooldown/stagger ranges.
+  // A config load failure must not stop the broker: defaults apply.
+  let brokerConfig = deps.config ?? null;
+  if (!brokerConfig) {
+    try {
+      brokerConfig = await (deps.loadConfig || loadConfig)(home);
+    } catch {
+      brokerConfig = null;
+    }
+  }
+  const runner = makeRunner({
+    home, mode: runnerMode,
+    deps: brokerConfig ? { ...deps, config: brokerConfig } : deps,
+  });
 
   const startFn = deps.startBroker || startBroker;
   let serverInstance;
@@ -548,8 +563,8 @@ async function handleBrokerAsk(argv, deps) {
   }
 
   const provider = options.provider ? String(options.provider).toLowerCase() : "";
-  if (!provider || !["chatgpt", "gemini"].includes(provider)) {
-    stderr.write("wfa: INVALID_ARGUMENT: Provider must be chatgpt or gemini\n");
+  if (!provider || !["chatgpt", "gemini", "claude"].includes(provider)) {
+    stderr.write("wfa: INVALID_ARGUMENT: Provider must be chatgpt, gemini, or claude\n");
     return { code: 2 };
   }
 
