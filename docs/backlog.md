@@ -41,7 +41,7 @@ problem, not a product failure; file-by-file runs all exit 0.
 | D3 | **pass (fail-closed)** | `--file d3-probe.zip` → `ATTACH_UPLOAD_FAILED` in 8.2 s, `chipCount=1`, no submission (`sendCommittedAt` absent). Meets the second acceptable outcome. |
 | D4 | not run this round | last run on 2026-11-26 11:2x passed (11,909 chars from Gemini). |
 | D5 | **fail — reproduced** | run1: page finished at **29,970 chars** (title "分布式链路追踪解析与实战"), `stopVisible=false`, but the CLI waited to the **900 s** hard timeout and printed `TIMEOUT`. run2 hit Google `/sorry` and was stopped. `WFA_PAUSE_EVENTS_DIR` produced **no files**. |
-| F1 | **fail** | `geminiMode: "task"` now reaches the turn record, but twice failed at ~0.7–3 s with `gemini_mode_failed: task_mode_control_not_found`. DOM probe on the same browser shows the selector is correct (`gem-segmented-button-row[role=group]` exists, Chat/Task buttons present) — the control renders **after** `waitForEditor`, and `ensureProviderMode` checks only once. Needs a 3–5 s bounded poll. |
+| F1 | **fail** | `geminiMode: "task"` now reaches the turn record, but twice failed at ~0.7–3 s with `gemini_mode_failed: task_mode_control_not_found`. DOM probe on the same browser shows the selector is correct (`gem-segmented-button-row[role=group]` exists, Chat/Task buttons present) — the control renders **after** `waitForEditor`, and `ensureProviderMode` checks only once. **Fix (2026-11-26, branch `fix/f1-task-mode-poll`, unpushed):** bounded 5 s / 100 ms in-page poll for the Task control (`button.gem-segmented-button-action` with Task text added as a second lookup; proven segment selector unchanged), click, then verify `aria-pressed="true"` and placeholder `Describe a task` before proceeding; still fail-closed (`task_mode_control_not_found` / new `task_mode_placeholder_not_confirmed`) with `GEMINI_MODE_FAILED` before typing. Awaiting live re-verification on Windows. |
 | F4 | **pass** | `--download-dir` captured `sample.csv` (6 B); turn record carries `downloads[]` with path, size, sha256, provider, downloadedAt. CLI stdout does not print the field. |
 | F7 | **pass** | `wfa cdp cleanup --dry-run --json` listed 35 sessions / 2 candidates; filtered dry-run (`--provider gemini --conversation-id d9-muse-20261126`) listed exactly 1; real run deleted it in 2.7 s. |
 | F5 / F8 / F9 | not re-run this round | unchanged from the previous round. |
@@ -368,8 +368,20 @@ mode recorded on the turn (`geminiMode`, `evidence.geminiMode`), fail-closed wit
 acceptance: `--gemini-mode task` silently ran as Chat), so it is now passed through,
 persisted/restored, included in the request hash, and accepted by `wfa broker ask`
 (`src/broker/cli.js`); broker-layer regression tests in
-`tests/broker-turn-fields-f1-f4.test.js`. Selectors are UNVERIFIED against the current
-Gemini DOM.
+`tests/broker-turn-fields-f1-f4.test.js`. **Fix round 2 (2026-11-26, branch
+`fix/f1-task-mode-poll`):** live verification found the toggle failing in 0.7–3 s
+with `task_mode_control_not_found` — the Task control renders after
+`waitForEditor` and the toggle checked only once. `buildTaskModeJs`
+(`src/browser/adapters/gemini.js`) now polls for the control, bounded to 5 s
+at a 100 ms interval (segment selector first, then
+`button.gem-segmented-button-action` with Task text, then the label
+fallback), and for task mode verifies `aria-pressed="true"` plus the
+composer placeholder becoming `Describe a task` (new distinct reason
+`task_mode_placeholder_not_confirmed` if it never does); still fail-closed
+with `GEMINI_MODE_FAILED` before typing when the control never appears.
+Regression tests in `tests/adapters-f1-f5.test.js` (late control, action
+selector, never-appears, placeholder-unconfirmed, already-pressed).
+Selectors are UNVERIFIED against the current Gemini DOM.
 
 The Gemini web UI has a Task mode that runs code in a sandbox with Node.js and `git apply --check`. The CDP path
 only ever reaches Chat mode, so the CLI cannot use that capability. The old `gemini-mode` command has been
