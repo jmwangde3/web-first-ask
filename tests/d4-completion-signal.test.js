@@ -123,7 +123,7 @@ test("gemini pending 存在时不得 completed", async () => {
   assert.ok(res.elapsedMs >= 180000);
 });
 
-test("gemini pending 冻结后 180s 退出 stalled", async () => {
+test("gemini pending 冻结后 180s 进入 continued wait，预算耗尽后退出 stalled (D5)", async () => {
   let virtualTime = 0;
   const fixedText = "Fixed 23 chars answer!!";
 
@@ -149,9 +149,15 @@ test("gemini pending 冻结后 180s 退出 stalled", async () => {
     },
   });
 
+  // D5 (2026-11-26): frozen pending with a responsive page is paused-but-
+  // alive, not dead — it is NOT declared stalled at the 180 s boundary.
+  // It keeps waiting under the 600 s continued-wait budget and is declared
+  // stalled only when that budget runs out: 180000 + 600000.
   assert.equal(res.status, "stalled");
   assert.equal(res.reason, "no_progress");
-  assert.equal(res.elapsedMs, 180000);
+  assert.equal(res.elapsedMs, 780000);
+  assert.equal(res.evidence.stallDecision?.type, "stall_continued_wait_exhausted");
+  assert.equal(res.evidence.stallDecision?.pendingCount, 198);
 });
 
 test("gemini pending 清零后正常完成", async () => {
@@ -246,6 +252,12 @@ test("gemini pending 变化刷新 stall 计时", async () => {
     baselineUserTurns: 0,
     baselineAnswerTurns: 0,
     stallTimeoutMs: 180000,
+    // D5 (2026-11-26): the last pending change is at 180 s, so the stall
+    // boundary is 360 s — but the frozen-pending page is alive, so the
+    // 600 s continued-wait budget applies (360000 + 600000 = 960000).
+    // hardTimeoutMs is raised past that so the run ends on the stall path
+    // instead of the hard timeout.
+    hardTimeoutMs: 1200000,
     pollIntervalMs: 500,
     now: () => virtualTime,
     sleep: async (ms) => {
@@ -256,7 +268,8 @@ test("gemini pending 变化刷新 stall 计时", async () => {
   assert.ok(seenTimes.includes(180000));
   assert.equal(res.status, "stalled");
   assert.equal(res.reason, "no_progress");
-  assert.equal(res.elapsedMs, 360000);
+  assert.equal(res.elapsedMs, 960000);
+  assert.equal(res.evidence.stallDecision?.type, "stall_continued_wait_exhausted");
 });
 
 test("chatgpt 行为零变化", async () => {
@@ -364,6 +377,12 @@ test("G3 R2: 永久断流正文与 pending 都不动，达到超时前退出 sta
   const res = await waitForCompletion(mockCdp, "session-perm-stall", geminiAdapter, {
     baselineUserTurns: 0,
     baselineAnswerTurns: 0,
+    // D5 (2026-11-26): frozen pending with a responsive page is alive, so
+    // the 420 s boundary starts a 600 s continued wait instead of stalling
+    // (420000 + 600000 = 1020000). hardTimeoutMs is raised past that so
+    // the run ends on the stall path; it still exits stalled before the
+    // hard timeout and never hangs forever.
+    hardTimeoutMs: 1500000,
     pollIntervalMs: 1000,
     now: () => virtualTime,
     sleep: async (ms) => {
@@ -373,6 +392,8 @@ test("G3 R2: 永久断流正文与 pending 都不动，达到超时前退出 sta
 
   assert.equal(res.status, "stalled");
   assert.equal(res.reason, "no_progress");
-  assert.equal(res.elapsedMs, 420000);
-  assert.ok(res.elapsedMs <= 900000);
+  assert.equal(res.elapsedMs, 1020000);
+  assert.ok(res.elapsedMs <= 1500000);
+  assert.equal(res.evidence.stallDecision?.type, "stall_continued_wait_exhausted");
+  assert.equal(res.evidence.stallDecision?.pendingCount, 12);
 });

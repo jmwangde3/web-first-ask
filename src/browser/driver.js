@@ -1,5 +1,6 @@
 
 import { WfaError } from "../errors.js";
+import { createAliveStallPolicy, DEFAULT_CONTINUED_WAIT_BUDGET_MS } from "../stall-alive.js";
 
 function buildEvidence(state, lastProgressAgoMs) {
   return {
@@ -854,6 +855,10 @@ export async function readTurnState(cdp, sessionId, adapter, { targetId } = {}) 
       signedOut: false,
       pageError: null,
       // D7: no page state was read, so nothing was parked.
+      // D5: no value came back from the page, so the read did not succeed —
+      // the alive/dead classifier must see this as unresponsive, not as a
+      // genuinely empty page.
+      readOk: false,
       parked: false,
     };
   }
@@ -888,6 +893,10 @@ export async function readTurnState(cdp, sessionId, adapter, { targetId } = {}) 
       signedIn: Boolean(parsed.signedIn),
       signedOut: Boolean(parsed.signedOut),
       pageError,
+      // D5: the evaluate returned a parseable page state, so the page
+      // answered this read. The alive/dead classifier uses this to tell a
+      // responsive-but-paused page from an unresponsive one.
+      readOk: true,
       parked: false,
     };
 
@@ -918,6 +927,8 @@ export async function readTurnState(cdp, sessionId, adapter, { targetId } = {}) 
       signedIn: false,
       signedOut: false,
       pageError: null,
+      // D5: the page state could not be parsed, so the read did not succeed.
+      readOk: false,
       parked: false,
     };
   }
@@ -945,6 +956,14 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   // D5 (coordinator wiring): pause tracker from stall-measurement.js.
   // Sampled once per poll; a throwing tracker must never break the wait.
   pauseTracker = null,
+  // D5 fix: continued-wait budget for a paused-but-alive turn (see
+  // src/stall-alive.js). Bounded by this AND by hardTimeoutMs. Not a CLI
+  // flag: the default applies to every CDP turn; the hard timeout stays
+  // the operator's control (--timeout).
+  continuedWaitBudgetMs = DEFAULT_CONTINUED_WAIT_BUDGET_MS,
+  // D5 fix: extra sink for stall decisions, in addition to the pause
+  // tracker. Best-effort; a throwing sink must never break the wait.
+  onStallDecision = null,
 } = {}) {
   const startTime = now();
   let lastProgressAt = startTime;
@@ -960,6 +979,23 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   // 三方裁决（2026-11-25 第七轮 3:0）：ChatGPT 的完成一律要求正面信号，
   // 停止按钮不参与完成判定（实测 0x0 且回答结束后长期不翻转）。
   const requiresActions = adapter.requiresCompletionActions === true;
+
+  // D5 fix: alive/dead stall policy. Decisions flow into the pause tracker
+  // (recordDecision) so they land in the same opt-in pause-event log, and
+  // to the caller's onStallDecision sink. Both are best-effort.
+  const aliveStallPolicy = createAliveStallPolicy({
+    stallTimeoutMs,
+    continuedWaitBudgetMs,
+    now,
+    onDecision: (decision) => {
+      try {
+        pauseTracker?.recordDecision?.(decision);
+      } catch {}
+      try {
+        onStallDecision?.(decision);
+      } catch {}
+    },
+  });
 
   // D8: activate the tab once, before the first read — not on every poll,
   // so the window is not repeatedly disturbed while the turn runs.
@@ -1097,6 +1133,9 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     if (textProgressed || pendingProgressed) {
       lastProgressAt = now();
       lastActivityAt = now();
+      // D5 fix: progress ends the silence episode, so a later silence gets
+      // a fresh continued-wait budget instead of reusing a spent one.
+      aliveStallPolicy.noteProgress();
       if (textProgressed) {
         lastAnswerChars = currentChars;
         lastAnswerText = currentText;
@@ -1133,18 +1172,44 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 
     if (now() - lastProgressAt >= stallTimeoutMs) {
       if (!requiresActions) {
-        return {
-          status: "stalled",
-          reason: "no_progress",
-          text: belongs ? (state.answerText || "") : "",
-          elapsedMs: now() - startTime,
-          evidence: buildEvidence(state, now() - lastProgressAt),
-        };
-      }
-      // ChatGPT（三方裁决 B@180，2026-11-25 3:0）：正文为空说明仍在思考，等到 hardTimeout；
-      // 正文非空且已归属本轮、却连续 stallTimeoutMs 仍拿不到正面信号 → 缺信号退出（非成功）。
-      // 绝不因超时把缺信号的正文标成 completed。
-      if (belongs && hasAnswer && !actionsDone) {
+        // D5 fix: 420 s is a classification boundary, not a stall
+        // declaration. A paused-but-alive turn (page responsive,
+        // pendingCount > 0) keeps waiting under the continued-wait budget
+        // and is re-classified on every poll; a dead turn is declared
+        // stalled exactly as before. The decision is recorded in the pause
+        // log via the policy's onDecision sink and in evidence below.
+        // stopVisible is deliberately NOT an alive signal: Gemini's stop
+        // button disappears during a long-thinking pause (see the completed
+        // branch comment below), so only pendingCount counts as in-flight.
+        const outcome = aliveStallPolicy.evaluate({
+          silentMs: now() - lastProgressAt,
+          pendingCount: Number.isInteger(state.pendingCount) ? state.pendingCount : 0,
+          // A state object without readOk (e.g. older mocks) came from a
+          // read that returned a value, so it counts as responsive.
+          readOk: state.readOk !== false,
+          completionSignal: state.answerActionsVisible === true,
+          answerChars: currentChars,
+          answerTurns: Number.isInteger(state.answerTurns) ? state.answerTurns : null,
+        });
+        if (outcome.action === "stalled") {
+          return {
+            status: "stalled",
+            reason: "no_progress",
+            text: belongs ? (state.answerText || "") : "",
+            elapsedMs: now() - startTime,
+            evidence: {
+              ...buildEvidence(state, now() - lastProgressAt),
+              stallDecision: outcome.decision,
+            },
+          };
+        }
+        // Alive: fall through to the completion checks below, then keep
+        // polling until progress resumes, the page goes dead, the
+        // continued-wait budget runs out, or hardTimeoutMs hits.
+      } else if (belongs && hasAnswer && !actionsDone) {
+        // ChatGPT（三方裁决 B@180，2026-11-25 3:0）：正文为空说明仍在思考，等到 hardTimeout；
+        // 正文非空且已归属本轮、却连续 stallTimeoutMs 仍拿不到正面信号 → 缺信号退出（非成功）。
+        // 绝不因超时把缺信号的正文标成 completed。
         return {
           status: "stalled",
           reason: "no_completion_signal",
@@ -1169,6 +1234,12 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
           ...buildEvidence(state, now() - lastProgressAt),
           stopVisibleForMs,
           stopSignalDegraded: stopDegraded,
+          // D5 fix: a run that kept waiting past 420 s because it was
+          // paused-but-alive records that here (and in the pause log),
+          // so a later read can tell throttling from a freeze.
+          ...(aliveStallPolicy.decisions().length
+            ? { stallDecisions: aliveStallPolicy.decisions() }
+            : {}),
         },
       };
     }

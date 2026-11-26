@@ -176,6 +176,26 @@ pause distribution; the tracker is wired into the completion poll loop
 `pauseSummary` in turn evidence. 420 s is kept **provisionally** — one sample cannot
 establish a distribution; revisit if p90 or any completed pause exceeds 420 s.
 
+**Status (2026-11-26, fix in worktree, awaiting live verification): alive/dead stall
+strategy implemented, 420 s is now a classification boundary, not a stall declaration.**
+`src/stall-alive.js` (`createAliveStallPolicy`, `continuedWaitBudgetMs` default 600 s,
+capped by `hardTimeoutMs`) is wired into `waitForCompletion` (`src/browser/driver.js`):
+at the 420 s boundary a turn is declared `stalled` only if dead (page not answering reads
+— `readTurnState` now reports `readOk` — or `pendingCount` 0 with no completion signal);
+a paused-but-alive turn (page responsive, `pendingCount > 0`, no text growth) keeps
+waiting and is re-classified every poll until progress resumes, the page goes dead,
+the budget runs out, or the hard timeout hits. Decisions are recorded as `stall_*`
+events in the same pause log (`recordDecision` in `src/stall-measurement.js`, printed by
+`scripts/summarize-pauses.mjs`) and in turn evidence (`evidence.stallDecision` /
+`evidence.stallDecisions`). ChatGPT keeps its existing `no_completion_signal` branch
+unchanged. Still awaiting live runs to tell throttling from freeze — and the classifier
+cannot tell server-side throttling from client-side background throttling; only the
+recorded decisions plus later completion can separate them (see the procedure in
+`src/stall-alive.js`). Branch acceptance that motivated this (Windows 2026-11-26):
+5/5 background runs paused 38–52 s in, openPause 249–269 s at the 300 s cutoff, and the
+visible control also timed out at 422.9 s — with a same-day throttling confound, so no
+single cause is attributed.
+
 **Measured 2026-11-25.** With the window hidden (`visibility=hidden`):
 
 - `.pending` stayed at 378 for more than five minutes with no text change;
