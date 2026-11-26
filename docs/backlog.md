@@ -397,14 +397,17 @@ rate limiting.
 
 ### F7 — clean up conversations created by a run (P3)
 
-**Status (2026-11-26): partially done — tracking wired, cleanup trigger NOT decided.**
-The store records `createdByRun`/`createdRunId` and `cleanupCreatedConversations`
-deletes exactly that set (never pre-existing; idempotent; dry-run/missing-hook report
-`wouldDelete`); the engine now flags a newly opened conversation at save time
-(`src/engines/cdp-engine.js`). What is NOT done: when cleanup runs — no auto-delete
-was wired (deleting user-visible conversations automatically is a design decision
-for the user: explicit `wfa cdp cleanup`-style command vs post-run flag). A run that
-opens a conversation but does not complete records no flag; its URL stays on the
+**Status (2026-11-26): done — explicit trigger implemented.** The store records
+`createdByRun`/`createdRunId` and `cleanupCreatedConversations` deletes exactly
+that set (never pre-existing; idempotent; dry-run/missing-hook report
+`wouldDelete`); the engine flags a newly opened conversation at save time
+(`src/engines/cdp-engine.js`). The trigger is now the explicit user-invoked
+`wfa cdp cleanup` command (`src/engines/cdp-cli.js` → `src/engines/cdp-cleanup.js`,
+`--provider`/`--conversation-id`/`--run-id`/`--dry-run`/`--json`); a dry run
+lists `wouldDelete` without opening a browser, a real run opens Chrome once
+only when there is something to delete. No automatic post-run deletion is
+wired anywhere. Live-browser verification still outstanding. A run that opens
+a conversation but does not complete records no flag; its URL stays on the
 turn record.
 
 Delete only the conversations this tool created, never pre-existing ones. Requires the adapter to track the
@@ -412,15 +415,19 @@ conversation it opened.
 
 ### F8 — GitHub read failure fallback (P3)
 
-**Status (2026-11-26): partially done — decision + classification + record; automatic
-submit NOT wired.** `classifyProviderError` detects `REPO_UNREADABLE` (sentinel before
+**Status (2026-11-26): done — CDP path wired; ask-bridge unchanged.**
+`classifyProviderError` detects `REPO_UNREADABLE` (sentinel before
 the completed-response guard), `selectRepoFallbackTransport` prefers attached archive
 over inline bundle, `decideRepoFallback`/`recordRepoFallback` (`src/repo-fallback.js`)
 produce a deterministic follow-up turn (new request id, bundled input, never the
-original prompt). What is NOT done: nothing calls them automatically yet — the CDP
-path does not detect the sentinel at all and the ask-bridge path only records the
-manual command. Auto-submitting a follow-up turn is a behaviour change that needs a
-live run to validate; until then the manual fallback command is the path.
+original prompt). The CDP path now calls them: `wfa cdp ask` (`src/engines/cdp-cli.js`
+→ `src/engines/cdp-repo-fallback.js`) detects the sentinel on the completed turn
+and submits exactly one follow-up turn through the broker (same conversation,
+new request id, attached archive or inline bundle). The broker POST /turns
+allowlist now forwards `files` (`src/broker/server.js`, `src/broker/turns.js`) so
+the attached archive actually reaches the runner — `geminiMode`/`downloadDir`
+are still dropped (F1/F4, unchanged). The ask-bridge path still only records
+the manual command. Live-run validation still outstanding.
 
 When a provider cannot read the referenced repository, fall back to an inline source bundle or an attached
 archive automatically instead of returning `REPO_UNREADABLE` and stopping.

@@ -39,6 +39,10 @@ export function createTurn({
   // through the broker; claude was rejected outright.
   geminiMode = null,
   downloadDir = null,
+  // F8: attachment paths for the turn (absolute file paths; the runner
+  // already forwards turn.files to runCdpTurn, but the server allowlist
+  // used to drop them, so a broker-routed turn never carried attachments).
+  files = [],
   createdAt = new Date().toISOString(),
 } = {}) {
   if (typeof id !== "string" || !id.trim() ||
@@ -54,13 +58,14 @@ export function createTurn({
       (chromePath !== null && (typeof chromePath !== "string" || !chromePath.trim())) ||
       (geminiMode !== null && geminiMode !== "chat" && geminiMode !== "task") ||
       (downloadDir !== null && (typeof downloadDir !== "string" || !downloadDir.trim())) ||
+      (!Array.isArray(files) || files.some((f) => typeof f !== "string" || !f.trim())) ||
       typeof createdAt !== "string" || !Number.isFinite(Date.parse(createdAt))) {
     throw invalid("Invalid turn arguments");
   }
   return {
     id, provider, prompt, conversationId, mode, requestId,
     settleMs, stallTimeoutMs, hardTimeoutMs, minIntervalMs, chromePath,
-    geminiMode, downloadDir,
+    geminiMode, downloadDir, files: [...files],
     createdAt,
     state: "queued", startedAt: null, finishedAt: null,
     cooldownWaitMs: null, cooldownWaitAt: null,

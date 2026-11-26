@@ -348,6 +348,9 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         // (invalid values -> INVALID_ARGUMENT -> 400), never defaults them.
         ...(body.geminiMode !== undefined ? { geminiMode: body.geminiMode } : {}),
         ...(body.downloadDir !== undefined ? { downloadDir: body.downloadDir } : {}),
+        // F8: forward attachment paths so a broker-routed turn can carry
+        // files (the F8 zip fallback attaches the repo archive).
+        ...(Array.isArray(body.files) && body.files.length ? { files: body.files } : {}),
       });
       const promptSha256 = journal.hashPrompt(turn.prompt);
       let requestHash = null;
