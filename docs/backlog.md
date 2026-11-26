@@ -36,6 +36,42 @@ Live verification (2026-11-26, Windows 11 / Node 26.13.1 / Chrome 158, local bra
 | F7/F8 | partial | as described in their status lines (tracking/classification only). |
 | F9 | **pass** | `skills/web-first/SKILL.md` is 32 lines / 1,995 B. |
 
+### Live verification of the Batch 1 + Batch 2 patch bundle (branch `neon`)
+
+The patch bundle (`01-batch1-d4-d3-d1-d2.patch` + `02-batch2-d8-d7-f1.patch`, baseline `4001f14`) was applied
+on a fresh local branch `neon` as two commits — `6457aa3` (D4/D3/D1/D2) and `8fdb215` (D8/D7/F1).
+`npm run check` green, `npm test` = **514/514** (11 new tests included).
+
+| Item | Live result | Notes |
+|---|---|---|
+| D1 | **pass** | after `--no-wait`, the broker pid was unchanged at t+35 s and `read --task-id` returned `completed` ("M") directly. The baseline returned `BROKER_UNREACHABLE(committed, safeToResend=false)`. |
+| D3 | **blocked** | two runs timed out (240 s, 122 s) with `sendCommittedAt: null`; `clear-orphan` reports `NOT_FOUND`, i.e. the turn never reached submission. The attachment logic was never exercised. |
+| D4 | **blocked** | same cause as D3. |
+| F1 | **blocked** | same cause as D3. |
+
+**New blocker — Google bot-check interstitial (not a wfa defect, but it invalidates any Gemini live run):**
+starting 2026-11-26 03:39 (UTC+8), every Gemini tab in the wfa Chrome profile was redirected to
+`https://www.google.com/sorry/index?continue=https://gemini.google.com/app&q=…` — 9 of 9 existing tabs and a
+freshly opened tab alike. The `/sorry` page has no editor, so `waitForEditor` (bounded by `hardTimeoutMs`) simply
+waits until the CLI timeout. This is also why the two D3 runs above show no submission at all.
+
+Timeline across the two days: on 11-25 18:00–22:00 Gemini produced text normally but stalled mid-answer; after
+22:00 the CLI began timing out; on 11-26 03:39 the hard interstitial appeared. **The D5 result above (5/5 background
+runs stalled after 38–52 s) may therefore be compounded by provider throttling, not only by the 420 s budget.
+Re-measure at least one visible + two background runs after the interstitial clears before changing `stallTimeoutMs`.**
+
+Preconditions for re-running D3/D4/F1 on `neon`:
+
+1. Complete the reCAPTCHA manually in `C:/Users/jmwan/AppData/Local/web-first-ask/chrome-profile` and confirm
+   `https://gemini.google.com/app` renders the editor (`rich-textarea [contenteditable="true"]`).
+2. D3 must end in one of two acceptable states: the zip is attached and Gemini answers `GEMINI_ZIP_OK_2026`, or the
+   verify step fails closed with `ATTACH_UPLOAD_FAILED` **without submitting** the prompt.
+3. D4: the CLI text length should approach the DOM `textContent` (tens of thousands of chars) with no 420 s `stalled`.
+4. F1: the Task segment must show `aria-pressed="true"` with placeholder `Describe a task`, and the turn record must
+   carry `geminiMode: "task"`.
+
+Do not loop-retry Gemini while the interstitial is up — it only extends the block.
+
 Everything below was reproduced on a real Chrome with logged-in ChatGPT and Gemini accounts unless marked
 otherwise. Items marked *(unverified)* were reported but not re-confirmed with a controlled experiment.
 
