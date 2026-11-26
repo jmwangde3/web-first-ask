@@ -192,7 +192,30 @@ async function handleStatus(options, deps) {
     } catch {}
   }
 
+  // Side finding (2026-11-26 branch acceptance): this used to print the
+  // broker.json record verbatim, so a dead broker's pid/port looked live
+  // while `wfa broker status` (which verifies via discoverBroker) said
+  // not running. Verify liveness first — same isInstanceAlive check the
+  // login path already uses — and report a stale record as not running
+  // instead of presenting it as the current state. Status stays
+  // read-only: the stale file itself is cleared on the next broker start
+  // (ensureBroker / spawnDetachedBroker), not by this command.
   if (record && typeof record === "object") {
+    const checkInstanceAlive = deps.isInstanceAlive || isInstanceAlive;
+    let alive = false;
+    try {
+      alive = await checkInstanceAlive(record);
+    } catch {
+      alive = false;
+    }
+    if (!alive) {
+      if (options.json) {
+        stdout.write(`${JSON.stringify({ running: false, alive: false, message: "broker: not running" }, null, 2)}\n`);
+      } else {
+        stdout.write("broker: not running\n");
+      }
+      return { code: 0 };
+    }
     if (options.json) {
       stdout.write(`${JSON.stringify(record, null, 2)}\n`);
     } else {
