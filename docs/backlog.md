@@ -216,11 +216,17 @@ Gemini case has not been re-tested with this same-key method.
 
 ### D10 — Chrome launch restores every historical tab and can trigger Google `/sorry` (P1, 2026-11-26)
 
-**Symptom.** Every Chrome launch passes `--restore-last-session` (`src/browser/launch.js:66`) so ChatGPT's
-non-persistent `oai-asli` cookie survives a restart. On this machine one launch restored **19 tabs, 9 of them
-Gemini**, all loading concurrently. Immediately afterwards every new Gemini navigation — the landing page and a
-concrete `/app/<id>` conversation — was redirected to `https://www.google.com/sorry/…`, blocking live testing
-until Google's risk control cleared.
+**Symptom.** Every Chrome launch passes `--restore-last-session` (`src/browser/launch.js:66`). On this machine
+one launch restored **19 tabs, 9 of them Gemini**, all loading concurrently. Immediately afterwards every new
+Gemini navigation — the landing page and a concrete `/app/<id>` conversation — was redirected to
+`https://www.google.com/sorry/…`, blocking live testing until Google's risk control cleared.
+
+**Status (2026-11-26 17:10).** The premise for the switch — that ChatGPT's non-persistent `oai-asli` cookie
+would be dropped without it — was tested and disproven on this profile. After a normal exit and again after
+`taskkill /F`, relaunching **without** `--restore-last-session` kept ChatGPT signed in
+(`__Secure-next-auth.session-token.0/.1`, persistent, expiry 2027-02-24; `oai-asli` count 0) and Gemini signed
+in; no historical tabs were restored. Evidence:
+`reverdict/live-tests/20261126-1657-no-restore-session/REPORT.md`.
 
 **Why it matters.** There is no supported opt-out: the switch is hardcoded, `config.json` has no browser-args
 key, and `tests/cdp-cli.test.js:1081` asserts the flag in every mode. Clearing `Default/Sessions/*` before a

@@ -375,13 +375,16 @@ Known limits of this path: only ChatGPT and Gemini adapters exist; Claude is sti
 itself confirms a session, then closes Chrome cleanly so the profile is written out. It is the only command
 that should be used for authentication on this path.
 
-ChatGPT does not use a persistent session cookie. Its session is `oai-asli` on `chatgpt.com` with
-`is_persistent = 0`, so a browser that shuts down normally would drop it. Chrome keeps such cookies across a
-restart only when it is **started with `--restore-last-session`**, which is why `launch.js` passes that switch
-on every launch, in every mode. Measured on Windows 11 with Chrome 158: log in, close the product tab, close
-Chrome via `Browser.close` (`profile.exit_type` becomes `Normal`), relaunch with the switch, and
-`fetch('/api/auth/session')` still returns the user. A crash exit behaves the same way, because Chrome
-preserves session cookies whenever the last exit was unclean as well.
+ChatGPT's login is carried by a persistent cookie, not a session cookie. Measured on Windows 11 with Chrome
+158 on 2026-11-26: `__Secure-next-auth.session-token.0` and `.1` are `HttpOnly`, `Secure` and expire on
+2027-02-24; `oai-asli` was not present at all. With that profile, a normal exit (`Browser.close`,
+`profile.exit_type=Normal`) followed by a launch **without** `--restore-last-session` still returned the user
+from `fetch('/api/auth/session')`; the same held after `taskkill /F`. Gemini stayed logged in in both cases.
+The switch is therefore not required for login persistence.
+
+This branch's `launch.js` still passes the switch; it also restores every tab from the previous session. On
+2026-11-26 one launch restored 19 tabs (9 Gemini), all loading at once, and Google answered subsequent Gemini
+navigations with `/sorry`; see D10 in `docs/backlog.md`.
 
 Do not hand-edit `Default/Preferences` to set `session.restore_on_startup`. On Windows that preference is
 covered by `Secure Preferences` and the HMAC is invalidated, so Chrome resets it on load. The command-line
@@ -395,9 +398,9 @@ switch is the supported mechanism.
 - if the tab stays on the identity provider for 45 s, the command navigates it back to the product once, at
   most twice per run.
 
-If the profile is ever launched **without** the switch, Chrome deletes the non-persistent cookies at startup
-and the next `wfa cdp ask` returns `login_required`. Re-run `wfa cdp login`; the identity provider's
-persistent cookie usually makes that a few seconds without retyping a password.
+Earlier revisions of this document claimed that launching without the switch drops the non-persistent
+`oai-asli` cookie and forces `login_required`. That was tested on 2026-11-26 and disproven for this profile:
+it has no `oai-asli`, and both ChatGPT and Gemini stayed signed in across restarts without the switch.
 
 ## Known issues
 
