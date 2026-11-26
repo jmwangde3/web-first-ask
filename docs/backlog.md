@@ -304,17 +304,11 @@ launch did **not** prevent the restore in practice (cleared at 15:22, the next l
 **Impact.** Any Chrome restart can burn tens of minutes of Gemini quota and invalidate live runs; repeated
 broker restarts amplify it.
 
-**Candidate fixes (need tri-party review).**
-
-- `WFA_CHROME_NO_RESTORE=1` (or a config key) opt-out, accepting a ChatGPT re-login after restart.
-- Pass the switch only for ChatGPT turns; Gemini-only runs skip restore.
-- Cap the restore: after startup close every restored tab except one anchor tab, then open the target tab.
-
-**Acceptance.**
-
-- With N≥5 stored tabs, a launch either opens at most 1 Gemini tab or honours the opt-out.
-- ChatGPT session still survives a default restart.
-- A regression test covers the chosen behaviour; a live restart check shows no `/sorry`.
+**Evidence (2026-11-26).** The 15:24 verification launch restored 19 tabs (9 Gemini); `ask` runs at 15:25:5x and
+15:30:5x plus probes at 15:31 were redirected to `/sorry` (landing page and `/app/ceeb4b6cc5ca503d` alike).
+`Default/Sessions/*` cleared at 15:22 was followed by that same 19-tab restore. The D7 fast-fail added by
+`5676132` fired at 3.6 s and parked the tab. Run record:
+`reverdict/live-tests/20261126-1520-neon-hotfix/REPORT.md`.
 
 ---
 
