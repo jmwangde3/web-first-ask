@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getHomeDir } from "../paths.js";
 
@@ -122,6 +122,37 @@ function isValidStoredSession(record, provider, conversationId) {
   if (record.createdRunId !== undefined && record.createdRunId !== null && typeof record.createdRunId !== "string") return false;
 
   return true;
+}
+
+// F7 — enumerate the stored session identities for an explicit cleanup
+// sweep. Session files are named by sha256(conversationId), so the id is
+// read back from each file and the record is re-validated through
+// loadSession; corrupt or foreign files are skipped, never trusted.
+export async function listSessionIdentities(home, { providers } = {}) {
+  const root = home || getHomeDir();
+  const wanted = Array.isArray(providers) && providers.length
+    ? [...new Set(providers.map((p) => String(p).toLowerCase()))]
+    : [...PROVIDERS];
+  const identities = [];
+  for (const provider of wanted) {
+    if (!PROVIDERS.has(provider)) continue;
+    const dir = path.join(root, "conversations", provider);
+    const names = await readdir(dir).catch(() => []);
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      let record = null;
+      try {
+        record = JSON.parse(await readFile(path.join(dir, name), "utf8"));
+      } catch {
+        continue;
+      }
+      const conversationId = record?.conversationId;
+      if (typeof conversationId !== "string" || !conversationId.trim()) continue;
+      const session = await loadSession(root, provider, conversationId);
+      if (session) identities.push({ provider, conversationId });
+    }
+  }
+  return identities;
 }
 
 export async function loadSession(home, provider, conversationId) {

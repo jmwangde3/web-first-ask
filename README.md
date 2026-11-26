@@ -279,6 +279,7 @@ The `ANCHOR` must match exactly once, including surrounding lines. Missing and a
 | `wfa cdp ask --provider <p> --prompt <text>` | Native CDP turn; `background` (default), `visible`, `headless`; `--json`, `--timeout`, `--settle`, `--min-interval` |
 | `wfa cdp login [--provider <p>]` | Log in once on our own profile, verify it on the product origin, close Chrome cleanly |
 | `wfa cdp status [--json]` | Show the browser this home owns and whether a turn could start now |
+| `wfa cdp cleanup [--provider <p>] [--dry-run]` | Delete only conversations this tool created; pre-existing ones are never touched; `--dry-run` only lists them |
 | `wfa broker start [--detach]` | Run the turn queue in the foreground, or detach it with a log file |
 | `wfa broker ask --provider <p> --prompt <text> [--wait]` | Submit a turn to the queue instead of driving Chrome directly |
 | `wfa broker status \| turns \| wait <id> \| stop` | Inspect and drain the queue |

@@ -184,6 +184,7 @@ Commands:
   wfa cdp read    Read a conversation or poll a submitted turn
   wfa cdp login   Log in to a provider through native CDP
   wfa cdp status  Show native CDP / browser status
+  wfa cdp cleanup Delete only conversations this tool created [--dry-run]
   wfa broker      Turn queue: start | stop | status | turns | wait
   wfa doctor      Check Node.js and Chrome environment
   wfa install-skill [--target codex|workbuddy|path]  Install web-first Skill

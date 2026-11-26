@@ -331,6 +331,10 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
         ...(body.hardTimeoutMs !== undefined ? { hardTimeoutMs: body.hardTimeoutMs } : {}),
         ...(body.minIntervalMs !== undefined ? { minIntervalMs: body.minIntervalMs } : {}),
         ...(body.chromePath !== undefined ? { chromePath: body.chromePath } : {}),
+        // F8: forward attachment paths so a broker-routed turn can carry
+        // files (the F8 zip fallback attaches the repo archive). geminiMode
+        // and downloadDir are still dropped here (F1/F4, unchanged).
+        ...(Array.isArray(body.files) && body.files.length ? { files: body.files } : {}),
       });
       const promptSha256 = journal.hashPrompt(turn.prompt);
       let requestHash = null;

@@ -17,6 +17,8 @@ import { stageCdpResponse as defaultStageCdpResponse } from "./cdp-stage.js";
 import { expandAttachmentInputs } from "../attachments.js";
 import { readConversation as defaultReadConversation } from "./cdp-read.js";
 import { runCdpFanout as defaultRunCdpFanout, retryFanoutProvider as defaultRetryFanoutProvider, normalizeGeminiMode } from "./cdp-engine.js";
+import { runCdpCleanup as defaultRunCdpCleanup } from "./cdp-cleanup.js";
+import { maybeRepoFallback as defaultMaybeRepoFallback } from "./cdp-repo-fallback.js";
 import { extractFileBlocksToDisk as defaultExtractFileBlocks } from "../stage.js";
 
 const DEFAULT_ADAPTERS = {
@@ -46,6 +48,7 @@ const VALUE_FLAGS = new Set([
   "min-interval",
   "conversation-id",
   "request-id",
+  "run-id",
   "workspace",
   "file",
   "url",
@@ -139,6 +142,13 @@ Commands:
                  Extract FILE: blocks from a provider answer to disk (F3),
                  with an integrity self-check; a truncated answer is
                  refused, nothing is written. Never writes into a repo.
+  wfa cdp cleanup [--provider <chatgpt|gemini|claude>] [--conversation-id <id>]
+                 [--run-id <id>] [--dry-run] [--json]
+                 Delete only the conversations this tool created (F7);
+                 pre-existing conversations are never touched, and a
+                 second run deletes nothing. --dry-run lists what would
+                 be deleted without opening a browser. No automatic
+                 cleanup exists: this explicit command is the only trigger.
 
 Options:
   --provider <name>          chatgpt, gemini, or claude
@@ -158,6 +168,11 @@ Options:
                              --mode stays the window mode; --gemini-mode task is rejected for
                              non-Gemini providers and for fan-out runs.
   --conversation-id <id>     Optional conversation ID to serialize same-session turns
+  --run-id <id>            F7: with wfa cdp cleanup, delete only conversations
+                             created by this run (createdRunId); omit to clean
+                             up every conversation this tool created
+  --dry-run                  F7: with wfa cdp cleanup, list what would be deleted
+                             without opening a browser or deleting anything
   --request-id <id>          Optional idempotency key (auto-generated UUID if omitted)
   --json                     Output machine-readable JSON
   --timeout <seconds>        Overall / stall timeout in seconds
@@ -972,7 +987,7 @@ async function handleAsk(argv, deps) {
     lastCooldownKey = key;
     stderr.write(`[cdp] waiting ${(remainingMs / 1000).toFixed(1)}s for the provider interval\n`);
   };
-  const turn = await waitFn({
+  let turn = await waitFn({
     record,
     turnId,
     home,
@@ -980,6 +995,57 @@ async function handleAsk(argv, deps) {
     onProgress,
     deps,
   });
+
+  // F8 — REPO_UNREADABLE sentinel: at most one automatic bundled fallback
+  // turn (same conversation, new request id, bundled input, never the
+  // original prompt). The fallback turn's result replaces the parent's; a
+  // planning/submission failure never loses the parent answer.
+  let repoFallback = null;
+  try {
+    const fallbackFn = deps.maybeRepoFallback || defaultMaybeRepoFallback;
+    const outcome = await fallbackFn({
+      turn,
+      provider,
+      prompt,
+      parentRequestId: requestId,
+      conversationId: turn.conversationId ?? conversationId,
+      workspace: options.workspace ? path.resolve(String(options.workspace)) : process.cwd(),
+      mode,
+      settleMs,
+      stallTimeoutMs,
+      hardTimeoutMs,
+      ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
+      record,
+      home,
+      createTurn: createTurnFn,
+      waitForTurn: waitFn,
+      onProgress,
+      deps,
+    });
+    if (outcome.attempted) {
+      repoFallback = {
+        action: "retry-with-bundle",
+        transport: outcome.decision.transport,
+        newRequestId: outcome.decision.newRequestId,
+        parentTurnId: turn.id ?? turnId,
+        ...(outcome.fallbackTurn
+          ? { fallbackTurnId: outcome.fallbackTurn.id ?? null, fallbackStatus: outcome.fallbackTurn.state ?? null }
+          : {}),
+        ...(outcome.error ? { error: outcome.error } : {}),
+      };
+      if (outcome.fallbackTurn) {
+        stderr.write(`[cdp] repo fallback: REPO_UNREADABLE on turn ${turn.id ?? turnId}; submitted follow-up turn ${outcome.fallbackTurn.id ?? ""} (${outcome.decision.transport}, new request ${outcome.decision.newRequestId})\n`);
+        turn = outcome.fallbackTurn;
+      } else {
+        stderr.write(`[cdp] repo fallback: REPO_UNREADABLE on turn ${turn.id ?? turnId}; follow-up turn could not be submitted\n`);
+      }
+    } else if (outcome.detected) {
+      repoFallback = { action: "none", reason: outcome.decision.reason };
+      stderr.write(`[cdp] repo fallback: REPO_UNREADABLE on turn ${turn.id ?? turnId}; no fallback (${outcome.decision.reason})\n`);
+    }
+  } catch (error) {
+    stderr.write(`[cdp] repo fallback skipped: ${error?.code || error?.message || String(error)}\n`);
+  }
 
   const startedAtMs = Date.parse(turn.startedAt || turn.createdAt || "");
   const finishedAtMs = Date.parse(turn.finishedAt || "");
@@ -997,6 +1063,7 @@ async function handleAsk(argv, deps) {
     text: rawText,
     reason: turn.reason ?? null,
     evidence: turn.evidence ?? null,
+    ...(repoFallback ? { repoFallback } : {}),
     ...(turn.sendCommittedAt != null ? { sendCommittedAt: turn.sendCommittedAt } : {}),
     elapsedMs,
   };
@@ -1110,6 +1177,75 @@ async function handleExtract(argv, deps = {}) {
   return { code: 0, ...result };
 }
 
+// F7 — the ONLY cleanup trigger: an explicit user-invoked command. No
+// automatic post-run deletion is wired anywhere. Deletes only
+// conversations flagged createdByRun/createdRunId (see cdp-cleanup.js);
+// pre-existing conversations are never targets, and the run is idempotent.
+async function handleCleanup(argv, deps = {}) {
+  const stdout = deps.stdout || process.stdout;
+  const stderr = deps.stderr || process.stderr;
+  const home = deps.home || getHomeDir();
+  const { positional, options } = parseArgs(argv);
+  if (options.help) {
+    printCdpHelp(stdout);
+    return { code: 0 };
+  }
+  if (positional.length) {
+    throw new WfaError("INVALID_ARGUMENT", "wfa cdp cleanup does not accept positional arguments.");
+  }
+  const provider = options.provider === undefined ? undefined : String(options.provider).toLowerCase();
+  if (provider !== undefined && !["chatgpt", "gemini", "claude"].includes(provider)) {
+    throw new WfaError("INVALID_ARGUMENT", `Invalid provider "${options.provider}". Must be chatgpt, gemini, or claude.`);
+  }
+  const conversationId = options["conversation-id"] === undefined
+    ? undefined
+    : String(options["conversation-id"]).trim();
+  if (conversationId !== undefined && !conversationId) {
+    throw new WfaError("INVALID_ARGUMENT", "Option --conversation-id must be a non-empty string.");
+  }
+  const runId = options["run-id"] === undefined ? undefined : String(options["run-id"]).trim();
+  if (runId !== undefined && !runId) {
+    throw new WfaError("INVALID_ARGUMENT", "Option --run-id must be a non-empty string.");
+  }
+
+  const cleanupFn = deps.runCdpCleanup || defaultRunCdpCleanup;
+  const result = await cleanupFn({
+    home,
+    ...(provider !== undefined ? { provider } : {}),
+    ...(conversationId !== undefined ? { conversationId } : {}),
+    ...(runId !== undefined ? { runId } : {}),
+    dryRun: Boolean(options["dry-run"]),
+    ...(options["chrome-path"] ? { chromePath: String(options["chrome-path"]) } : {}),
+    ...(deps.recoverBrowser ? { recover: deps.recoverBrowser } : {}),
+    ...(deps.connectCdp ? { connect: deps.connectCdp } : {}),
+    ...(deps.driver ? { driver: deps.driver } : {}),
+    ...(deps.adapters ? { adapters: deps.adapters } : {}),
+    ...(deps.conversationStore ? { conversationStore: deps.conversationStore } : {}),
+  });
+
+  if (options.json) {
+    stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else if (result.dryRun) {
+    if (!result.wouldDelete.length) {
+      stdout.write("[cdp] cleanup (dry run): nothing created by this tool to delete\n");
+    } else {
+      stdout.write(`[cdp] cleanup (dry run): would delete ${result.wouldDelete.length} conversation(s) created by this tool:\n`);
+      for (const url of result.wouldDelete) stdout.write(`  - ${url}\n`);
+      stdout.write("[cdp] pre-existing conversations are never deleted; re-run without --dry-run to delete these\n");
+    }
+  } else if (!result.deleted.length && !result.failed.length) {
+    stdout.write("[cdp] cleanup: nothing created by this tool to delete\n");
+  } else {
+    for (const url of result.deleted) stdout.write(`[cdp] cleanup: deleted ${url}\n`);
+    for (const failure of result.failed) {
+      stderr.write(`[cdp] cleanup: failed to delete ${failure.conversationUrl}: ${failure.reason}\n`);
+    }
+    stdout.write(`[cdp] cleanup: deleted ${result.deleted.length}, failed ${result.failed.length}\n`);
+  }
+
+  return { code: result.status === "partial" ? 1 : 0, result };
+}
+
 export async function runCdpCommand(argv = [], deps = {}) {
   const stdout = deps.stdout || process.stdout;
   const stderr = deps.stderr || process.stderr;
@@ -1120,8 +1256,8 @@ export async function runCdpCommand(argv = [], deps = {}) {
   }
 
   const subcmd = argv[0];
-  if (!subcmd || !["ask", "read", "status", "login", "extract"].includes(subcmd)) {
-    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|read|status|login|extract>\n`);
+  if (!subcmd || !["ask", "read", "status", "login", "extract", "cleanup"].includes(subcmd)) {
+    stderr.write(`wfa: UNKNOWN_COMMAND: Unknown or missing cdp subcommand "${subcmd || ""}". Usage: wfa cdp <ask|read|status|login|extract|cleanup>\n`);
     return { code: 2 };
   }
 
@@ -1140,6 +1276,7 @@ export async function runCdpCommand(argv = [], deps = {}) {
     }
     if (subcmd === "read") return await handleRead(argv.slice(1), deps);
     if (subcmd === "extract") return await handleExtract(argv.slice(1), deps);
+    if (subcmd === "cleanup") return await handleCleanup(argv.slice(1), deps);
     return await handleAsk(argv.slice(1), deps);
   } catch (error) {
     if (error instanceof WfaError) {
