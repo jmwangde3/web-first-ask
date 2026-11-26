@@ -14,8 +14,27 @@ below, with the manual command to run on Windows. Per-item status lines were add
 each heading; nothing else in this file was rewritten.
 
 Live verification (2026-11-26, Windows 11 / Node 26.13.1 / Chrome 158, local branch `muse` built from
-`backlog/d1-f9` @ `5146c1b`): `npm test` = **657/657**, `npm run check` green. Live results are appended to
-each item's status as they run; **D2 has been run and fails** (see its status line).
+`backlog/d1-f9` @ `5146c1b`): `npm test` = **657/657**, `npm run check` green. Results:
+
+| Item | Live result | Notes |
+|---|---|---|
+| D1 | **pass** | broker survived a 35 s gate and an ~8 min generation; `read --task-id` completed both times (21,986 chars). |
+| D2 | **fail** | first read empty on both the restored-tab path and the `openTab` path; see the D2 status line. |
+| D3 | **fail** | a 421 KB zip was not attached, the prompt was still submitted, and the CLI timed out instead of failing closed. |
+| D4 | **pass** | Gemini 11,909 chars / ChatGPT 25,391 chars; no missing sections, code blocks match the DOM. |
+| D5 | **reproduced** | 5/5 background runs stalled after 38–52 s (pending 482–658, ~20 chars), still open at the 300 s cutoff; a visible run also timed out at 423 s. May be compounded by provider throttling. |
+| D6 | not reproduced | repeated continuations all submitted normally. |
+| D7 | not triggered | no Cloudflare interstitial during the run. |
+| D8 | **pass** (focus) | a read of a background tab took 2.8 s and did not steal focus; launching Chrome itself may. |
+| D9 | **pass** | same conversation and `userTurns` 1→2 for both Gemini and ChatGPT. |
+| F1 | **fail** | `POST /turns` drops `geminiMode`, so `--gemini-mode task` silently runs in Chat mode. |
+| F2 | **pass** | parallel fan-out produced per-provider files; retry refused a completed provider. |
+| F3 | **pass** | extraction + manifest/hash; truncated answer refused with zero writes. |
+| F4 | **fail** | ChatGPT produced a downloadable file but nothing was captured (`downloads: null`); same `POST /turns` allowlist also drops `downloadDir`. |
+| F5 | not run | Claude was not logged in (`login` timed out after 60 s). |
+| F6 | **pass** | pacing measured: casual 1.1–2.0 s, batch 4.8–5.2 s, disabled 0 ms. |
+| F7/F8 | partial | as described in their status lines (tracking/classification only). |
+| F9 | **pass** | `skills/web-first/SKILL.md` is 32 lines / 1,995 B. |
 
 Everything below was reproduced on a real Chrome with logged-in ChatGPT and Gemini accounts unless marked
 otherwise. Items marked *(unverified)* were reported but not re-confirmed with a controlled experiment.
@@ -125,6 +144,12 @@ than stated: Gemini `buildAttachmentVerifyJs` referenced free variables (`sendRe
 filename-verified chips, selector no longer matches the attach button, fail-closed with
 `ATTACH_UPLOAD_FAILED` and no submission. ChatGPT already verified by name (locked by test).
 
+**Live verification (2026-11-26, Windows): FAILS.** A 421,605-byte zip was not attached
+(Gemini answered "No attachment or zip file was provided", the conversation DOM had no file name and only a
+zero-height `div.file-preview-container`), yet the prompt **was** submitted (`sendCommittedAt` set) and the CLI
+timed out after 150 s instead of returning `ATTACH_UPLOAD_FAILED`. The verify check apparently saw a transient
+chip with the file name and let the submit through; add a post-submit confirmation for attachment chips.
+
 **Symptom.** `wfa cdp ask --file <archive>` passes the attachment check, the prompt is submitted, but the
 provider receives no file. Gemini answers `REPO_UNREADABLE`; ChatGPT has historically answered
 "No file is attached".
@@ -188,6 +213,12 @@ pause distribution; the tracker is wired into the completion poll loop
 `WFA_PAUSE_EVENTS_DIR` (or `deps.pauseEventsDir`), writing `<dir>/<requestId>.jsonl` and a
 `pauseSummary` in turn evidence. 420 s is kept **provisionally** — one sample cannot
 establish a distribution; revisit if p90 or any completed pause exceeds 420 s.
+
+**Live verification (2026-11-26, Windows): reproduced.** Five background runs all entered a pause at
+38–52 s (pending 482–658, answer text stuck at 18–25 chars) and were still paused when the 300 s CLI
+timeout fired (`openPauseMs` 249–269 s; `summarize-pauses.mjs`: 5 open/censored pauses). A visible control
+run also timed out at 423 s. Caveat: many long prompts were sent in a row today, so provider throttling cannot
+be ruled out; yesterday the same prompt finished in 27–55 s.
 
 **Measured 2026-11-25.** With the window hidden (`visibility=hidden`):
 
@@ -301,6 +332,11 @@ mode recorded on the turn (`geminiMode`, `evidence.geminiMode`), fail-closed wit
 (`src/broker/turns.js` accepts `geminiMode`, runner forwards it). Selectors are
 UNVERIFIED against the current Gemini DOM.
 
+**Live verification (2026-11-26, Windows): FAILS.** With `--gemini-mode task` the model answered
+"I don't have access to a code execution sandbox…" and the turn record/JSON had no `geminiMode` field:
+`POST /turns` (`src/broker/server.js`) never copies `body.geminiMode` into `createTurn`, so the flag is
+silently dropped before the engine sees it. Add the field (and a broker-level regression test).
+
 The Gemini web UI has a Task mode that runs code in a sandbox with Node.js and `git apply --check`. The CDP path
 only ever reaches Chat mode, so the CLI cannot use that capability. The old `gemini-mode` command has been
 removed; the CDP path needs the mode toggle in the page plus adapter state for it.
@@ -340,6 +376,11 @@ wait, SHA-256 verification, distinct fail-closed codes) + download-click hooks i
 adapters + engine wiring by the coordinator: `wfa cdp ask --download-dir <dir>` captures
 after a completed turn and records `downloads[]` on the turn (broker copies it through).
 Download-control selectors are best-effort and UNVERIFIED against the live DOM.
+
+**Live verification (2026-11-26, Windows): FAILS.** ChatGPT created a downloadable `sample.csv` and the
+answer confirmed it, but `--download-dir` produced no file and `downloads` stayed `null`. Root cause: the same
+`POST /turns` allowlist that drops `geminiMode` also drops `downloadDir`, so `cdp-engine.js`'s
+`if (downloadDir && …)` never runs. Add both fields at the broker boundary.
 
 Currently there is no download capability at all: no `Page.setDownloadBehavior`, and the `downloads` field in
 turn records is always `null`. Collecting an attachment a provider produced requires clicking the download and
