@@ -136,6 +136,14 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
   const requests = new Map();
   const controllers = new Map();
   const active = new Map();
+  const pendingPersists = new Set();
+
+  function trackPersist(promise) {
+    const tracked = Promise.resolve(promise);
+    pendingPersists.add(tracked);
+    tracked.finally(() => { pendingPersists.delete(tracked); });
+    return tracked;
+  }
   let server;
   let idleTimer;
   let closePromise;
@@ -164,16 +172,18 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     else idleSince ??= Date.now();
   }
 
-  async function persistTurnSnapshot(turn) {
-    if (!turn || typeof turnStore.recordTurn !== "function") return;
-    try {
-      await turnStore.recordTurn(home, turn);
-    } catch (error) {
-      log("turn_persist_failed", {
-        turnId: turn.id,
-        code: String(error?.code ?? "TURN_WRITE_FAILED"),
-      });
-    }
+  function persistTurnSnapshot(turn) {
+    if (!turn || typeof turnStore.recordTurn !== "function") return Promise.resolve();
+    return trackPersist((async () => {
+      try {
+        await turnStore.recordTurn(home, turn);
+      } catch (error) {
+        log("turn_persist_failed", {
+          turnId: turn.id,
+          code: String(error?.code ?? "TURN_WRITE_FAILED"),
+        });
+      }
+    })());
   }
 
   async function updateProgress(id, patch) {
@@ -197,20 +207,22 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
     }));
   }
 
-  async function persistTurnResult(turn) {
+  function persistTurnResult(turn) {
     if (!turn || (!TERMINAL_STATES.includes(turn.state) &&
         turn.state !== "needs_human" && turn.state !== "takeover")) {
-      return;
+      return Promise.resolve();
     }
-    try {
-      await resultStore.recordResult(home, turn);
-    } catch (error) {
-      log("result_persist_failed", { turnId: turn.id, code: String(error?.code ?? "RESULT_WRITE_FAILED") });
-      return;
-    }
-    await journal.clearCommit(home, turn.id).catch((error) => {
-      log("journal_clear_failed", { turnId: turn.id, code: String(error?.code ?? "JOURNAL_CLEAR_FAILED") });
-    });
+    return trackPersist((async () => {
+      try {
+        await resultStore.recordResult(home, turn);
+      } catch (error) {
+        log("result_persist_failed", { turnId: turn.id, code: String(error?.code ?? "RESULT_WRITE_FAILED") });
+        return;
+      }
+      await journal.clearCommit(home, turn.id).catch((error) => {
+        log("journal_clear_failed", { turnId: turn.id, code: String(error?.code ?? "JOURNAL_CLEAR_FAILED") });
+      });
+    })());
   }
 
   function runTurn(turn) {
@@ -463,6 +475,10 @@ export async function startBroker({ home, mode = "off", runner, idleTimeoutMs = 
               Promise.resolve().then(() => runner.cancel(id)).catch(() => {});
             }
           }
+        }
+        // Wait for any in-flight turn/result/journal persistence started during active shutdown.
+        while (pendingPersists.size && Date.now() < deadline) {
+          await boundedWait(Promise.allSettled([...pendingPersists]), Math.max(1, deadline - Date.now()));
         }
       } finally {
         try {

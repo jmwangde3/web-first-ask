@@ -344,6 +344,7 @@ export function buildReadStateJs() {
     stopVisible,
     editorEmpty,
     title,
+    url: typeof location !== "undefined" && typeof location.href === "string" ? location.href : "",
     hasChallenge,
     loggedOut,
     signedIn,

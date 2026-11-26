@@ -723,6 +723,7 @@ export async function runCdpTurn({
         baselineUserTurns,
         baselineAnswerTurns,
         baselineAnswerText,
+        baselineUrl: conversationUrl || "",
         settleMs,
         stallTimeoutMs,
         hardTimeoutMs,

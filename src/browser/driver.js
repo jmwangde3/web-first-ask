@@ -753,6 +753,7 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
     : null;
   if (verifyJs) {
     let diag = null;
+    let verifyPolls = 0;
     const deadline = now() + attachmentVerifyTimeoutMs;
     while (now() < deadline) {
       if (signal?.aborted) {
@@ -760,6 +761,7 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
         err.code = "CANCELLED";
         throw err;
       }
+      verifyPolls += 1;
       const res = await cdp.send("Runtime.evaluate", {
         expression: verifyJs,
         returnByValue: true,
@@ -769,10 +771,21 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
       await sleep(attachmentVerifyIntervalMs);
     }
     if (!diag?.present) {
+      const diagnostics = {
+        provider: adapter?.id || "unknown",
+        expectedFiles: absolutePaths.map((fp) => path.basename(fp)),
+        verifyPolls,
+        inputFiles: diag?.inputFiles ?? null,
+        chipCount: diag?.chipCount ?? 0,
+        chipTexts: diag?.chipTexts ?? [],
+        matched: diag?.matched ?? [],
+        sendReady: diag?.sendReady ?? null,
+      };
       throw new WfaError(
         "ATTACH_UPLOAD_FAILED",
         `Attachment chip not visible within ${attachmentVerifyTimeoutMs}ms for ${adapter?.id || "unknown"}. ` +
-          `diagnostics=${JSON.stringify({ inputFiles: diag?.inputFiles ?? null, chipCount: diag?.chipCount ?? 0 })}`
+          `diagnostics=${JSON.stringify(diagnostics)}`,
+        { details: diagnostics },
       );
     }
   }
@@ -948,6 +961,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       stopVisible: false,
       editorEmpty: false,
       title: "",
+      url: "",
       hasChallenge: false,
       loggedOut: false,
       hasProseMirror: false,
@@ -982,6 +996,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       stopVisible: Boolean(parsed.stopVisible),
       editorEmpty: parsed.editorEmpty !== null && parsed.editorEmpty !== undefined ? Boolean(parsed.editorEmpty) : null,
       title: typeof parsed.title === "string" ? parsed.title : "",
+      url: typeof parsed.url === "string" ? parsed.url : "",
       hasChallenge: Boolean(parsed.hasChallenge),
       loggedOut: Boolean(parsed.loggedOut),
       hasProseMirror: Boolean(parsed.hasProseMirror),
@@ -1001,6 +1016,7 @@ export async function readTurnState(cdp, sessionId, adapter) {
       stopVisible: false,
       editorEmpty: null,
       title: "",
+      url: "",
       hasChallenge: false,
       loggedOut: false,
       hasProseMirror: false,
@@ -1016,9 +1032,11 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   baselineAnswerTurns = 0,
   baselineUserTurns = 0,
   baselineAnswerText = "",
+  baselineUrl = "",
   settleMs = 4000,
   unresolvedGraceMs = 6000,
   stopGraceMs = 60000,
+  stalePendingMs = 60000,
   hardTimeoutMs = 900000,
   stallTimeoutMs = 420000,
   ackTimeoutMs = 30000,
@@ -1031,6 +1049,8 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
   let lastProgressAt = startTime;
   let lastActivityAt = startTime;
   let lastPendingCount = 0;
+  let lastPendingChangedAt = startTime;
+  let sawStopVisible = false;
   let hasAcked = false;
   let lastBelongsToCurrentTurn = false;
   let lastAnswerChars = 0;
@@ -1079,6 +1099,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     lastBelongsToCurrentTurn = belongs;
 
     if (state.stopVisible) {
+      sawStopVisible = true;
       if (stopVisibleSince === null) stopVisibleSince = now();
       unresolvedSince = null;
     } else {
@@ -1111,12 +1132,19 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     }
 
     if (!hasAcked) {
-      const ackConfirmed = (state.userTurns > baselineUserTurns) || (state.editorEmpty === true);
+      const urlAdvanced = Boolean(baselineUrl && state.url && state.url !== baselineUrl);
+      const ackConfirmed =
+        (state.userTurns > baselineUserTurns) ||
+        (state.editorEmpty === true) ||
+        (state.answerTurns > baselineAnswerTurns) ||
+        Boolean(state.stopVisible) ||
+        urlAdvanced;
       if (ackConfirmed) {
         hasAcked = true;
         lastProgressAt = now();
         lastActivityAt = now();
         lastPendingCount = Number.isInteger(state.pendingCount) ? state.pendingCount : 0;
+        lastPendingChangedAt = now();
         lastAnswerText = state.answerText || "";
         lastAnswerChars = lastAnswerText.length;
       } else {
@@ -1147,10 +1175,22 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
 
     const currentText = state.answerText || "";
     const currentChars = currentText.length;
-    const collapsedPendingFrozen = Boolean(state.collapsed) && !state.stopVisible && currentAnswerText.length > 0;
-    const currentPendingCount = !requiresActions && !collapsedPendingFrozen && Number.isInteger(state.pendingCount)
+    const rawPendingCount = !requiresActions && Number.isInteger(state.pendingCount)
       ? state.pendingCount
       : 0;
+    if (rawPendingCount !== lastPendingCount) {
+      lastPendingChangedAt = now();
+    }
+    const collapsedPendingFrozen = Boolean(state.collapsed) && !state.stopVisible && currentAnswerText.length > 0;
+    const stalePendingFallback =
+      !requiresActions &&
+      rawPendingCount > 0 &&
+      !state.stopVisible &&
+      belongs &&
+      currentAnswerText.length > 0 &&
+      state.answerActionsVisible === true &&
+      (now() - lastPendingChangedAt) >= stalePendingMs;
+    const currentPendingCount = (collapsedPendingFrozen || stalePendingFallback) ? 0 : rawPendingCount;
     const textProgressed = currentChars > lastAnswerChars || (currentText && currentText !== lastAnswerText);
     const pendingProgressed = !requiresActions && currentPendingCount > 0 && currentPendingCount !== lastPendingCount;
     if (textProgressed || pendingProgressed) {
@@ -1162,7 +1202,7 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
       }
       unresolvedSince = null;
     }
-    lastPendingCount = currentPendingCount;
+    lastPendingCount = rawPendingCount;
 
     const stopVisibleForMs = stopVisibleSince === null ? 0 : now() - stopVisibleSince;
     const stopGone = !state.stopVisible;
@@ -1218,16 +1258,20 @@ export async function waitForCompletion(cdp, sessionId, adapter, {
     }
 
     // 必须确认本轮产生了新答案，才允许 completed；否则旧答案会从各终态分支泄漏（裁决见 wfa-resume-bug-verdict.md）。
-    if (belongs && hasAnswer && settled && stopGateSatisfied && actionsDone) {
+    const effectiveActionsDone = actionsDone || stalePendingFallback;
+    if (belongs && hasAnswer && settled && stopGateSatisfied && effectiveActionsDone) {
       return {
         status: "completed",
-        reason: !requiresActions && stopDegraded ? "completed_stop_signal_unreliable" : "completed",
+        reason: stalePendingFallback
+          ? "completed_stale_pending_fallback"
+          : (!requiresActions && stopDegraded ? "completed_stop_signal_unreliable" : "completed"),
         text: state.answerText,
         elapsedMs: now() - startTime,
         evidence: {
           ...buildEvidence(state, now() - lastProgressAt),
           stopVisibleForMs,
           stopSignalDegraded: stopDegraded,
+          ...(stalePendingFallback ? { stalePendingFallback: true } : {}),
         },
       };
     }

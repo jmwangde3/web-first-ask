@@ -19,8 +19,12 @@ import {
 import { TURN_STATES } from "./turns.js";
 import { clearBrokerRecord, readBrokerRecord } from "./lifecycle.js";
 import * as defaultJournal from "./journal.js";
+import { expandAttachmentInputs } from "../attachments.js";
 
-const VALUE_FLAGS = new Set(["mode", "state", "timeout", "provider", "prompt", "prompt-file", "request-id"]);
+const VALUE_FLAGS = new Set([
+  "mode", "state", "timeout", "provider", "prompt", "prompt-file", "request-id",
+  "file", "conversation-id", "gemini-mode", "download-dir",
+]);
 
 function parseArgs(argv) {
   const positional = [];
@@ -45,7 +49,12 @@ function parseArgs(argv) {
     } else {
       value = true;
     }
-    options[name] = value;
+    if (name === "file") {
+      if (!Array.isArray(options.file)) options.file = [];
+      options.file.push(value);
+    } else {
+      options[name] = value;
+    }
   }
   return { positional, options };
 }
@@ -596,6 +605,43 @@ async function handleBrokerAsk(argv, deps) {
     timeoutSec = t;
   }
 
+  let conversationId = null;
+  if (options["conversation-id"] !== undefined) {
+    conversationId = String(options["conversation-id"]).trim();
+    if (!conversationId) {
+      stderr.write("wfa: INVALID_ARGUMENT: Option --conversation-id must be a non-empty string.\n");
+      return { code: 2 };
+    }
+  }
+
+  let geminiMode = null;
+  if (options["gemini-mode"] !== undefined) {
+    geminiMode = String(options["gemini-mode"]).trim().toLowerCase();
+    if (!["chat", "task"].includes(geminiMode)) {
+      stderr.write(`wfa: INVALID_ARGUMENT: Invalid --gemini-mode: ${options["gemini-mode"]}. Must be chat or task.\n`);
+      return { code: 2 };
+    }
+  }
+
+  let downloadDir = null;
+  if (options["download-dir"] !== undefined) {
+    downloadDir = path.resolve(String(options["download-dir"]).trim());
+  }
+
+  let attachedFiles = [];
+  if (Array.isArray(options.file) && options.file.length > 0) {
+    try {
+      const expanded = await expandAttachmentInputs({
+        files: options.file,
+        cwd: deps.cwd || process.cwd(),
+      });
+      attachedFiles = expanded.files || [];
+    } catch (err) {
+      stderr.write(`wfa: ${err?.code || "ATTACH_INVALID"}: ${err?.message || String(err)}\n`);
+      return { code: 2 };
+    }
+  }
+
   const ensureFn = deps.ensureBroker || ensureBroker;
   let record;
   try {
@@ -616,6 +662,11 @@ async function handleBrokerAsk(argv, deps) {
       prompt,
       requestId,
       ...(mode ? { mode } : {}),
+      ...(conversationId !== null ? { conversationId } : {}),
+      ...(geminiMode !== null ? { geminiMode } : {}),
+      ...(attachedFiles.length > 0 ? { files: attachedFiles } : {}),
+      ...(downloadDir !== null ? { downloadDir } : {}),
+      ...(options.cleanup ? { cleanupCreated: true } : {}),
     });
   } catch (err) {
     stderr.write(`wfa: ${err?.code || "BROKER_UNREACHABLE"}: ${err?.message || String(err)}\n`);
