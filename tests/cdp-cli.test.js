@@ -1033,7 +1033,7 @@ test("wfa cdp login: Browser.close rejects - still exits 0", async () => {
 
   assert.equal(res.code, 0);
   assert.match(stdout.output, /logged in as a@b\.c/);
-  assert.match(stdout.output, /session persisted; later runs restore it with --restore-last-session/);
+  assert.match(stdout.output, /session persisted in browser profile/);
 });
 
 test("wfa cdp login: exits 0 even when Browser.close never resolves", async () => {
@@ -1068,7 +1068,7 @@ test("wfa cdp login: exits 0 even when Browser.close never resolves", async () =
   assert.equal(res.code, 0);
   assert.equal(browserCloseSent, 1, "Browser.close was sent exactly once");
   assert.match(stdout.output, /hang@b\.c/);
-  assert.match(stdout.output, /session persisted; later runs restore it with --restore-last-session/);
+  assert.match(stdout.output, /session persisted in browser profile/);
 });
 
 test("launch.js: the argument list contains the shared switches for all browser modes", async () => {
@@ -1078,7 +1078,7 @@ test("launch.js: the argument list contains the shared switches for all browser 
   for (const mode of ["background", "visible", "headless", "headful"]) {
     // 1. Direct argument builder check
     const args = buildChromeArgs({ userDataDir: "/tmp/profile", mode });
-    assert.ok(args.includes("--restore-last-session"), `args for ${mode} must include --restore-last-session`);
+    assert.ok(!args.includes("--restore-last-session"), `args for ${mode} must NOT include --restore-last-session (D10)`);
     assert.ok(args.includes("--disable-background-timer-throttling"), `args for ${mode} must include --disable-background-timer-throttling`);
     assert.ok(args.includes("--disable-backgrounding-occluded-windows"), `args for ${mode} must include --disable-backgrounding-occluded-windows`);
     assert.ok(args.includes("--disable-renderer-backgrounding"), `args for ${mode} must include --disable-renderer-backgrounding`);
@@ -1088,9 +1088,7 @@ test("launch.js: the argument list contains the shared switches for all browser 
       args.includes("--force-webrtc-ip-handling-policy=disable_non_proxied_udp"),
       `args for ${mode} must include --force-webrtc-ip-handling-policy=disable_non_proxied_udp`
     );
-    const noFirstRunIdx = args.indexOf("--no-first-run");
-    const restoreIdx = args.indexOf("--restore-last-session");
-    assert.equal(restoreIdx, noFirstRunIdx + 1, "--restore-last-session must be placed next to --no-first-run");
+    assert.ok(args.includes("--no-first-run"), `args for ${mode} must include --no-first-run`);
 
     // 2. Fake spawn via launchChrome check
     let spawnedArgs = null;
@@ -1115,7 +1113,7 @@ test("launch.js: the argument list contains the shared switches for all browser 
     } catch {}
 
     assert.ok(spawnedArgs, `spawn must have been called for mode ${mode}`);
-    assert.ok(spawnedArgs.includes("--restore-last-session"), `spawned args for ${mode} must include --restore-last-session`);
+    assert.ok(!spawnedArgs.includes("--restore-last-session"), `spawned args for ${mode} must NOT include --restore-last-session (D10)`);
     assert.ok(spawnedArgs.includes("--disable-session-crashed-bubble"), `spawned args for ${mode} must include --disable-session-crashed-bubble`);
     assert.ok(spawnedArgs.includes("--hide-crash-restore-bubble"), `spawned args for ${mode} must include --hide-crash-restore-bubble`);
     assert.ok(

@@ -283,13 +283,12 @@ Gemini case has not been re-tested with this same-key method.
 
 ---
 
-### D10 — Chrome launch restores every historical tab and can trigger Google `/sorry` (P1, 2026-11-26)
+### D10 — Chrome launch restores every historical tab and can trigger Google `/sorry` (P1, resolved 2026-11-26)
 
-**Symptom.** Every Chrome launch passes `--restore-last-session` (`src/browser/launch.js:66`) so ChatGPT's
-non-persistent `oai-asli` cookie survives a restart. On this machine one launch restored **19 tabs, 9 of them
-Gemini**, all loading concurrently. Immediately afterwards every new Gemini navigation — the landing page and a
-concrete `/app/<id>` conversation — was redirected to `https://www.google.com/sorry/…`, blocking live testing
-until Google's risk control cleared.
+**Symptom.** Every Chrome launch passes `--restore-last-session` (`src/browser/launch.js:66`). On this machine
+one launch restored **19 tabs, 9 of them Gemini**, all loading concurrently. Immediately afterwards every new
+Gemini navigation — the landing page and a concrete `/app/<id>` conversation — was redirected to
+`https://www.google.com/sorry/…`, blocking live testing until Google's risk control cleared.
 
 **Observed on this branch.** 2026-11-26 15:24 the `neon` verification launch restored 19 tabs (9 Gemini);
 15:25–15:31 every new Gemini navigation (landing and `/app/ceeb4b6cc5ca503d`) hit `/sorry`. The D7 fast-fail
@@ -309,6 +308,13 @@ broker restarts amplify it.
 `Default/Sessions/*` cleared at 15:22 was followed by that same 19-tab restore. The D7 fast-fail added by
 `5676132` fired at 3.6 s and parked the tab. Run record:
 `reverdict/live-tests/20261126-1520-neon-hotfix/REPORT.md`.
+
+**Resolution (2026-11-26).** Controlled restarts without `--restore-last-session` across both clean
+`Browser.close` (`exit_type=Normal`) and `taskkill /F /T` confirmed that both ChatGPT
+(`__Secure-next-auth.session-token.0/.1`, `oai-asli = 0`) and Google
+(`SID`/`HSID`/`SSID`/`APISID`/`SAPISID`/`__Secure-1PSID`/`__Secure-3PSID`) persist login via persistent cookies
+while restoring zero historical tabs. Removed `--restore-last-session` from `src/browser/launch.js` and updated
+`src/engines/cdp-cli.js`, `tests/cdp-cli.test.js`, and `README.md`.
 
 ---
 

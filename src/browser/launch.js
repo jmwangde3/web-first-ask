@@ -60,10 +60,10 @@ export function buildChromeArgs({ userDataDir, mode = "headless" } = {}) {
     "--remote-debugging-port=0",
     "--remote-debugging-address=127.0.0.1",
     "--no-first-run",
-    // ChatGPT stores its session in a non-persistent cookie (oai-asli). Chrome only keeps
-    // such cookies across restarts when started with this switch; without it the profile
-    // looks logged out after any exit, including a crash.
-    "--restore-last-session",
+    // D10 (2026-11-26): do NOT pass --restore-last-session. Both ChatGPT
+    // (__Secure-next-auth.session-token.*) and Google (SID/HSID/SSID/APISID/SAPISID/
+    // __Secure-1PSID/__Secure-3PSID) use persistent cookies that survive normal close
+    // and hard kill without restoring historical tabs (which can trigger Google /sorry).
     "--no-default-browser-check",
     "--disable-background-networking",
     "--disable-background-timer-throttling",

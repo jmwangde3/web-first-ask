@@ -375,17 +375,13 @@ Known limits of this path: only ChatGPT and Gemini adapters exist; Claude is sti
 itself confirms a session, then closes Chrome cleanly so the profile is written out. It is the only command
 that should be used for authentication on this path.
 
-ChatGPT does not use a persistent session cookie. Its session is `oai-asli` on `chatgpt.com` with
-`is_persistent = 0`, so a browser that shuts down normally would drop it. Chrome keeps such cookies across a
-restart only when it is **started with `--restore-last-session`**, which is why `launch.js` passes that switch
-on every launch, in every mode. Measured on Windows 11 with Chrome 158: log in, close the product tab, close
-Chrome via `Browser.close` (`profile.exit_type` becomes `Normal`), relaunch with the switch, and
-`fetch('/api/auth/session')` still returns the user. A crash exit behaves the same way, because Chrome
-preserves session cookies whenever the last exit was unclean as well.
-
-Do not hand-edit `Default/Preferences` to set `session.restore_on_startup`. On Windows that preference is
-covered by `Secure Preferences` and the HMAC is invalidated, so Chrome resets it on load. The command-line
-switch is the supported mechanism.
+Both ChatGPT (`__Secure-next-auth.session-token.0`/`.1`, HttpOnly/Secure/persistent) and Google
+(`SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`, `__Secure-3PSID`) store login state in persistent
+cookies. Measured on Windows 11 with Chrome 158 (2026-11-26): after both a clean CDP `Browser.close`
+(`profile.exit_type = Normal`) and a hard kill (`taskkill /F /T`), relaunching **without**
+`--restore-last-session` keeps both ChatGPT and Gemini signed in while opening only a clean tab set (no
+historical tabs restored). `launch.js` therefore omits `--restore-last-session` so restarts never reopen
+accumulated product tabs or trigger Google `/sorry` risk control (see D10 in `docs/backlog.md`).
 
 `wfa cdp login` reports success only when the product origin answers with a real user:
 
