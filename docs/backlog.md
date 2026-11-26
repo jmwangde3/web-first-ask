@@ -283,6 +283,41 @@ Gemini case has not been re-tested with this same-key method.
 
 ---
 
+### D10 — Chrome launch restores every historical tab and can trigger Google `/sorry` (P1, 2026-11-26)
+
+**Symptom.** Every Chrome launch passes `--restore-last-session` (`src/browser/launch.js:66`) so ChatGPT's
+non-persistent `oai-asli` cookie survives a restart. On this machine one launch restored **19 tabs, 9 of them
+Gemini**, all loading concurrently. Immediately afterwards every new Gemini navigation — the landing page and a
+concrete `/app/<id>` conversation — was redirected to `https://www.google.com/sorry/…`, blocking live testing
+until Google's risk control cleared.
+
+**Observed on this branch.** 2026-11-26 15:24 the `neon` verification launch restored 19 tabs (9 Gemini);
+15:25–15:31 every new Gemini navigation (landing and `/app/ceeb4b6cc5ca503d`) hit `/sorry`. The D7 fast-fail
+added by `5676132` fired at 3.6 s and parked the tab.
+
+**Why it matters.** There is no supported opt-out: the switch is hardcoded, `config.json` has no browser-args
+key, and `tests/cdp-cli.test.js:1081` asserts the flag in every mode. Clearing `Default/Sessions/*` before a
+launch did **not** prevent the restore in practice (cleared at 15:22, the next launch at 15:24 still restored
+19 tabs), so the documented workaround is unreliable. `README.md:378-388` explains why the switch exists
+(ChatGPT cookie), but not this cost.
+
+**Impact.** Any Chrome restart can burn tens of minutes of Gemini quota and invalidate live runs; repeated
+broker restarts amplify it.
+
+**Candidate fixes (need tri-party review).**
+
+- `WFA_CHROME_NO_RESTORE=1` (or a config key) opt-out, accepting a ChatGPT re-login after restart.
+- Pass the switch only for ChatGPT turns; Gemini-only runs skip restore.
+- Cap the restore: after startup close every restored tab except one anchor tab, then open the target tab.
+
+**Acceptance.**
+
+- With N≥5 stored tabs, a launch either opens at most 1 Gemini tab or honours the opt-out.
+- ChatGPT session still survives a default restart.
+- A regression test covers the chosen behaviour; a live restart check shows no `/sorry`.
+
+---
+
 ## Planned work
 
 ### F1 — Gemini "Task" mode over CDP (P1)
