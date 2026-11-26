@@ -6,12 +6,22 @@ provider adapters. Upstream ask-bridge defects (U1–U19) live in [`known-issues
 State of `main` when this list was written: `f3d104e`, `npm test` = **503 tests, 503 pass**, Node.js >= 22.15,
 zero runtime dependencies.
 
-Implementation status (2026-11-26, branch `backlog/d1-f9`, HEAD `4001f14`, package 1.2.0):
-`npm test` = **657 tests, 655 pass, 1 fail (pre-existing Linux-only `cdp-stage.test.js:107`), 1 skipped**;
-`npm run check` green. No live-browser validation was run on this VM (no logged-in
-Chrome here) — every item that needs a real browser is marked **awaiting live verification**
-below, with the manual command to run on Windows. Per-item status lines were added under
-each heading; nothing else in this file was rewritten.
+Implementation status (2026-11-26, branch `backlog/d1-f9-live-verify`, package 1.2.0):
+first round commit `5146c1b` — `npm test` = **657 tests, 655 pass, 1 fail (pre-existing Linux-only
+`cdp-stage.test.js:107`), 1 skipped**; fix round merged on top of it (D2, D3, D5, F1, F4, F7, F8
++ 3 side findings, see status lines) — `npm test` = **709 tests, 707 pass, 1 fail (same pre-existing
+Linux-only `cdp-stage.test.js:107`), 1 skipped**; `npm run check` green. No live-browser validation
+was run on this VM (no logged-in Chrome here) — every item that needs a real browser is marked
+**awaiting live verification** below, with the manual command to run on Windows. Per-item status
+lines were added under each heading; nothing else in this file was rewritten.
+
+Side findings fixed in the fix round (from branch acceptance REPORT-7b9e1ceb.md): (a) EPIPE crash on
+`broker status --json | head` — `process.stdout.on('error', …)` guard in `src/broker/cli.js`;
+(b) 409 idempotency ignored `conversationId` — `src/broker/journal.js` now scopes the match per
+conversation (unknown/legacy records stay conservative and still block); (c) stale `browser.lock` /
+broker record printed as live by `cdp status` — status now verifies pid/port liveness with
+`isInstanceAlive` and reports dead records as `alive: false` instead of printing them as live.
+F5 was code-reviewed only (no conformance bugs found; all Claude selectors still UNVERIFIED).
 
 Everything below was reproduced on a real Chrome with logged-in ChatGPT and Gemini accounts unless marked
 otherwise. Items marked *(unverified)* were reported but not re-confirmed with a controlled experiment.
@@ -75,9 +85,15 @@ readable and reach `completed`. Real-browser run survives a 10-minute generation
 
 ### D2 — first read after reopening a tab returns `unconfirmed` (P1)
 
-**Status (2026-11-26): done in code, awaiting live verification.** After `openTab` the
-read polls until message nodes appear (bounded 10 s, injectable clock, no fixed sleep);
-a genuinely empty conversation still returns `unconfirmed` (`src/engines/cdp-read.js`).
+**Status (2026-11-26): fix round done in code, awaiting live verification.** Branch
+acceptance FAILED on both paths, so the settle was fixed twice: (a) the `attachTab` branch
+now also enters settle (a restored-session shell tab is sampled only after message nodes
+render, bounded 10 s); (b) settle completion now requires `answerText.trim().length > 0`,
+not just any message node — ChatGPT renders user turns → answer shell/action bar → body
+text, and the old `userTurns > 0` condition ended settle while the text was still empty.
+A genuinely empty conversation still returns `unconfirmed` after the 10 s bound; no fixed
+sleep. Regression tests in `tests/cdp-read-d2-fix.test.js` cover both paths
+(`src/engines/cdp-read.js`).
 
 **Symptom.** Reading a conversation that has no open tab reopens it and samples the page before the message
 list has rendered, so the read reports an empty conversation.
@@ -116,7 +132,7 @@ filename-verified chips, selector no longer matches the attach button, fail-clos
 `d3b-probe.zip` (421,605 B) the verify passed at the submit moment (`present: true`),
 Gemini dropped the zip afterwards, the prompt was submitted anyway (`sendCommittedAt`
 written, Gemini answered "No attachment or zip file was provided") and the CLI timed
-out after 150 s instead of returning an error. Fix (branch `fix/d3`, uncommitted):
+out after 150 s instead of returning an error. Fix (merged into `backlog/d1-f9-live-verify`):
 (1) re-verify at submit time inside the send slot, before any send intent is journaled —
 `src/browser/driver.js` `verifyAttachments`, `src/engines/cdp-engine.js` pre-submit
 re-check; failure returns `ATTACH_UPLOAD_FAILED` with no submission and no
@@ -194,7 +210,7 @@ pause distribution; the tracker is wired into the completion poll loop
 `pauseSummary` in turn evidence. 420 s is kept **provisionally** — one sample cannot
 establish a distribution; revisit if p90 or any completed pause exceeds 420 s.
 
-**Status (2026-11-26, fix in worktree, awaiting live verification): alive/dead stall
+**Status (2026-11-26, fix merged, awaiting live verification): alive/dead stall
 strategy implemented, 420 s is now a classification boundary, not a stall declaration.**
 `src/stall-alive.js` (`createAliveStallPolicy`, `continuedWaitBudgetMs` default 600 s,
 capped by `hardTimeoutMs`) is wired into `waitForCompletion` (`src/browser/driver.js`):
@@ -323,8 +339,13 @@ chat|task` (separate flag; `--mode` stays the window mode), toggle in the Gemini
 (selectors carried over from the removed `gemini-mode.js`, `aria-pressed` as state signal),
 mode recorded on the turn (`geminiMode`, `evidence.geminiMode`), fail-closed with
 `GEMINI_MODE_FAILED` before typing. Broker passthrough wired by the coordinator
-(`src/broker/turns.js` accepts `geminiMode`, runner forwards it). Selectors are
-UNVERIFIED against the current Gemini DOM.
+(`src/broker/turns.js` accepts `geminiMode`, runner forwards it). **Fix round:** the
+`POST /turns` allowlist in `src/broker/server.js` was dropping `geminiMode` (branch
+acceptance: `--gemini-mode task` silently ran as Chat), so it is now passed through,
+persisted/restored, included in the request hash, and accepted by `wfa broker ask`
+(`src/broker/cli.js`); broker-layer regression tests in
+`tests/broker-turn-fields-f1-f4.test.js`. Selectors are UNVERIFIED against the current
+Gemini DOM.
 
 The Gemini web UI has a Task mode that runs code in a sandbox with Node.js and `git apply --check`. The CDP path
 only ever reaches Chat mode, so the CLI cannot use that capability. The old `gemini-mode` command has been
@@ -364,6 +385,10 @@ a valid file.
 wait, SHA-256 verification, distinct fail-closed codes) + download-click hooks in both
 adapters + engine wiring by the coordinator: `wfa cdp ask --download-dir <dir>` captures
 after a completed turn and records `downloads[]` on the turn (broker copies it through).
+**Fix round:** the `POST /turns` allowlist in `src/broker/server.js` was dropping
+`downloadDir` (branch acceptance: `--download-dir` never reached the capture), so it is
+now passed through, persisted/restored, and accepted by `wfa broker ask`; broker-layer
+regression tests in `tests/broker-turn-fields-f1-f4.test.js`.
 Download-control selectors are best-effort and UNVERIFIED against the live DOM.
 
 Currently there is no download capability at all: no `Page.setDownloadBehavior`, and the `downloads` field in
@@ -379,7 +404,12 @@ verification.** `src/browser/adapters/claude.js` implements the provider interfa
 (login probe, answer/read state, filename-verified attach, download hook, delete hook)
 and is registered in engine, CLI, broker turn validation, turn store, conversation
 store and read path (coordinator wiring). All Claude selectors are UNVERIFIED against
-the live Claude DOM. Fan-out stays `chatgpt,gemini` for now.
+the live Claude DOM. Fan-out stays `chatgpt,gemini` for now. **Fix round:** code-level
+review only — all 14 shared adapter exports present with correct shapes, no D3-style
+free-variable bug, registration complete in all 14 places; no conformance fix was
+needed. One flag for the live run: `editorSelector = 'div[contenteditable="true"]'` is
+extremely broad and may match a non-composer node — only a live DOM inspection can pick
+the right hook.
 
 Login flow plus a DOM adapter, following the existing provider adapter interface.
 
@@ -425,8 +455,7 @@ original prompt). The CDP path now calls them: `wfa cdp ask` (`src/engines/cdp-c
 and submits exactly one follow-up turn through the broker (same conversation,
 new request id, attached archive or inline bundle). The broker POST /turns
 allowlist now forwards `files` (`src/broker/server.js`, `src/broker/turns.js`) so
-the attached archive actually reaches the runner — `geminiMode`/`downloadDir`
-are still dropped (F1/F4, unchanged). The ask-bridge path still only records
+the attached archive actually reaches the runner. The ask-bridge path still only records
 the manual command. Live-run validation still outstanding.
 
 When a provider cannot read the referenced repository, fall back to an inline source bundle or an attached

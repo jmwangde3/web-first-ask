@@ -1,12 +1,47 @@
 # Changelog
 
-## 1.2.0 - Unreleased (backlog/d1-f9)
+## 1.2.0 - Unreleased (backlog/d1-f9-live-verify)
 
 Backlog D1–D9 / F1–F9 (`docs/backlog.md`). No live-browser validation was run
 for this branch — every item that needs a real Chrome is marked awaiting live
 verification in the backlog, with the manual command to run on Windows.
-`npm test`: 657 tests, 655 pass, 1 fail (pre-existing Linux-only
+`npm test`: 709 tests, 707 pass, 1 fail (pre-existing Linux-only
 `cdp-stage.test.js:107`), 1 skipped. Zero runtime dependencies, unchanged.
+
+Fix round (branch acceptance REPORT-7b9e1ceb.md, 2026-11-26 — all code-done,
+awaiting Windows re-verification):
+
+- D2: the `attachTab` branch now also enters the settle, and settle completion
+  requires non-empty `answerText` (not just any message node); empty
+  conversations still return `unconfirmed` after the 10 s bound.
+- D3: attachment is re-verified at submit time (fail-closed `ATTACH_UPLOAD_FAILED`,
+  no submission) and confirmed post-submit by filename in the newest user turn
+  (failure after submit is `SUBMITTED_WITH_UNVERIFIED_ATTACHMENT`, never a
+  silent timeout); filename verification unchanged.
+- D5: 420 s is now a stall-classification boundary, not a stall declaration
+  (`src/stall-alive.js`): a paused-but-alive turn (page responsive,
+  `pendingCount > 0`) keeps waiting under a 600 s continued-wait budget capped
+  by the hard timeout; a dead turn still stalls. Decisions are recorded in the
+  pause log and turn evidence. Cannot distinguish server throttling from
+  background throttling — only the recorded decisions can.
+- F1/F4: `POST /turns` now passes `geminiMode` and `downloadDir` through
+  (they were silently dropped, so `--gemini-mode task` ran as Chat and
+  `--download-dir` never captured); also accepted by `wfa broker ask`,
+  persisted/restored, and included in the request hash.
+- F7: explicit `wfa cdp cleanup` command (`--provider`/`--conversation-id`/
+  `--run-id`/`--dry-run`/`--json`); deletes only created-by-run conversations,
+  idempotent; no automatic post-run deletion wired.
+- F8: the CDP path now detects `REPO_UNREADABLE` and submits exactly one
+  fallback follow-up turn (new request id, bundled input, never the original
+  prompt); broker `POST /turns` now also forwards `files` so the attached
+  archive reaches the runner.
+- Side findings: EPIPE guard on broker stdout/stderr; 409 idempotency now
+  scoped by `conversationId` (unknown/legacy records stay conservative);
+  `cdp status` verifies broker-record liveness and reports dead records as
+  `alive: false`. F5: code review only — no conformance bugs found; all
+  Claude selectors still unverified.
+
+First round:
 
 - D1: broker no longer idles out while it owns a non-terminal turn
   (`hasNonTerminalTurn` + idle grace in `src/broker/server.js`).
@@ -46,10 +81,11 @@ verification in the backlog, with the manual command to run on Windows.
 - F6: configurable human-like pacing (`pace` in `DEFAULT_CONFIG` /
   `loadConfig`, broker starter passes `deps.config`).
 - F7: created-by-run conversation tracking (`createdByRun`/`createdRunId`)
-  + store-level cleanup of exactly that set; no auto-delete wired —
-  the cleanup trigger is still to be decided.
+  + store-level cleanup of exactly that set; trigger decided in the fix
+  round — explicit `wfa cdp cleanup` command, no auto-delete.
 - F8: `REPO_UNREADABLE` classification + fallback decision/record
-  (`src/repo-fallback.js`, archive preferred); automatic submit not wired.
+  (`src/repo-fallback.js`, archive preferred); automatic submit wired in
+  the fix round (CDP path only).
 - F9: packaged Skill slimmed 41 → 32 lines.
 
 ## 1.0.0 - Unreleased
