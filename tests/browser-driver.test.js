@@ -231,7 +231,7 @@ test("openTab and submitTurn: standard CDP protocol execution", async () => {
     },
   };
 
-  const tab = await openTab(mockCdp, "https://chatgpt.com/");
+  const tab = await openTab(mockCdp, "https://chatgpt.com/", { systemTimezone: "America/Los_Angeles" });
   assert.equal(tab.targetId, "target-123");
   assert.equal(tab.sessionId, "session-456");
 

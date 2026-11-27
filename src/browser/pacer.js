@@ -5,6 +5,7 @@ import { setTimeout as defaultSleep } from "node:timers/promises";
 export const PACE_CONFIG = {
   casual: { min: 1000, max: 2000 },
   batch: { min: 4000, max: 6000 },
+  batch_pause: { min: 60000, max: 180000 },
 };
 
 function parsePositiveInt(value, fallback) {
@@ -14,7 +15,7 @@ function parsePositiveInt(value, fallback) {
 
 export function resolvePaceRange(kind = "casual", overrides = {}) {
   const base = PACE_CONFIG[kind] || PACE_CONFIG.casual;
-  const envPrefix = kind === "batch" ? "WFA_PACE_BATCH" : "WFA_PACE_CASUAL";
+  const envPrefix = kind === "batch_pause" ? "WFA_PACE_BATCH_PAUSE" : (kind === "batch" ? "WFA_PACE_BATCH" : "WFA_PACE_CASUAL");
   const min = parsePositiveInt(overrides?.min ?? process.env[`${envPrefix}_MIN_MS`], base.min);
   const max = Math.max(min, parsePositiveInt(overrides?.max ?? process.env[`${envPrefix}_MAX_MS`], base.max));
   return { min, max };

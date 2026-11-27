@@ -91,7 +91,13 @@ test("bulk wfa cdp cleanup --all opens ONLY ONE tab and navigates within it for 
     connectCdp: async () => ({
       async send(method, params) {
         if (method === "Page.navigate") navigatedUrls.push(params.url);
-        if (method === "Runtime.evaluate") return { result: { value: { deleted: true } } };
+        if (method === "Runtime.evaluate") {
+          if (String(params?.expression || "").includes("document.readyState")) {
+            const current = navigatedUrls[navigatedUrls.length - 1] || "https://chatgpt.com/c/one";
+            return { result: { value: { readyState: "complete", pathname: new URL(current).pathname } } };
+          }
+          return { result: { value: { deleted: true } } };
+        }
         return {};
       },
       close() {},

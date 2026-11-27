@@ -201,6 +201,16 @@ test("3.3 & 3.4 & 3.5: bulk cleanup uses batch pacing, waits for pathname readin
   assert.equal(timeoutRes.ready, false);
   assert.equal(timeoutRes.reason, "navigation_timeout");
 
+  // Null/empty Runtime.evaluate must NOT falsely treat navigation as ready
+  const nullEvalRes = await waitForNavigationReady(
+    { async send() { return { result: { value: null } }; } },
+    "s1",
+    "https://gemini.google.com/app/expected",
+    { timeoutMs: 30, pollMs: 5, settleMs: 1, sleepFn: async () => new Promise((r) => setTimeout(r, 10)) },
+  );
+  assert.equal(nullEvalRes.ready, false);
+  assert.equal(nullEvalRes.reason, "navigation_timeout");
+
   // Direct test of parseDeleteEvalResult
   assert.equal(parseDeleteEvalResult({ result: { value: { success: true, verified: "sidebar_entry_removed" } } }).status, "deleted");
   assert.equal(parseDeleteEvalResult({ result: { value: { success: false, reason: "target_url_mismatch" } } }).status, "failed");

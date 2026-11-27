@@ -370,6 +370,13 @@ archive automatically instead of returning `REPO_UNREADABLE` and stopping.
 The packaged Skill carries a large instruction document. Reduce it to what changes behaviour, and stop the agent
 from over-thinking when the user explicitly names `wfa`.
 
+### F10 — Humanized keystroke timing & curved mouse trajectories (P3, deferred)
+
+Add optional human-like per-keystroke timing distributions (hold duration / rollover) for short inputs and curved
+mouse trajectories (Fitts' law / Bezier path) before CDP clicks. Deferred because long code/context prompts are
+naturally pasted in bulk and randomized bounding-box CDP `Input.dispatchMouseEvent` clicks + inter-batch pauses
+cover the primary anti-bot signal first.
+
 ---
 
 ## Out of scope

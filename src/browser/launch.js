@@ -65,7 +65,6 @@ export function buildChromeArgs({ userDataDir, mode = "headless" } = {}) {
     // __Secure-1PSID/__Secure-3PSID) use persistent cookies that survive normal close
     // and hard kill without restoring historical tabs (which can trigger Google /sorry).
     "--no-default-browser-check",
-    "--disable-background-networking",
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",

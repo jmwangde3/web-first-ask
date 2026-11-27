@@ -85,7 +85,82 @@ export async function ensureAnchorTab(cdp) {
   }
 }
 
-export async function attachTab(cdp, targetId, { timeoutMs = 60000 } = {}) {
+export const DEFAULT_TARGET_TIMEZONE = "Asia/Tokyo";
+
+export function getSystemTimezone() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof tz === "string" && tz.trim() ? tz.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function pickHumanPoint(rect, random = Math.random) {
+  const r1 = Math.max(0, Math.min(1, Number(random()) || 0));
+  const r2 = Math.max(0, Math.min(1, Number(random()) || 0));
+  const rx = 0.25 + r1 * 0.5;
+  const ry = 0.25 + r2 * 0.5;
+  return {
+    x: Math.round((rect.left + rect.width * rx) * 100) / 100,
+    y: Math.round((rect.top + rect.height * ry) * 100) / 100,
+  };
+}
+
+export async function humanClickAt(cdp, sessionId, x, y, {
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  random = Math.random,
+} = {}) {
+  const hoverDelay = 40 + Math.floor(Math.max(0, Math.min(1, Number(random()) || 0)) * 61);
+  const pressDelay = 80 + Math.floor(Math.max(0, Math.min(1, Number(random()) || 0)) * 61);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, sessionId);
+  await sleep(hoverDelay);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, sessionId);
+  await sleep(pressDelay);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, sessionId);
+}
+
+export async function evaluateInWorld(cdp, sessionId, expression, {
+  awaitPromise = false,
+  returnByValue = true,
+  isolated = true,
+} = {}) {
+  if (isolated) {
+    try {
+      const tree = await cdp.send("Page.getFrameTree", {}, sessionId);
+      const frameId = tree?.frameTree?.frame?.id;
+      if (frameId) {
+        const world = await cdp.send("Page.createIsolatedWorld", {
+          frameId,
+          worldName: "",
+          grantUniveralAccess: true,
+        }, sessionId);
+        const contextId = world?.executionContextId;
+        if (contextId != null) {
+          return await cdp.send("Runtime.evaluate", {
+            expression,
+            contextId,
+            awaitPromise,
+            returnByValue,
+          }, sessionId);
+        }
+      }
+    } catch {
+      // Fallback cleanly to default Runtime.evaluate when isolated world is unavailable.
+    }
+  }
+  return await cdp.send("Runtime.evaluate", {
+    expression,
+    awaitPromise,
+    returnByValue,
+  }, sessionId);
+}
+
+export async function attachTab(cdp, targetId, {
+  timeoutMs = 60000,
+  targetTimezone = DEFAULT_TARGET_TIMEZONE,
+  systemTimezone,
+} = {}) {
   if (!cdp || typeof cdp.send !== "function") {
     throw new WfaError("CDP_REQUIRED", "A CDP client is required to attach a tab");
   }
@@ -113,7 +188,11 @@ export async function attachTab(cdp, targetId, { timeoutMs = 60000 } = {}) {
     await cdp.send("Page.enable", {}, sessionId);
   }
   // Runtime.evaluate works without subscribing to the Runtime event domain.
-  await cdp.send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" }, sessionId);
+  // Auto-detect host OS timezone: only override when it differs from targetTimezone (default Asia/Tokyo).
+  const hostTz = systemTimezone !== undefined ? systemTimezone : getSystemTimezone();
+  if (targetTimezone && hostTz !== targetTimezone) {
+    await cdp.send("Emulation.setTimezoneOverride", { timezoneId: targetTimezone }, sessionId);
+  }
   // D8: soft-enable focus emulation so background tabs stay composited without stealing focus.
   await enableFocusEmulation(cdp, sessionId);
   return { targetId, sessionId };
@@ -256,7 +335,7 @@ export async function ensureProviderMode(cdp, sessionId, adapter, targetMode, {
   );
 }
 
-export async function openTab(cdp, url, { timeoutMs = 60000 } = {}) {
+export async function openTab(cdp, url, { timeoutMs = 60000, targetTimezone = DEFAULT_TARGET_TIMEZONE, systemTimezone } = {}) {
   const targetResult = await cdp.send(
     "Target.createTarget",
     { url: "about:blank", background: true },
@@ -268,7 +347,7 @@ export async function openTab(cdp, url, { timeoutMs = 60000 } = {}) {
   }
   const { targetId } = targetResult;
 
-  const tab = await attachTab(cdp, targetId, { timeoutMs });
+  const tab = await attachTab(cdp, targetId, { timeoutMs, targetTimezone, systemTimezone });
   if (url) {
     await cdp.send("Page.navigate", { url }, tab.sessionId);
   }
@@ -837,10 +916,9 @@ export async function submitTurn(cdp, sessionId, adapter, {
         };
       })()`;
 
-      const probeRes = await cdp.send("Runtime.evaluate", {
-        expression: probeExpr,
+      const probeRes = await evaluateInWorld(cdp, sessionId, probeExpr, {
         returnByValue: true,
-      }, sessionId).catch(() => null);
+      }).catch(() => null);
 
       const val = probeRes?.result?.value;
       lastProbe = val;
@@ -865,6 +943,15 @@ export async function submitTurn(cdp, sessionId, adapter, {
 
           if (enabled.length === 1) {
             const btn = enabled[0];
+            if (typeof btn.scrollIntoView === "function") {
+              try { btn.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+            }
+            if (typeof btn.getBoundingClientRect === "function") {
+              const r = btn.getBoundingClientRect();
+              if (r && r.width > 0 && r.height > 0) {
+                return { readyToClick: true, rect: { left: r.left, top: r.top, width: r.width, height: r.height } };
+              }
+            }
             btn.click();
             return { clicked: true };
           }
@@ -876,10 +963,9 @@ export async function submitTurn(cdp, sessionId, adapter, {
 
         let clickRes;
         try {
-          clickRes = await cdp.send("Runtime.evaluate", {
-            expression: clickExpr,
+          clickRes = await evaluateInWorld(cdp, sessionId, clickExpr, {
             returnByValue: true,
-          }, sessionId);
+          });
         } catch (cause) {
           const err = new WfaError("SEND_UNCONFIRMED", "CDP click outcome unknown; automatic retry forbidden");
           err.cause = cause;
@@ -892,6 +978,17 @@ export async function submitTurn(cdp, sessionId, adapter, {
         }
 
         const outcome = clickRes.result?.value;
+        if (outcome?.readyToClick === true && outcome?.rect) {
+          const pt = pickHumanPoint(outcome.rect);
+          try {
+            await humanClickAt(cdp, sessionId, pt.x, pt.y, { sleep });
+          } catch (cause) {
+            const err = new WfaError("SEND_UNCONFIRMED", "CDP mouse click outcome unknown; automatic retry forbidden");
+            err.cause = cause;
+            throw err;
+          }
+          return { submittedAt: now(), method: "click" };
+        }
         if (outcome?.clicked === true) {
           return { submittedAt: now(), method: "click" };
         }

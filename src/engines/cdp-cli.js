@@ -60,6 +60,8 @@ const VALUE_FLAGS = new Set([
   "repro",
   "command",
   "limit",
+  "batch-size",
+  "batch-pause-sec",
 ]);
 
 function parseArgs(argv) {
@@ -165,6 +167,8 @@ Options:
   --limit <N>                Maximum conversations to delete in one bulk cleanup run
   --include-unknown          Allow cleanup of legacy records with unknown createdByWfa (still refuses createdByWfa=false)
   --dry-run                  Preview bulk cleanup candidates without opening Chrome or deleting
+  --batch-size <N>           Bulk cleanup items per batch before a long pause (default: 15; 0 disables)
+  --batch-pause-sec <A-B>    Inter-batch pause range in seconds (default: 60-180)
   --out <path>               Write captured answer text to a file
   --workspace <dir>          Target workspace root for staging (default: current directory)
   --help, -h                 Show this help message
@@ -1128,20 +1132,19 @@ export async function waitForNavigationReady(cdp, sessionId, targetUrl, {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const res = await cdp.send("Runtime.evaluate", {
-        expression: "({ readyState: document.readyState, pathname: location.pathname })",
-        returnByValue: true,
-      }, sessionId);
+      const res = typeof defaultDriver.evaluateInWorld === "function"
+        ? await defaultDriver.evaluateInWorld(cdp, sessionId, "({ readyState: document.readyState, pathname: location.pathname })", { returnByValue: true })
+        : await cdp.send("Runtime.evaluate", {
+            expression: "({ readyState: document.readyState, pathname: location.pathname })",
+            returnByValue: true,
+          }, sessionId);
       const val = res?.result?.value;
-      if (!val || typeof val.pathname !== "string") {
-        // Synthetic unit-test mock without DOM evaluation
-        await sleepFn(settleMs);
-        return { ready: true, synthetic: true };
-      }
-      const actualPath = val.pathname.replace(/\/+$/, "");
-      if ((actualPath === expectedPath || actualPath.startsWith(`${expectedPath}/`)) && val.readyState !== "loading") {
-        await sleepFn(settleMs);
-        return { ready: true, pathname: val.pathname, readyState: val.readyState };
+      if (val && typeof val.pathname === "string") {
+        const actualPath = val.pathname.replace(/\/+$/, "");
+        if ((actualPath === expectedPath || actualPath.startsWith(`${expectedPath}/`)) && val.readyState !== "loading") {
+          await sleepFn(settleMs);
+          return { ready: true, pathname: val.pathname, readyState: val.readyState };
+        }
       }
     } catch {
       // Page context may be transiently destroyed during navigation; keep polling.
@@ -1171,7 +1174,7 @@ async function readConversationStoreCandidates(home) {
             provider: prov,
             conversationId: rec.conversationId || null,
             conversationUrl: rec.conversationUrl,
-            createdByWfa: true,
+            createdByWfa: typeof rec.createdByWfa === "boolean" ? rec.createdByWfa : true,
             state: "completed",
             source: "conversation-store",
           });
@@ -1184,7 +1187,7 @@ async function readConversationStoreCandidates(home) {
                 provider: prov,
                 conversationId: rec.conversationId || null,
                 conversationUrl: item.conversationUrl,
-                createdByWfa: true,
+                createdByWfa: typeof item.createdByWfa === "boolean" ? item.createdByWfa : (typeof rec.createdByWfa === "boolean" ? rec.createdByWfa : true),
                 state: "completed",
                 source: "conversation-store:retired",
               });
@@ -1345,6 +1348,25 @@ async function handleCleanup(argv, deps = {}) {
       }
       limit = parsedLimit;
     }
+    let batchSize = 15;
+    if (options["batch-size"] !== undefined) {
+      const parsedBatch = Number(options["batch-size"]);
+      if (!Number.isInteger(parsedBatch) || parsedBatch < 0) {
+        throw new WfaError("INVALID_ARGUMENT", "Option --batch-size must be a non-negative integer.");
+      }
+      batchSize = parsedBatch;
+    }
+    let batchPauseRange = undefined;
+    if (options["batch-pause-sec"] !== undefined) {
+      const parts = String(options["batch-pause-sec"]).trim().split("-").map((x) => Number(x.trim()));
+      if (parts.length === 1 && Number.isFinite(parts[0]) && parts[0] >= 0) {
+        batchPauseRange = { min: Math.round(parts[0] * 1000), max: Math.round(parts[0] * 1000) };
+      } else if (parts.length === 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1]) && parts[0] >= 0 && parts[1] >= parts[0]) {
+        batchPauseRange = { min: Math.round(parts[0] * 1000), max: Math.round(parts[1] * 1000) };
+      } else {
+        throw new WfaError("INVALID_ARGUMENT", "Option --batch-pause-sec must be <sec> or <min>-<max>.");
+      }
+    }
 
     const selected = [];
     const skipped = [];
@@ -1428,8 +1450,12 @@ async function handleCleanup(argv, deps = {}) {
         for (let i = 0; i < actionable.length; i += 1) {
           const { rec, prov, adapter } = actionable[i];
           if (i > 0) {
-            // Batch pacing: 4-6s random between bulk deletions (requirement #23 / D11)
-            await paceFn("batch");
+            // Inter-batch long pause (default 60-180s every 15 items) vs item-level 4-6s batch pacing
+            if (batchSize > 0 && i % batchSize === 0) {
+              await paceFn("batch_pause", batchPauseRange ? { range: batchPauseRange } : {});
+            } else {
+              await paceFn("batch");
+            }
             await cdp.send("Page.navigate", { url: rec.conversationUrl }, tab.sessionId);
             const nav = await waitNavFn(cdp, tab.sessionId, rec.conversationUrl, { timeoutMs: 15000, sleepFn });
             if (!nav?.ready) {

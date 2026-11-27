@@ -206,6 +206,9 @@ export async function saveSession(home, provider, conversationId, patch = {}) {
     provider,
     conversationId,
     conversationUrl,
+    createdByWfa: typeof patch.createdByWfa === "boolean"
+      ? patch.createdByWfa
+      : (typeof existing?.createdByWfa === "boolean" ? existing.createdByWfa : true),
     turnCount,
     invalidated,
     invalidatedReason,
