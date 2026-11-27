@@ -48,3 +48,47 @@ test("bilingual UI: Gemini buildLoginProbeJs detects English Google Account / Pr
     assert.equal(res.loggedIn, true, `must detect signed-in for ${matchedSelector}`);
   }
 });
+
+test("bilingual UI: Gemini sendSelector covers zh-CN '发送' and EN 'Send message' and attachment verify succeeds", () => {
+  for (const label of ["Send message", "Send", "发送消息", "发送", "傳送訊息", "傳送"]) {
+    assert.ok(
+      geminiAdapter.sendSelector.includes(`button[aria-label="${label}"]`),
+      `sendSelector must include exact aria-label="${label}"`,
+    );
+  }
+  // Exact match only: must not use fuzzy *= which could match "Send feedback" / "发送反馈"
+  assert.equal(geminiAdapter.sendSelector.includes("*="), false);
+
+  const makeDoc = ({ hasChip, sendLabel }) => ({
+    querySelectorAll: (sel) => {
+      if (sel === geminiAdapter.attachmentChipSelector) {
+        return hasChip
+          ? [{ innerText: "TXT\nd3-attachment-r1d.txt", getBoundingClientRect: () => ({ width: 80, height: 24 }) }]
+          : [];
+      }
+      if (sel === geminiAdapter.sendSelector) {
+        return sendLabel
+          ? [{
+              disabled: false,
+              getAttribute: (k) => (k === "aria-label" ? sendLabel : (k === "aria-disabled" ? "false" : null)),
+              getBoundingClientRect: () => ({ width: 32, height: 32 }),
+            }]
+          : [];
+      }
+      return [];
+    },
+    querySelector: () => null,
+  });
+
+  const okZh = vm.runInNewContext(geminiAdapter.buildAttachmentVerifyJs(["d3-attachment-r1d.txt"]), {
+    document: makeDoc({ hasChip: true, sendLabel: "发送" }),
+  });
+  assert.equal(okZh.present, true);
+  assert.equal(okZh.sendReady, true);
+  assert.deepEqual([...okZh.matched], [true]);
+
+  const missingChip = vm.runInNewContext(geminiAdapter.buildAttachmentVerifyJs(["d3-attachment-r1d.txt"]), {
+    document: makeDoc({ hasChip: false, sendLabel: "发送" }),
+  });
+  assert.equal(missingChip.present, false);
+});

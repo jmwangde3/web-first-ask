@@ -14,9 +14,16 @@ export const stopSelector = [
   'conversation-container button[aria-label*="停止"]',
   '.stop-button',
 ].join(', ');
-// 真机核实（2026-11-24）：Gemini 改版后发送按钮为 aria-label="Send message"（中文 UI 为「发送消息」），
-// 旧的 gem-icon-button.send-button.submit 已不存在，导致点击不生效、send_unconfirmed。
-export const sendSelector = 'button[aria-label="Send message"], button[aria-label="发送消息"]';
+// 真机核实（2026-11-24 / 2026-11-27）：Gemini 发送按钮在英文 UI 为「Send message」/「Send」，
+// zh-CN 实测为「发送」（旧版曾为「发送消息」），繁中为「傳送」/「傳送訊息」；必须用精确 aria-label 避免误匹配反馈按钮。
+export const sendSelector = [
+  'button[aria-label="Send message"]',
+  'button[aria-label="Send"]',
+  'button[aria-label="发送消息"]',
+  'button[aria-label="发送"]',
+  'button[aria-label="傳送訊息"]',
+  'button[aria-label="傳送"]',
+].join(", ");
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证|sign in|log in|登录/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
