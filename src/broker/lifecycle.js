@@ -4,6 +4,28 @@ import os from "node:os";
 import path from "node:path";
 
 const defaultHome = () => path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share"), "web-first-ask");
+const TRANSIENT_FS_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+async function retryTransientFs(operation, {
+  maxAttempts = 8,
+  baseDelayMs = 10,
+  maxDelayMs = 160,
+} = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!TRANSIENT_FS_CODES.has(error?.code) || attempt + 1 >= maxAttempts) {
+        throw error;
+      }
+      const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** attempt));
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
 
 export function getBrokerPaths(home = defaultHome()) {
   const resolved = path.resolve(home);
@@ -33,7 +55,7 @@ export async function writeBrokerRecord(home, record) {
   const temp = `${brokerJson}.${process.pid}.${randomUUID()}.tmp`;
   try {
     await fs.writeFile(temp, JSON.stringify(record, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-    await fs.rename(temp, brokerJson);
+    await retryTransientFs(() => fs.rename(temp, brokerJson));
   } finally {
     await fs.rm(temp, { force: true }).catch(() => {});
   }
@@ -46,7 +68,7 @@ export async function clearBrokerRecord(home, expectedInstanceId) {
     if (!current || current.instanceId !== expectedInstanceId) return;
   }
   try {
-    await fs.rm(file, { force: true });
+    await retryTransientFs(() => fs.rm(file, { force: true }));
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
@@ -108,7 +130,7 @@ async function readInstanceOwner(lockPath) {
   let raw;
 
   try {
-    raw = await fs.readFile(lockPath, "utf8");
+    raw = await retryTransientFs(() => fs.readFile(lockPath, "utf8"), { maxAttempts: 5 });
   } catch (error) {
     if (error?.code === "ENOENT") return undefined;
     throw error;
@@ -176,7 +198,7 @@ export async function acquireInstanceLock(home) {
     // Therefore the absent/dead owner cannot be replaced by another
     // contender between this check and the atomic publication.
     await fs.writeFile(temp, payload, { flag: "wx", mode: 0o600 });
-    await fs.rename(temp, lockPath);
+    await retryTransientFs(() => fs.rename(temp, lockPath));
 
     let released = false;
 
@@ -197,7 +219,7 @@ export async function acquireInstanceLock(home) {
           // A conforming contender cannot replace a live owner's record.
           // Until this unlink completes, our PID prevents reclamation.
           // Once it completes, this release never touches lockPath again.
-          await fs.rm(lockPath, { force: true });
+          await retryTransientFs(() => fs.rm(lockPath, { force: true }));
         } catch (error) {
           // Permit an explicit retry after an actual filesystem failure.
           released = false;

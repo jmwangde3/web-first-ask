@@ -4,6 +4,8 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { getBrokerPaths } from "./lifecycle.js";
 
+const TRANSIENT_FS_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
 function pidAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -19,28 +21,63 @@ function coded(code, message) {
   return Object.assign(new Error(message), { code });
 }
 
-// Each contender owns a unique file for its entire lifetime. An empty record
-// means "choosing a ticket"; a complete record is published by atomic rename.
+async function retryTransientFs(operation, {
+  maxAttempts = 8,
+  baseDelayMs = 10,
+  maxDelayMs = 160,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!TRANSIENT_FS_CODES.has(error?.code) || attempt + 1 >= maxAttempts) {
+        throw error;
+      }
+      const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** attempt));
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
+
+async function removeClaimFiles(lockPath, sleep) {
+  for (const target of [lockPath, `${lockPath}.choosing`, `${lockPath}.ready`]) {
+    await retryTransientFs(() => fs.rm(target, { force: true }), { sleep }).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+  }
+}
+
+// Each contender owns a unique claim basename (<prefix><pid>-<lockId>.lock)
+// for its entire lifetime. Choosing is advertised via a separate `.choosing`
+// marker file; the complete JSON ticket is published by renaming `.ready` to
+// the brand-new `.lock` path (never overwriting an existing `.lock` that
+// concurrent contenders may be reading, avoiding Windows MoveFileExW EPERM).
 // This is a filesystem-backed bakery lock on a local filesystem. No contender
 // ever deletes a reusable shared pathname based on a stale read.
-async function readClaim(dir, name, pid) {
-  const file = path.join(dir, name);
-  if (!pidAlive(pid)) {
-    await fs.rm(file, { force: true });
-    await fs.rm(`${file}.ready`, { force: true });
+async function readClaim(dir, claim, sleep) {
+  const file = path.join(dir, claim.name);
+  if (!pidAlive(claim.pid)) {
+    await removeClaimFiles(file, sleep);
     return null;
+  }
+  if (!claim.hasLock) {
+    return { choosing: true };
   }
   let raw;
   try {
-    raw = await fs.readFile(file, "utf8");
+    raw = await retryTransientFs(() => fs.readFile(file, "utf8"), { maxAttempts: 5, sleep });
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
   if (!raw.trim()) return { choosing: true };
   const record = JSON.parse(raw);
-  if (record.pid !== pid || !Number.isSafeInteger(record.ticket) || record.ticket < 1) {
-    throw coded("TURN_LOCK_CORRUPT", `Invalid lock claim ${name}`);
+  if (record.pid !== claim.pid || !Number.isSafeInteger(record.ticket) || record.ticket < 1) {
+    throw coded("TURN_LOCK_CORRUPT", `Invalid lock claim ${claim.name}`);
   }
   return record;
 }
@@ -70,6 +107,7 @@ export async function acquireTurnLock(home, provider = "default", {
   const prefix = `${key}-`;
   const ownName = `${prefix}${process.pid}-${lockId}.lock`;
   const lockPath = path.join(dir, ownName);
+  const choosingPath = `${lockPath}.choosing`;
   const readyPath = `${lockPath}.ready`;
   const deadline = now() + timeoutMs;
   let created = false;
@@ -84,57 +122,75 @@ export async function acquireTurnLock(home, provider = "default", {
 
   async function contenders({ reapOtherKeys = false } = {}) {
     const names = await fs.readdir(dir);
-    const claims = [];
-    for (const name of names) {
-      if (name === ownName) continue;
-      const match = /^([0-9a-f]{64})-(\d+)-[0-9a-f-]{36}\.lock$/i.exec(name);
+    const byBase = new Map();
+    const otherDeadBases = new Set();
+
+    for (const entry of names) {
+      const match = /^(([0-9a-f]{64})-(\d+)-[0-9a-f-]{36}\.lock)(\.choosing)?$/i.exec(entry);
       if (!match) continue;
-      const pid = Number(match[2]);
-      if (name.startsWith(prefix)) claims.push({ name, pid });
-      else if (reapOtherKeys && !pidAlive(pid)) {
-        // Also reap dead anonymous/retired keys that may never recur.
-        const file = path.join(dir, name);
-        await fs.rm(file, { force: true });
-        await fs.rm(`${file}.ready`, { force: true });
+      const baseName = match[1];
+      const pid = Number(match[3]);
+      const isChoosing = Boolean(match[4]);
+      if (baseName === ownName) continue;
+
+      if (baseName.startsWith(prefix)) {
+        const existing = byBase.get(baseName) || { name: baseName, pid, hasLock: false, hasChoosing: false };
+        if (isChoosing) existing.hasChoosing = true;
+        else existing.hasLock = true;
+        byBase.set(baseName, existing);
+      } else if (reapOtherKeys && !pidAlive(pid)) {
+        otherDeadBases.add(baseName);
       }
     }
-    return claims;
+
+    for (const deadBase of otherDeadBases) {
+      // Also reap dead anonymous/retired keys that may never recur.
+      await removeClaimFiles(path.join(dir, deadBase), sleep);
+    }
+
+    return [...byBase.values()];
   }
 
   try {
     check();
     await fs.mkdir(dir, { recursive: true });
-    const handle = await fs.open(lockPath, "wx", 0o600);
+    // Phase 1: advertise "choosing" via a dedicated marker file that is never
+    // overwritten by rename.
+    const handle = await fs.open(choosingPath, "wx", 0o600);
     created = true;
     await handle.close();
 
     // Publish choosing before taking a ticket. Ties are broken by the
     // immutable contender name, not clock time or filesystem timestamps.
     let highest = 0;
-    for (const { name, pid } of await contenders({ reapOtherKeys: true })) {
+    for (const claim of await contenders({ reapOtherKeys: true })) {
       check();
-      const claim = await readClaim(dir, name, pid);
-      if (claim && !claim.choosing) highest = Math.max(highest, claim.ticket);
+      const record = await readClaim(dir, claim, sleep);
+      if (record && !record.choosing) highest = Math.max(highest, record.ticket);
     }
     if (highest >= Number.MAX_SAFE_INTEGER) {
       throw coded("TURN_LOCK_CORRUPT", "Turn lock ticket exhausted");
     }
     const ticket = highest + 1;
+    // Phase 2: write complete JSON to .ready and atomically create .lock via
+    // rename onto a non-existent destination (no overwrite contention on Windows).
     await fs.writeFile(readyPath, JSON.stringify({
       pid: process.pid, lockId, turnId, conversationId: convId,
       provider: providerKey, ticket, acquiredAt: Date.now(),
     }) + "\n", { flag: "wx", mode: 0o600 });
-    await fs.rename(readyPath, lockPath);
+    await retryTransientFs(() => fs.rename(readyPath, lockPath), { sleep });
+    // Phase 3: remove .choosing marker after .lock is published.
+    await retryTransientFs(() => fs.rm(choosingPath, { force: true }), { sleep });
 
     for (;;) {
       check();
       let blocked = false;
-      for (const { name, pid } of await contenders()) {
+      for (const claim of await contenders()) {
         check();
-        const claim = await readClaim(dir, name, pid);
-        if (!claim) continue;
-        if (claim.choosing || claim.ticket < ticket ||
-            (claim.ticket === ticket && name < ownName)) {
+        const record = await readClaim(dir, claim, sleep);
+        if (!record) continue;
+        if (record.choosing || record.ticket < ticket ||
+            (record.ticket === ticket && claim.name < ownName)) {
           blocked = true;
           break;
         }
@@ -151,13 +207,13 @@ export async function acquireTurnLock(home, provider = "default", {
       async release() {
         if (released) return;
         // The pathname is unique to this acquisition, even after release.
-        await fs.rm(lockPath, { force: true });
+        await removeClaimFiles(lockPath, sleep);
         released = true;
       },
     };
   } finally {
     if (created && !acquired) {
-      await fs.rm(readyPath, { force: true }).finally(() => fs.rm(lockPath, { force: true }));
+      await removeClaimFiles(lockPath, sleep).catch(() => {});
     }
   }
 }
