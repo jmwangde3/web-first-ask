@@ -329,6 +329,24 @@ is not covered by this item.
 
 ---
 
+### D13 — Windows concurrent lock publication fails with `fs.rename` `EPERM (-4048)` (P1, 2026-11-27)
+
+**Symptom.** Under 8-way concurrent contention (`tests/instance-lock-stale.test.js` and `tests/broker.test.js`),
+`fs.rename('.../*.lock.ready', '.../*.lock')` in `src/broker/turn-lock.js` (and `broker.lock` overwrite-rename in
+`src/broker/lifecycle.js`) intermittently fails on Windows with `EPERM (-4048)`. Changing `TEMP`/`TMP` drive
+does not eliminate the failure.
+
+**Expected.** Concurrent lock acquisition on Windows must preserve strict single-owner exclusivity and atomic
+complete JSON publication without intermittent `EPERM` failures, without ignoring `EPERM`, without unbounded
+retries, and without global serialization.
+
+**Code fact (2026-11-27).** `src/broker/turn-lock.js` creates an empty `.lock` placeholder and then overwrites
+it via `fs.rename(readyPath, lockPath)` while competing contenders poll `fs.readFile(lockPath)`. On Windows
+NTFS, overwriting an existing file that another handle or scanner has open returns `EPERM`. `src/broker/lifecycle.js`
+similarly overwrites `broker.lock` via `fs.rename(temp, lockPath)` while unguarded optimistic reads occur.
+
+---
+
 ## Planned work
 
 ### F1 — Gemini "Task" mode over CDP (P1)
@@ -380,6 +398,30 @@ archive automatically instead of returning `REPO_UNREADABLE` and stopping.
 
 The packaged Skill carries a large instruction document. Reduce it to what changes behaviour, and stop the agent
 from over-thinking when the user explicitly names `wfa`.
+
+### F10 — Humanized keystroke timing & curved mouse trajectories (P3, deferred)
+
+Add optional human-like per-keystroke timing distributions (hold duration / rollover) for short inputs and curved
+mouse trajectories (Fitts' law / Bezier path) before CDP clicks. Deferred as lower priority than randomized
+CDP mouse clicks, isolated-world evaluation, and inter-batch pacing.
+
+### F11 — Default-ON debug issue logging & repro-only Skill rule (P2)
+
+Enable a default-ON debug mode (opt-out via CLI flag or env var) that records failed `wfa` commands with bounded
+log size/rotation and provides a command for local agents to append reproduction steps. Update the Skill so
+local agents only record how to reproduce `wfa` issues and never modify or fix `wfa` itself.
+
+### F12 — Bilingual EN/ZH web UI support for ChatGPT and Gemini (P2)
+
+Ensure all core interactions on ChatGPT and Gemini (send, stop, readback, file upload, Gemini Chat/Task mode
+switching, login detection, and conversation deletion) work consistently on both English and Chinese web UIs.
+
+### F13 — Stealth & humanization hardening (P2)
+
+Reduce automation detection surface while keeping `background` mode non-intrusive: auto-detect host timezone
+(skip timezone override when host is already `Asia/Tokyo`), subtract unnecessary Chrome launch flags, use
+trusted CDP mouse clicks with randomized target points, evaluate DOM probes in isolated worlds where possible,
+and add randomized inter-batch long pauses for bulk operations.
 
 ---
 
