@@ -345,7 +345,9 @@ async function handleLogin(argv, deps) {
   const title = document.title || "";
   const signedInSelectors = [
     'button[aria-label*="Google 账号"]',
+    'button[aria-label*="Google Account"]',
     'img[aria-label*="个人资料"]',
+    'img[aria-label*="Profile"]',
     'a[href*="accounts.google.com/SignOutOptions"]'
   ];
   const signedOutSelectors = [

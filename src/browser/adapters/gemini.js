@@ -28,9 +28,16 @@ export const taskModeButtonSelector = 'gem-segmented-button-row button.gem-segme
 export function buildEnsureModeJs(targetMode = "task") {
   const normalized = String(targetMode || "task").toLowerCase();
   const expectedLabel = normalized === "chat" ? "chat" : "task";
+  const expectedAliases = expectedLabel === "chat"
+    ? ["chat", "聊天", "对话", "對話"]
+    : ["task", "任务", "任務"];
   return `(() => {
+  const aliases = ${JSON.stringify(expectedAliases)};
   const buttons = [...document.querySelectorAll(${JSON.stringify(taskModeButtonSelector)})];
-  const btn = buttons.find((el) => String((el && (el.innerText || el.textContent)) || "").trim().toLowerCase() === ${JSON.stringify(expectedLabel)});
+  const btn = buttons.find((el) => {
+    const t = String((el && (el.innerText || el.textContent)) || "").trim().toLowerCase();
+    return aliases.includes(t);
+  });
   if (!btn) {
     return { ok: false, active: false, switched: false, reason: "mode_button_not_found" };
   }
@@ -54,8 +61,8 @@ export function buildEnsureModeJs(targetMode = "task") {
 })()`;
 }
 
-export const uploadTriggerSelector = 'button[aria-label="Upload & tools"]';
-export const uploadMenuItemSelector = '[role="menuitem"][aria-label^="Upload files"]';
+export const uploadTriggerSelector = 'button[aria-label="Upload & tools"], button[aria-label="上传和工具"], button[aria-label="上傳與工具"], button[aria-label*="Upload"], button[aria-label*="上传"], button[aria-label*="上傳"]';
+export const uploadMenuItemSelector = '[role="menuitem"][aria-label^="Upload files"], [role="menuitem"][aria-label^="上传文件"], [role="menuitem"][aria-label^="上傳檔案"], [role="menuitem"][aria-label*="Upload"], [role="menuitem"][aria-label*="上传"], [role="menuitem"][aria-label*="上傳"]';
 export const fileInputSelector = 'input[type="file"].hidden-file-input[accept^=".txt"]';
 
 export function buildUploadJs() {
@@ -87,7 +94,8 @@ export function buildUploadJs() {
   trigger.click();
 
   const menuItem = await waitFor(() => {
-    const item = document.querySelector(${JSON.stringify(uploadMenuItemSelector)});
+    const item = document.querySelector(${JSON.stringify(uploadMenuItemSelector)}) ||
+      [...document.querySelectorAll('[role="menuitem"]')].find((m) => isVisible(m) && /^(upload files|上传文件|上传档案|上傳檔案)/i.test(String(m.innerText || m.textContent || "").trim()));
     return isVisible(item) ? item : null;
   }, 6000);
   if (!menuItem) {
@@ -177,7 +185,9 @@ export function buildLoginProbeJs() {
   const title = document.title || "";
   const signedInSelectors = [
     'button[aria-label*="Google 账号"]',
+    'button[aria-label*="Google Account"]',
     'img[aria-label*="个人资料"]',
+    'img[aria-label*="Profile"]',
     'a[href*="accounts.google.com/SignOutOptions"]'
   ];
   const signedOutSelectors = [

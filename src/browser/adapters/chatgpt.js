@@ -14,7 +14,7 @@ export const challengeTitlePattern = /请稍候|just a moment|verifying|security
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
 // 批次 D 附件上传契约：ChatGPT 真机 DOM 存在直接可用的文档通用入口 input，无需展开菜单
-export const fileInputSelector = 'input[type="file"][aria-label="附加文件"]';
+export const fileInputSelector = 'input[type="file"][aria-label="附加文件"], input[type="file"][aria-label="Attach files"], input[type="file"][aria-label="Upload files"], input[type="file"][aria-label="上传文件"]';
 export function buildUploadJs() {
   return null;
 }

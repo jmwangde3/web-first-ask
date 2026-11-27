@@ -6,13 +6,17 @@ import * as geminiAdapter from "../src/browser/adapters/gemini.js";
 import { attachFiles } from "../src/browser/driver.js";
 
 test("adapter upload contract exposes valid selectors and buildUploadJs", () => {
-  // ChatGPT contract verification
-  assert.equal(chatgptAdapter.fileInputSelector, 'input[type="file"][aria-label="附加文件"]');
+  // ChatGPT contract verification (bilingual ZH + EN)
+  assert.ok(chatgptAdapter.fileInputSelector.includes('aria-label="附加文件"'));
+  assert.ok(chatgptAdapter.fileInputSelector.includes('aria-label="Attach files"'));
+  assert.ok(chatgptAdapter.fileInputSelector.includes('aria-label="Upload files"'));
   assert.equal(chatgptAdapter.buildUploadJs(), null);
 
-  // Gemini contract verification
-  assert.equal(geminiAdapter.uploadTriggerSelector, 'button[aria-label="Upload & tools"]');
-  assert.equal(geminiAdapter.uploadMenuItemSelector, '[role="menuitem"][aria-label^="Upload files"]');
+  // Gemini contract verification (bilingual EN + ZH)
+  assert.ok(geminiAdapter.uploadTriggerSelector.includes('aria-label="Upload & tools"'));
+  assert.ok(geminiAdapter.uploadTriggerSelector.includes('aria-label="上传和工具"'));
+  assert.ok(geminiAdapter.uploadMenuItemSelector.includes('aria-label^="Upload files"'));
+  assert.ok(geminiAdapter.uploadMenuItemSelector.includes('aria-label^="上传文件"'));
   assert.equal(geminiAdapter.fileInputSelector, 'input[type="file"].hidden-file-input[accept^=".txt"]');
   const geminiJs = geminiAdapter.buildUploadJs();
   assert.equal(typeof geminiJs, "string");
