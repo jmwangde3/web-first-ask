@@ -10,6 +10,7 @@ import { WfaError } from "../errors.js";
 import { sleep as defaultSleep } from "../util.js";
 import * as defaultConversationStore from "../browser/conversation-store.js";
 import { DEFAULT_MIN_INTERVAL_MS, enforceCooldown, recordLastTurn } from "../browser/cooldown.js";
+import { enforceDensityBudget, recordDensityAction } from "../browser/density-guard.js";
 import { acquireTurnLock } from "../broker/turn-lock.js";
 import { pace as defaultPace } from "../browser/pacer.js";
 import { withSendSlot as defaultWithSendSlot } from "../browser/stagger.js";
@@ -240,6 +241,17 @@ export async function runCdpTurn({
     minIntervalMs,
     now: deps.now || Date.now,
     sleep: sleepFn,
+    onWait,
+  });
+  const densityEnabled = deps.densityEnabled !== undefined
+    ? deps.densityEnabled
+    : (minIntervalMs === 0 ? false : undefined);
+  const enforceDensity = deps.enforceDensityBudget || enforceDensityBudget;
+  await enforceDensity(effectiveHome, normalizedProvider, {
+    enabled: densityEnabled,
+    now: deps.now || Date.now,
+    sleep: deps.sleep,
+    signal,
     onWait,
   });
 
@@ -704,6 +716,10 @@ export async function runCdpTurn({
         });
       }
       submitted = true;
+      await (deps.recordDensityAction || recordDensityAction)(effectiveHome, normalizedProvider, {
+        enabled: densityEnabled,
+        now: deps.now || Date.now,
+      }).catch(() => {});
 
       // Publish the submission signal immediately after submitTurn succeeds.
       // The broker awaits this callback, so the durable turn record contains

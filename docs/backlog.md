@@ -3,8 +3,40 @@
 This is the **wfa-side** list: defects in the native CDP engine (`wfa cdp`), the broker (`wfa broker`) and the
 provider adapters. Upstream ask-bridge defects (U1–U19) live in [`known-issues.md`](known-issues.md).
 
-State of `main` when this list was written: `f3d104e`, `npm test` = **503 tests, 503 pass**, Node.js >= 22.15,
-zero runtime dependencies.
+Branch state: **`neon` @ `b2815a9` + patch 21** (2026-11-27), Node.js >= 22.15, zero runtime dependencies.
+Requirements baseline lives in [`requirements.md`](requirements.md); verified provider sandbox runtimes live in
+[`provider-capabilities.md`](provider-capabilities.md).
+
+## Status summary on `neon` (2026-11-27)
+
+| ID | Summary | Status on `neon` | Notes |
+|---|---|---|---|
+| **D1** | `--no-wait` broker idle exit | **Live pass** | Broker stays alive past idle window; `read --task-id` returns `completed` |
+| **D2** | First read after reopen returns `unconfirmed` | **Live pass** | Bounded hydration poll; first read returns `completed` |
+| **D3** | Attachment upload false positive / broker drop / zh-CN send button | **Fixed (`1bb6b7b`, `b2815a9`); zh-CN live re-test pending** | Fixed broker `POST /turns` `files` forwarding, chip height check, and Gemini zh-CN `aria-label="发送"` (`20`); restart broker (`wfa broker stop`) before live re-test |
+| **D4** | Long answer truncated to first line | **Live pass** | `div.collapsible-content-wrapper` `textContent` fallback; complete head-to-tail readback |
+| **D5** | Gemini background multi-minute pause | **Root cause merged into D4** | Stale-pending fallback added (`1bb6b7b`) |
+| **D6** | Continuation `composer_stop_state` | **Diagnostics added (`73b417b`)** | Preserves G1 R2 gate and captures `stopDiagnostics` |
+| **D7** | Cloudflare / Google `/sorry` interstitial | **Unit pass + `/sorry` fast-fail live** | Parks challenged tab to `about:blank` |
+| **D8** | Background tab hang / focus steal | **Live pass** | `Emulation.setFocusEmulationEnabled` + activate fallback |
+| **D9** | Gemini ignores reused `--conversation-id` | **Closed (not reproduced)** | Verified twice on same URL (`userTurns` 1->2) |
+| **D10** | `--restore-last-session` triggers `/sorry` | **Live pass (`ddd1acd`)** | Flag removed; persistent cookies survive normal close and hard termination |
+| **D11** | Bulk cleanup opens one tab per conversation | **Live pass (single tab) + hardened (`66461bc`, `0fc8a08`)** | Reuses 1 tab via `Page.navigate` + strict `waitForNavigationReady`, `batch` 4-6 s + `batch_pause` 60-180 s, multi-store dedupe, strict `createdByWfa === true` default, `--limit`/`--dry-run` |
+| **D12** | `wfa cdp login` 45 s off-origin redirect interrupts manual login | **Fixed (`66461bc`, unit pass)** | Off-origin redirect disabled by default; opt-in via `--recover-off-origin` |
+| **D13** | Windows lock `fs.rename` `EPERM (-4048)` under concurrency | **Fixed (`53be560`, unit/stress pass; Windows full-suite pending)** | Separate `.choosing` marker eliminates overwrite-rename on `.lock`; bounded transient FS retry in `turn-lock.js` & `lifecycle.js` |
+| **F1** | Gemini Task mode over CDP | **Live pass** | `gemini-mode` added to `VALUE_FLAGS`; new Gemini sessions default to `task` |
+| **F2** | Concurrent multi-provider runs | **Live pass** | `--providers chatgpt,gemini` (default when `--provider` omitted) |
+| **F3** | Extract `FILE:` blocks with integrity check | **Live pass (`6d04c26`)** | `wfa cdp extract` rejects unclosed fences / bad diff hunks |
+| **F4** | Download provider-produced attachments | **Unit pass; live pending** | `--download-dir` + CDP download capture & SHA-256 |
+| **F5** | Claude web adapter | **Unit pass; live pending** | `src/browser/adapters/claude.js` wired |
+| **F6** | Configurable human-like pacing & burst-density guard | **Unit pass (`0fc8a08`, patch 21); live pending** | 1-2 s `casual`, 4-6 s `batch`, 60-180 s `batch_pause`, plus per-provider 5-min sliding-window density guard (`density-guard.js`, default 12/5min) |
+| **F7** | Clean up `wfa`-created conversations | **Live pass + hardened (`66461bc`, `0fc8a08`)** | Single-tab bulk cleanup + persisted `createdByWfa` across stores |
+| **F8** | `REPO_UNREADABLE` fallback & `--code-task` | **Unit pass (`6d04c26`, `75c1903`); live pending** | `--fallback-bundle` + `--code-task` upfront repo bundle & `git apply --check` / `npm test` directive |
+| **F9** | Skill slimming | **Static pass** | `skills/web-first/SKILL.md` <= 120 lines; includes Q&A, code-bundle, and debug repro-only rules |
+| **F10** | Humanized keystroke timing & curved mouse trajectories | **Deferred (backlog)** | Lower priority than CDP `Input.dispatchMouseEvent` + pacing |
+| **F11** | Default-ON debug issue logging & repro-only Skill rule | **Live verified (`66461bc`)** | Default ON (`--no-debug` / `WFA_DEBUG=0` opt-out); `debug-issues.md` 512 KB `.1` rotation; `wfa cdp log-issue` |
+| **F12** | Bilingual EN/ZH web UI support | **Live pass (`c14af7b`) + zh-CN send fix (`b2815a9`)** | ChatGPT & Gemini EN/ZH uploads, mode switch, login probe, and Gemini zh-CN `发送` button |
+| **F13** | Stealth & humanization hardening | **Unit pass (`0fc8a08`, patch 21); live pending** | Auto-detect `Asia/Tokyo` timezone, launch arg subtraction, CDP `Input.dispatchMouseEvent`, `Page.createIsolatedWorld`, inter-batch pauses, sliding-window burst-density guard |
 
 Everything below was reproduced on a real Chrome with logged-in ChatGPT and Gemini accounts unless marked
 otherwise. Items marked *(unverified)* were reported but not re-confirmed with a controlled experiment.
@@ -14,7 +46,7 @@ otherwise. Items marked *(unverified)* were reported but not re-confirmed with a
 This file is the `neon` branch's copy: only results produced on this branch are recorded here.
 The shared defect catalogue lives on `main`; the `muse` fix round records its own results in its own copy.
 
-### Live verification of the Batch 1 + Batch 2 patch bundle (branch `neon`)
+### Historical baseline — Batch 1 + Batch 2 patch bundle (superseded by commits `1bb6b7b`..`b2815a9`)
 
 The patch bundle (`01-batch1-d4-d3-d1-d2.patch` + `02-batch2-d8-d7-f1.patch`, baseline `4001f14`) was applied
 on a fresh local branch `neon` as two commits — `6457aa3` (D4/D3/D1/D2) and `8fdb215` (D8/D7/F1).
@@ -318,6 +350,33 @@ while restoring zero historical tabs. Removed `--restore-last-session` from `src
 
 ---
 
+---
+
+### D11 — `wfa cdp cleanup` opens one new tab per conversation (P1, resolved on `neon` `66461bc` / `0fc8a08`)
+
+Bulk cleanup now reuses a single tab via `Page.navigate`, waits strictly for `location.pathname` and
+`document.readyState !== "loading"`, paces deletions with `batch` (4-6 s) and `batch_pause` (60-180 s every
+`--batch-size` items), deduplicates across `turns/results`, `turns/records`, `conversations/`, and `sessions.json`,
+and enforces `createdByWfa === true` by default (`--include-unknown` for legacy unknown records, never deleting
+`createdByWfa === false`).
+
+---
+
+### D12 — `wfa cdp login` off-origin redirect interrupts manual login (P2, resolved on `neon` `66461bc`)
+
+Disabled the 45 s off-origin `Page.navigate` redirect by default so human sign-in / 2FA is never interrupted;
+gated behind explicit `--recover-off-origin`.
+
+---
+
+### D13 — Windows concurrent lock publication fails with `fs.rename` `EPERM (-4048)` (P1, fixed on `neon` `53be560`)
+
+Split `src/broker/turn-lock.js` choosing phase into a separate `.lock.choosing` marker so `fs.rename(.lock.ready, .lock)`
+never overwrites an open `.lock` file, and added bounded transient FS retries (`EPERM`/`EBUSY`/`EACCES`, max 8 attempts,
+rethrown on exhaustion) in `turn-lock.js` and `lifecycle.js` with `tests/batch14-lock-windows-eperm.test.js`.
+
+---
+
 ## Planned work
 
 ### F1 — Gemini "Task" mode over CDP (P1)
@@ -376,6 +435,25 @@ Add optional human-like per-keystroke timing distributions (hold duration / roll
 mouse trajectories (Fitts' law / Bezier path) before CDP clicks. Deferred because long code/context prompts are
 naturally pasted in bulk and randomized bounding-box CDP `Input.dispatchMouseEvent` clicks + inter-batch pauses
 cover the primary anti-bot signal first.
+
+### F11 — Default-ON debug issue logging & repro-only Skill rule (P2, implemented on `neon` `66461bc`)
+
+`src/debug-log.js` logs failed `wfa cdp` commands by default to `<home>/debug-issues.md` (512 KB rotation to `.1`;
+disable via `--no-debug` or `WFA_DEBUG=0`), `wfa cdp log-issue` records agent reproduction steps, and `SKILL.md`
+forbids agents from modifying or fixing `wfa` itself.
+
+### F12 — Bilingual EN/ZH web UI support (P2, implemented on `neon` `c14af7b`, `b2815a9`)
+
+ChatGPT and Gemini selectors cover both English and Chinese UIs for uploads, Gemini Chat/Task mode switching,
+login probes, and Gemini's zh-CN send button (`aria-label="发送"`).
+
+### F13 — Stealth & humanization hardening (P2, implemented on `neon` `0fc8a08`, patch 21)
+
+Prevent short-window burst density while allowing concurrent big tasks: auto-detect host timezone (skip
+`Emulation.setTimezoneOverride` when host is already `Asia/Tokyo`), subtract unnecessary Chrome launch flags
+(`--disable-background-networking`), use CDP `Input.dispatchMouseEvent` with randomized bounding-box points for
+submit clicks, run DOM probes in `Page.createIsolatedWorld`, add inter-batch long pauses (`batch_pause`), and
+enforce a per-provider 5-minute sliding-window burst-density guard (`src/browser/density-guard.js`).
 
 ---
 

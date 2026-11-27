@@ -388,12 +388,8 @@ accumulated product tabs or trigger Google `/sorry` risk control (see D10 in `do
 - while the browser is on `auth.openai.com`, the probe returns `offOrigin` and keeps waiting instead of
   declaring victory. That mistake used to close the browser in the middle of the OAuth redirect, which left
   the identity provider signed in and the product signed out.
-- if the tab stays on the identity provider for 45 s, the command navigates it back to the product once, at
-  most twice per run.
-
-If the profile is ever launched **without** the switch, Chrome deletes the non-persistent cookies at startup
-and the next `wfa cdp ask` returns `login_required`. Re-run `wfa cdp login`; the identity provider's
-persistent cookie usually makes that a few seconds without retyping a password.
+- by default, `wfa cdp login` leaves off-origin sign-in / 2FA tabs alone so manual login is never interrupted
+  (D12, `66461bc`). Pass `--recover-off-origin` to opt in to navigating back after 45 s (at most twice per run).
 
 ## Known issues
 
