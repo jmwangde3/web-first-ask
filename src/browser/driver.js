@@ -3,6 +3,13 @@ import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { WfaError } from "../errors.js";
+import {
+  generateMousePath,
+  getLastCursor,
+  setLastCursor,
+  humanTypeText,
+  isHumanizeEnabled,
+} from "./humanize.js";
 
 function buildEvidence(state, lastProgressAgoMs) {
   return {
@@ -110,14 +117,30 @@ export function pickHumanPoint(rect, random = Math.random) {
 export async function humanClickAt(cdp, sessionId, x, y, {
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   random = Math.random,
+  curved = isHumanizeEnabled(),
+  from,
 } = {}) {
   const hoverDelay = 40 + Math.floor(Math.max(0, Math.min(1, Number(random()) || 0)) * 61);
   const pressDelay = 80 + Math.floor(Math.max(0, Math.min(1, Number(random()) || 0)) * 61);
-  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, sessionId);
+  if (curved) {
+    const start = from || getLastCursor(sessionId, random);
+    const points = generateMousePath(start, { x, y }, { random });
+    for (const pt of points) {
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: pt.x, y: pt.y }, sessionId);
+      if (pt.delayMs > 0) await sleep(pt.delayMs);
+    }
+  } else {
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, sessionId);
+  }
   await sleep(hoverDelay);
   await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, sessionId);
   await sleep(pressDelay);
-  await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, sessionId);
+  const driftX = curved ? Math.round((Math.max(0, Math.min(1, Number(random()) || 0)) - 0.5) * 200) / 100 : 0;
+  const driftY = curved ? Math.round((Math.max(0, Math.min(1, Number(random()) || 0)) - 0.5) * 200) / 100 : 0;
+  const relX = Math.round((x + driftX) * 100) / 100;
+  const relY = Math.round((y + driftY) * 100) / 100;
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: relX, y: relY, button: "left", clickCount: 1 }, sessionId);
+  setLastCursor(sessionId, { x: relX, y: relY });
 }
 
 export async function evaluateInWorld(cdp, sessionId, expression, {
@@ -645,7 +668,7 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
   }
 
   if (kind === "editable") {
-    await cdp.send("Input.insertText", { text }, sessionId);
+    await humanTypeText(cdp, sessionId, text);
 
     // Read back and compare normalized text
     const readBackExpr = `(() => {

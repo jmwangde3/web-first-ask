@@ -33,7 +33,7 @@ Requirements baseline lives in [`requirements.md`](requirements.md); verified pr
 | **F7** | Clean up `wfa`-created conversations | **Live pass + hardened (`66461bc`, `0fc8a08`)** | Single-tab bulk cleanup + persisted `createdByWfa` across stores |
 | **F8** | `REPO_UNREADABLE` fallback & `--code-task` | **Unit pass (`6d04c26`, `75c1903`); live pending** | `--fallback-bundle` + `--code-task` upfront repo bundle & `git apply --check` / `npm test` directive |
 | **F9** | Skill slimming | **Static pass** | `skills/web-first/SKILL.md` <= 120 lines; includes Q&A, code-bundle, and debug repro-only rules |
-| **F10** | Humanized keystroke timing & curved mouse trajectories | **Deferred (backlog)** | Lower priority than CDP `Input.dispatchMouseEvent` + pacing |
+| **F10** | Humanized keystroke timing & curved mouse trajectories | **Unit pass (patch 22); live pending** | `src/browser/humanize.js`: cubic-Bezier/Fitts' law mouse paths in `humanClickAt` + char-by-char typing for short single-line prompts (<=120 chars; long prompts paste in bulk) |
 | **F11** | Default-ON debug issue logging & repro-only Skill rule | **Live verified (`66461bc`)** | Default ON (`--no-debug` / `WFA_DEBUG=0` opt-out); `debug-issues.md` 512 KB `.1` rotation; `wfa cdp log-issue` |
 | **F12** | Bilingual EN/ZH web UI support | **Live pass (`c14af7b`) + zh-CN send fix (`b2815a9`)** | ChatGPT & Gemini EN/ZH uploads, mode switch, login probe, and Gemini zh-CN `发送` button |
 | **F13** | Stealth & humanization hardening | **Unit pass (`0fc8a08`, patch 21); live pending** | Auto-detect `Asia/Tokyo` timezone, launch arg subtraction, CDP `Input.dispatchMouseEvent`, `Page.createIsolatedWorld`, inter-batch pauses, sliding-window burst-density guard |
@@ -429,7 +429,7 @@ archive automatically instead of returning `REPO_UNREADABLE` and stopping.
 The packaged Skill carries a large instruction document. Reduce it to what changes behaviour, and stop the agent
 from over-thinking when the user explicitly names `wfa`.
 
-### F10 — Humanized keystroke timing & curved mouse trajectories (P3, deferred)
+### F10 — Humanized keystroke timing & curved mouse trajectories (P3, implemented on `neon` patch 22)
 
 Add optional human-like per-keystroke timing distributions (hold duration / rollover) for short inputs and curved
 mouse trajectories (Fitts' law / Bezier path) before CDP clicks. Deferred because long code/context prompts are
