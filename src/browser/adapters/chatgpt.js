@@ -75,8 +75,18 @@ export function buildAttachmentVerifyJs(fileNames) {
   return `(() => {
   const bases = ${JSON.stringify(bases)};
   const chips = [...document.querySelectorAll(${JSON.stringify(attachmentChipSelector)})];
+  const dedupRe = new RegExp(${JSON.stringify("\\s*\\(\\d+\\)(?=\\.[^.\\s/\\\\]+$|$)")}, "g");
+  const stripDedup = (str) => String(str || "")
+    .split(String.fromCharCode(10))
+    .map((line) => line.split(String.fromCharCode(13)).join("").trim().replace(dedupRe, ""))
+    .join(String.fromCharCode(10))
+    .toLowerCase();
   const texts = chips.map((el) => String((el && (el.innerText || el.textContent)) || "").trim());
-  const matched = bases.map((b) => texts.some((t) => t.includes(b)));
+  const normTexts = texts.map(stripDedup);
+  const matched = bases.map((b) => {
+    const nb = stripDedup(b);
+    return normTexts.some((t) => t.includes(nb));
+  });
   const input = document.querySelector(${JSON.stringify(fileInputSelector)});
   const sendBtns = [...document.querySelectorAll(${JSON.stringify(sendSelector)})];
   const isVisible = (el) => {

@@ -211,3 +211,36 @@ test("attachFiles: re-acquires fresh nodeId and retries once after 1s when chipC
   assert.equal(res.attempts[0].describeNode.attrs["aria-label"], "附加文件");
   assert.equal(res.attempts[0].beforeUrl, "https://chatgpt.com/");
 });
+
+test("chatgpt buildAttachmentVerifyJs: normalizes (n) dedup suffixes like ten(5).txt without false positives", async () => {
+  const vm = await import("node:vm");
+  const chatgptAdapter = await import("../src/browser/adapters/chatgpt.js");
+
+  const runVerify = (expectedFiles, chipTexts) => {
+    const fakeDoc = {
+      querySelectorAll: (sel) => {
+        if (sel === chatgptAdapter.attachmentChipSelector) {
+          return chipTexts.map((t) => ({ innerText: t }));
+        }
+        if (sel === chatgptAdapter.sendSelector) {
+          return [{ disabled: false, getAttribute: () => "false", getBoundingClientRect: () => ({ width: 32, height: 32 }) }];
+        }
+        return [];
+      },
+      querySelector: () => null,
+    };
+    return vm.runInNewContext(chatgptAdapter.buildAttachmentVerifyJs(expectedFiles), { document: fakeDoc });
+  };
+
+  const ok5 = runVerify(["ten.txt"], ["ten(5).txt", "ten(5).txt", "", "", ""]);
+  assert.equal(ok5.present, true);
+  assert.deepEqual([...ok5.matched], [true]);
+
+  const okZip = runVerify(["repo-123.zip"], ["repo-123 (2).zip\nZIP"]);
+  assert.equal(okZip.present, true);
+  assert.deepEqual([...okZip.matched], [true]);
+
+  const badOther = runVerify(["ten.txt"], ["other(5).txt"]);
+  assert.equal(badOther.present, false);
+  assert.deepEqual([...badOther.matched], [false]);
+});
