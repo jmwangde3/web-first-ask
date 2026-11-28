@@ -4,6 +4,7 @@ import path from "node:path";
 import { getHomeDir } from "../paths.js";
 import { isDebugEnabled, appendDebugIssue } from "../debug-log.js";
 import { pace as defaultPace } from "../browser/pacer.js";
+import { normalizeCleanupUrlKey, readDeletedLedger, recordDeletedUrl } from "../browser/cleanup-ledger.js";
 import { WfaError } from "../errors.js";
 import { recoverBrowser } from "../browser/recovery.js";
 import { connectCdp } from "../browser/cdp.js";
@@ -924,6 +925,7 @@ async function handleAsk(argv, deps) {
     conversationUrl: turn.conversationUrl ?? null,
     ...(geminiMode !== null ? { geminiMode } : (turn.geminiMode != null ? { geminiMode: turn.geminiMode } : {})),
     ...(turn.createdCleanup != null ? { cleanup: turn.createdCleanup } : {}),
+    ...(turn.downloads != null ? { downloads: turn.downloads } : {}),
     mode: turn.mode ?? mode,
     status: turn.state,
     text: rawText,
@@ -1101,13 +1103,7 @@ async function handleExtract(argv, deps = {}) {
 }
 
 function normalizeUrlKey(rawUrl) {
-  if (typeof rawUrl !== "string" || !rawUrl.trim()) return "";
-  try {
-    const u = new URL(rawUrl.trim());
-    return `${u.origin}${u.pathname.replace(/\/+$/, "")}`;
-  } catch {
-    return rawUrl.trim().replace(/\/+$/, "");
-  }
+  return normalizeCleanupUrlKey(rawUrl);
 }
 
 function isUnfinishedRecordState(record) {
@@ -1119,11 +1115,17 @@ function isUnfinishedRecordState(record) {
 
 export function parseDeleteEvalResult(evalRes) {
   const val = evalRes?.result?.value;
+  const diag = {};
+  if (val && typeof val === "object") {
+    for (const k of ["scrolledSteps", "scrollerFound", "finalLinkCount", "entryFound", "menuRetried", "expected", "actual"]) {
+      if (val[k] !== undefined) diag[k] = val[k];
+    }
+  }
   if (val && (val.success === true || val.deleted === true)) {
-    return { status: "deleted", verified: val.verified ?? true };
+    return { status: "deleted", verified: val.verified ?? true, ...diag };
   }
   if (val && val.success === false) {
-    return { status: "failed", reason: val.reason || "delete_failed" };
+    return { status: "failed", reason: val.reason || "delete_failed", ...diag };
   }
   return { status: "attempted" };
 }
@@ -1153,7 +1155,16 @@ export async function waitForNavigationReady(cdp, sessionId, targetUrl, {
       const val = res?.result?.value;
       if (val && typeof val.pathname === "string") {
         const actualPath = val.pathname.replace(/\/+$/, "");
-        if ((actualPath === expectedPath || actualPath.startsWith(`${expectedPath}/`)) && val.readyState !== "loading") {
+        const stripGeminiUserPrefix = (p) => {
+          const m = p.match(/^\/u\/\d+(\/app\/[^/]+)$/);
+          return m ? m[1] : p;
+        };
+        const canonActual = stripGeminiUserPrefix(actualPath);
+        const canonExpected = stripGeminiUserPrefix(expectedPath);
+        const pathOk = actualPath === expectedPath
+          || actualPath.startsWith(`${expectedPath}/`)
+          || (canonExpected.startsWith("/app/") && canonActual === canonExpected);
+        if (pathOk && val.readyState !== "loading") {
           await sleepFn(settleMs);
           return { ready: true, pathname: val.pathname, readyState: val.readyState };
         }
@@ -1252,6 +1263,18 @@ export async function collectCleanupCandidates(home, deps = {}) {
   const legacySessions = deps.resultStore?.readResults || deps.readResults
     ? (deps.readLegacySessions ? await deps.readLegacySessions(home) : [])
     : await readLegacySessionsCandidates(home);
+  const deletedLedger = deps.cleanupLedger?.readDeletedLedger
+    ? await deps.cleanupLedger.readDeletedLedger(home).catch(() => ({}))
+    : (deps.resultStore?.readResults || deps.readResults
+      ? {}
+      : await readDeletedLedger(home).catch(() => ({})));
+
+  const isRecordDeleted = (r) => Boolean(
+    r?.alreadyDeleted === true
+    || r?.createdCleanup?.status === "deleted"
+    || r?.cleanup?.status === "deleted"
+    || r?.cleanupStatus === "deleted"
+  );
 
   const allRaw = [
     ...(Array.isArray(results) ? results.map((r) => ({ ...r, source: r.source || "turns/results" })) : []),
@@ -1270,8 +1293,9 @@ export async function collectCleanupCandidates(home, deps = {}) {
       continue;
     }
     const existing = byUrl.get(key);
+    const ledgerDeleted = Boolean(deletedLedger && deletedLedger[key]);
     if (!existing) {
-      byUrl.set(key, { ...rec });
+      byUrl.set(key, { ...rec, ...(isRecordDeleted(rec) || ledgerDeleted ? { alreadyDeleted: true } : {}) });
       continue;
     }
     // Conservative merge:
@@ -1288,6 +1312,7 @@ export async function collectCleanupCandidates(home, deps = {}) {
       mergedSendCommittedAt = rec.sendCommittedAt ?? mergedSendCommittedAt;
     }
 
+    const mergedDeleted = Boolean(existing.alreadyDeleted || isRecordDeleted(rec) || ledgerDeleted);
     byUrl.set(key, {
       ...existing,
       turnId: existing.turnId || existing.id || rec.turnId || rec.id || null,
@@ -1296,6 +1321,7 @@ export async function collectCleanupCandidates(home, deps = {}) {
       createdByWfa: mergedCreated,
       state: mergedState,
       sendCommittedAt: mergedSendCommittedAt,
+      ...(mergedDeleted ? { alreadyDeleted: true } : {}),
     });
   }
 
@@ -1310,6 +1336,14 @@ export function classifyCleanupCandidate(record, {
   includeUnknown = false,
 } = {}) {
   if (!record || typeof record !== "object") return { eligible: false, reason: "invalid_record" };
+  if (
+    record.alreadyDeleted === true
+    || record.createdCleanup?.status === "deleted"
+    || record.cleanup?.status === "deleted"
+    || record.cleanupStatus === "deleted"
+  ) {
+    return { eligible: false, reason: "already_deleted" };
+  }
   if (record.createdByWfa === false) return { eligible: false, reason: "preexisting_conversation" };
   if (record.createdByWfa !== true && !includeUnknown) {
     return { eligible: false, reason: "created_by_wfa_unknown" };
@@ -1489,6 +1523,13 @@ async function handleCleanup(argv, deps = {}) {
               returnByValue: true,
             }, tab.sessionId);
             const parsed = parseDeleteEvalResult(evalRes);
+            if (parsed.status === "deleted") {
+              const shouldPersist = Boolean(deps.cleanupLedger?.recordDeletedUrl || deps.home || !deps.resultStore);
+              if (shouldPersist) {
+                const recordDeletedFn = deps.cleanupLedger?.recordDeletedUrl || recordDeletedUrl;
+                await recordDeletedFn(home, rec.conversationUrl, { provider: prov, verified: parsed.verified ?? true });
+              }
+            }
             cleaned.push({
               turnId: rec.turnId || rec.id || null,
               ...parsed,
@@ -1566,6 +1607,22 @@ async function handleCleanup(argv, deps = {}) {
     throw new WfaError("INVALID_ARGUMENT", "Conversation URL is missing for cleanup.");
   }
 
+  const forceSingle = Boolean(options.force);
+  if (!forceSingle) {
+    const canReadLedger = Boolean(deps.cleanupLedger?.readDeletedLedger || deps.home || !deps.resultStore);
+    if (canReadLedger) {
+      const readLedgerFn = deps.cleanupLedger?.readDeletedLedger || readDeletedLedger;
+      const ledger = await readLedgerFn(home).catch(() => ({}));
+      const urlKey = normalizeUrlKey(targetUrl);
+      if (urlKey && ledger && ledger[urlKey]) {
+        const skipped = { status: "skipped", reason: "already_deleted", provider, url: targetUrl };
+        if (options.json) stdout.write(`${JSON.stringify(skipped, null, 2)}\n`);
+        else stdout.write(`[cleanup] skipped (already_deleted): ${targetUrl}\n`);
+        return { code: 0, result: skipped };
+      }
+    }
+  }
+
   const adapter = (deps.adapters && deps.adapters[provider]) || DEFAULT_ADAPTERS[provider];
   if (typeof adapter.buildDeleteConversationJs !== "function") {
     const skipped = { status: "skipped", reason: "adapter_delete_not_supported", provider, url: targetUrl };
@@ -1595,6 +1652,13 @@ async function handleCleanup(argv, deps = {}) {
       returnByValue: true,
     }, tab.sessionId);
     const parsed = parseDeleteEvalResult(evalRes);
+    if (parsed.status === "deleted") {
+      const shouldPersist = Boolean(deps.cleanupLedger?.recordDeletedUrl || deps.home || !deps.resultStore);
+      if (shouldPersist) {
+        const recordDeletedFn = deps.cleanupLedger?.recordDeletedUrl || recordDeletedUrl;
+        await recordDeletedFn(home, targetUrl, { provider, verified: parsed.verified ?? true });
+      }
+    }
     const out = { ...parsed, provider, url: targetUrl };
     if (options.json) stdout.write(`${JSON.stringify(out, null, 2)}\n`);
     else stdout.write(`[cleanup] ${out.status}: ${targetUrl}\n`);

@@ -14,6 +14,7 @@ import { enforceDensityBudget, recordDensityAction } from "../browser/density-gu
 import { acquireTurnLock } from "../broker/turn-lock.js";
 import { pace as defaultPace } from "../browser/pacer.js";
 import { withSendSlot as defaultWithSendSlot } from "../browser/stagger.js";
+import { recordDeletedUrl } from "../browser/cleanup-ledger.js";
 
 const DEFAULT_ADAPTERS = {
   chatgpt: chatgptAdapter,
@@ -829,6 +830,15 @@ export async function runCdpTurn({
 
       let downloads = null;
       if (downloadDir && finalStatus === "completed") {
+        const triggerDl = typeof driver.triggerAndWaitForDownloads === "function"
+          ? driver.triggerAndWaitForDownloads
+          : defaultDriver.triggerAndWaitForDownloads;
+        if (cdp && sessionId && typeof triggerDl === "function") {
+          await triggerDl(cdp, sessionId, adapter, {
+            downloadDir,
+            beforeFiles: downloadBeforeFiles || new Set(),
+          }).catch(() => {});
+        }
         const collectDl = typeof driver.collectDownloads === "function"
           ? driver.collectDownloads
           : defaultDriver.collectDownloads;
@@ -850,6 +860,13 @@ export async function runCdpTurn({
             }, sessionId);
             const delVal = delRes?.result?.value;
             const delOk = Boolean(delVal && (delVal.success === true || delVal.deleted === true));
+            if (delOk) {
+              const recordDeletedFn = deps.recordDeletedUrl || recordDeletedUrl;
+              await recordDeletedFn(effectiveHome, conversationUrl, {
+                provider: normalizedProvider,
+                verified: delVal.verified ?? true,
+              }).catch(() => {});
+            }
             createdCleanup = delOk
               ? { status: "deleted", verified: delVal.verified ?? true, url: conversationUrl, createdByWfa: true }
               : (delVal && delVal.success === false
@@ -1015,12 +1032,14 @@ export async function runCdpTurn({
       });
     } finally {
       const mayCloseWorkTab =
-        terminalStatus === "completed" &&
-        terminalHasAnswer &&
         !normalizedConversationId &&
         keepBrowser === false &&
         targetId &&
-        targetId !== anchorTargetId;
+        targetId !== anchorTargetId &&
+        (
+          (terminalStatus === "completed" && terminalHasAnswer) ||
+          (terminalStatus === "failed" && !submitted && submittedAt == null)
+        );
       if (cdp && mayCloseWorkTab) {
         try {
           await cdp.send("Target.closeTarget", { targetId });

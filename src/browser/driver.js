@@ -316,6 +316,86 @@ export async function collectDownloads({ downloadDir, beforeFiles = new Set() } 
   return collected.length > 0 ? collected : null;
 }
 
+const DEFAULT_DOWNLOAD_TRIGGER_JS = `(() => {
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const sel = [
+    'button[aria-label="下载文件"]',
+    'button[aria-label="Download file"]',
+    'button[aria-label="Download"]',
+    'a[download]',
+  ].join(", ");
+  const candidates = [...document.querySelectorAll(sel)].filter((el) => isVisible(el) && !el.disabled);
+  const clicked = [];
+  for (const el of candidates) {
+    try {
+      el.click();
+      clicked.push(String(el.getAttribute("aria-label") || el.getAttribute("download") || el.innerText || "").trim() || "download");
+    } catch (e) {}
+  }
+  return { clickedCount: clicked.length, labels: clicked };
+})()`;
+
+export async function triggerAndWaitForDownloads(cdp, sessionId, adapter, {
+  downloadDir = null,
+  beforeFiles = new Set(),
+  timeoutMs = 15000,
+  pollMs = 250,
+  sleepFn = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  if (!cdp || typeof cdp.send !== "function" || !sessionId) {
+    return { clickedCount: 0, labels: [], waitedMs: 0 };
+  }
+  const expression = typeof adapter?.buildDownloadTriggerJs === "function"
+    ? adapter.buildDownloadTriggerJs()
+    : DEFAULT_DOWNLOAD_TRIGGER_JS;
+  let clickedCount = 0;
+  let labels = [];
+  try {
+    const res = await cdp.send("Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+    }, sessionId);
+    const val = res?.result?.value;
+    if (val && typeof val === "object") {
+      clickedCount = Number(val.clickedCount) || 0;
+      labels = Array.isArray(val.labels) ? val.labels : [];
+    }
+  } catch {
+    return { clickedCount: 0, labels: [], waitedMs: 0 };
+  }
+  if (clickedCount <= 0 || !downloadDir) {
+    return { clickedCount, labels, waitedMs: 0 };
+  }
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+  let sawAnyNew = false;
+  while (Date.now() < deadline) {
+    let entries = [];
+    try {
+      entries = await readdir(downloadDir);
+    } catch {}
+    const added = entries.filter((name) => !beforeFiles.has(name));
+    const pending = added.filter((name) => name.endsWith(".crdownload") || name.endsWith(".tmp") || name.endsWith(".part"));
+    const finalized = added.filter((name) => !name.endsWith(".crdownload") && !name.endsWith(".tmp") && !name.endsWith(".part"));
+    if (added.length > 0) sawAnyNew = true;
+    if (finalized.length >= clickedCount && pending.length === 0) {
+      return { clickedCount, labels, waitedMs: Date.now() - start };
+    }
+    if (sawAnyNew && finalized.length > 0 && pending.length === 0) {
+      await sleepFn(pollMs);
+      return { clickedCount, labels, waitedMs: Date.now() - start };
+    }
+    await sleepFn(pollMs);
+  }
+  return { clickedCount, labels, waitedMs: Date.now() - start };
+}
+
 export async function ensureProviderMode(cdp, sessionId, adapter, targetMode, {
   timeoutMs = 10000,
   pollIntervalMs = 250,

@@ -3,17 +3,17 @@
 This is the **wfa-side** list: defects in the native CDP engine (`wfa cdp`), the broker (`wfa broker`) and the
 provider adapters. Upstream ask-bridge defects (U1–U19) live in [`known-issues.md`](known-issues.md).
 
-Branch state: **`neon` @ `b2815a9` + patch 21** (2026-11-27), Node.js >= 22.15, zero runtime dependencies.
+Branch state: **`neon` @ `500db76` + patches 28–30** (2026-11-28), Node.js >= 22.15, zero runtime dependencies.
 Requirements baseline lives in [`requirements.md`](requirements.md); verified provider sandbox runtimes live in
 [`provider-capabilities.md`](provider-capabilities.md).
 
-## Status summary on `neon` (2026-11-27)
+## Status summary on `neon` (2026-11-28)
 
 | ID | Summary | Status on `neon` | Notes |
 |---|---|---|---|
 | **D1** | `--no-wait` broker idle exit | **Live pass** | Broker stays alive past idle window; `read --task-id` returns `completed` |
 | **D2** | First read after reopen returns `unconfirmed` | **Live pass** | Bounded hydration poll; first read returns `completed` |
-| **D3** | Attachment upload false positive / broker drop / zh-CN send button | **Fixed (`1bb6b7b`, `b2815a9`); zh-CN live re-test pending** | Fixed broker `POST /turns` `files` forwarding, chip height check, and Gemini zh-CN `aria-label="发送"` (`20`); restart broker (`wfa broker stop`) before live re-test |
+| **D3** | Attachment upload false positive / broker drop / zh-CN send button | **Live pass (ChatGPT `0f33f71` + Gemini zh-CN patch 28)** | Fixed broker `POST /turns` `files` forwarding, Gemini zh-CN `aria-label="发送"` (`20`), ChatGPT upload trigger + fresh `nodeId` one-shot retry (`24–25`), and `(n)` dedup filename normalization (`26`); ChatGPT `.txt` 3/3 & `--code-task` `.zip` 2/2 live pass |
 | **D4** | Long answer truncated to first line | **Live pass** | `div.collapsible-content-wrapper` `textContent` fallback; complete head-to-tail readback |
 | **D5** | Gemini background multi-minute pause | **Root cause merged into D4** | Stale-pending fallback added (`1bb6b7b`) |
 | **D6** | Continuation `composer_stop_state` | **Diagnostics added (`73b417b`)** | Preserves G1 R2 gate and captures `stopDiagnostics` |
@@ -27,13 +27,13 @@ Requirements baseline lives in [`requirements.md`](requirements.md); verified pr
 | **F1** | Gemini Task mode over CDP | **Live pass** | `gemini-mode` added to `VALUE_FLAGS`; new Gemini sessions default to `task` |
 | **F2** | Concurrent multi-provider runs | **Live pass** | `--providers chatgpt,gemini` (default when `--provider` omitted) |
 | **F3** | Extract `FILE:` blocks with integrity check | **Live pass (`6d04c26`)** | `wfa cdp extract` rejects unclosed fences / bad diff hunks |
-| **F4** | Download provider-produced attachments | **Unit pass; live pending** | `--download-dir` + CDP download capture & SHA-256 |
-| **F5** | Claude web adapter | **Unit pass; live pending** | `src/browser/adapters/claude.js` wired |
+| **F4** | Download provider-produced attachments | **Live pass (patch 29)** | `--download-dir` + `triggerAndWaitForDownloads` (`aria-label="下载文件"`/`Download file` + `a[download]`) + CDP capture & SHA-256 + CLI JSON `downloads` |
+| **F5** | Claude web adapter | **Live pass (patches 28–30)** | `src/browser/adapters/claude.js`: login/ask live pass, `.sr-only` prefix stripped from `answerText`, `buildDeleteConversationJs` via `session-title-menu` + `delete-session-trigger` + `alertdialog` |
 | **F6** | Configurable human-like pacing & burst-density guard | **Unit pass (`0fc8a08`, patch 21); live pending** | 1-2 s `casual`, 4-6 s `batch`, 60-180 s `batch_pause`, plus per-provider 5-min sliding-window density guard (`density-guard.js`, default 12/5min) |
-| **F7** | Clean up `wfa`-created conversations | **Live pass + hardened (`66461bc`, `0fc8a08`)** | Single-tab bulk cleanup + persisted `createdByWfa` across stores |
-| **F8** | `REPO_UNREADABLE` fallback & `--code-task` | **Unit pass (`6d04c26`, `75c1903`); live pending** | `--fallback-bundle` + `--code-task` upfront repo bundle & `git apply --check` / `npm test` directive |
+| **F7** | Clean up `wfa`-created conversations | **Live pass + hardened (`500db76`, patch 28)** | One-shot `--cleanup` default ON (`23`), ChatGPT lazy-loaded sidebar bounded scroll (`27`, 8/8 older sessions live pass), Gemini `/u/<n>/app/<id>` + zh-CN/sidebar-row fallback & menu-open retry (`28`), persistent deleted-URL ledger `cleanup-deleted.json` (`28`), and pre-submit failed tab close (`28`) |
+| **F8** | `REPO_UNREADABLE` fallback & `--code-task` | **ChatGPT live pass (`0f33f71`)** | `--fallback-bundle` + `--code-task` wraps `repo.bundle` inside `.zip` (`23`) with `git apply --check` / `npm test` directive; ChatGPT 2/2 live pass |
 | **F9** | Skill slimming | **Static pass** | `skills/web-first/SKILL.md` <= 120 lines; includes Q&A, code-bundle, and debug repro-only rules |
-| **F10** | Humanized keystroke timing & curved mouse trajectories | **Unit pass (patch 22); live pending** | `src/browser/humanize.js`: cubic-Bezier/Fitts' law mouse paths in `humanClickAt` + char-by-char typing for short single-line prompts (<=120 chars; long prompts paste in bulk) |
+| **F10** | Humanized keystroke timing & curved mouse trajectories | **Live pass (`bc0c273`)** | `src/browser/humanize.js`: cubic-Bezier/Fitts' law mouse paths in `humanClickAt` + char-by-char typing for short single-line prompts (<=120 chars; long prompts paste in bulk) |
 | **F11** | Default-ON debug issue logging & repro-only Skill rule | **Live verified (`66461bc`)** | Default ON (`--no-debug` / `WFA_DEBUG=0` opt-out); `debug-issues.md` 512 KB `.1` rotation; `wfa cdp log-issue` |
 | **F12** | Bilingual EN/ZH web UI support | **Live pass (`c14af7b`) + zh-CN send fix (`b2815a9`)** | ChatGPT & Gemini EN/ZH uploads, mode switch, login probe, and Gemini zh-CN `发送` button |
 | **F13** | Stealth & humanization hardening | **Unit pass (`0fc8a08`, patch 21); live pending** | Auto-detect `Asia/Tokyo` timezone, launch arg subtraction, CDP `Input.dispatchMouseEvent`, `Page.createIsolatedWorld`, inter-batch pauses, sliding-window burst-density guard |

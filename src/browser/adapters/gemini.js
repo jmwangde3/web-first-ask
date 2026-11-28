@@ -371,14 +371,25 @@ export function buildReadStateJs() {
 })()`;
 }
 
-export function buildDeleteConversationJs(targetUrl) {
-  // 三方审核加固（2026-11-24）：
-  // 1) 目标绑定：脚本入参 targetUrl，location.pathname 不匹配则拒绝执行。
-  // 2) 入口唯一性：精确 aria 且必须恰好一个可见；模糊回退排除导航容器且必须唯一。
-  // 3) 菜单项限定在打开的菜单容器内并过滤可见性。
-  // 4) 确认框必须归属 Delete chat（aria-label 或标题文案），按钮在框内精确匹配。
-  // 5) 验证组合：路由变化 / 标题变化 / 侧边栏条目消失 / 不存在提示。
+export function buildDeleteConversationJs(targetUrl, opts = {}) {
+  // 加固（2026-11-28, patch 28）：
+  // 1) 目标绑定：规范化 /u/<n>/app/<id> 与 /app/<id>，按 convId 严格匹配，不匹配直接 target_url_mismatch。
+  // 2) 入口唯一性：主视图精确/宽松 aria + 中英文标签（排除导航容器且唯一）；回退到目标 convId 对应侧边栏行内唯一菜单按钮。
+  // 3) 侧边栏懒加载：主视图与首屏均未命中时，对侧边栏滚动容器做有界翻页滚动（步数/连续无增长/总超时硬上限）。
+  // 4) 菜单展开重试：首次点击未展开时对同一按钮补发一次 pointerdown+mouseup+click 重试。
+  // 5) 确认框必须归属 Delete chat（aria-label 或标题文案），验证路由/标题/侧边栏条目/不存在状态变化。
+  const cfg = {
+    headerWaitMs: Number.isFinite(opts.headerWaitMs) ? opts.headerWaitMs : 4000,
+    maxScrollSteps: Number.isFinite(opts.maxScrollSteps) ? opts.maxScrollSteps : 12,
+    scrollSettleMs: Number.isFinite(opts.scrollSettleMs) ? opts.scrollSettleMs : 2500,
+    maxNoGrowthSteps: Number.isFinite(opts.maxNoGrowthSteps) ? opts.maxNoGrowthSteps : 2,
+    totalLinkTimeoutMs: Number.isFinite(opts.totalLinkTimeoutMs) ? opts.totalLinkTimeoutMs : 20000,
+    pollIntervalMs: Number.isFinite(opts.pollIntervalMs) ? opts.pollIntervalMs : 150,
+    menuWaitMs: Number.isFinite(opts.menuWaitMs) ? opts.menuWaitMs : 4000,
+    menuRetryMs: Number.isFinite(opts.menuRetryMs) ? opts.menuRetryMs : 1500,
+  };
   return `(async () => {
+  const cfg = ${JSON.stringify(cfg)};
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const isVisible = (el) => {
     if (!el || !el.isConnected) return false;
@@ -391,46 +402,224 @@ export function buildDeleteConversationJs(targetUrl) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try { const v = fn(); if (v) return v; } catch (e) {}
-      await sleep(intervalMs || 150);
+      await sleep(intervalMs || cfg.pollIntervalMs);
     }
+    try { const v = fn(); if (v) return v; } catch (e) {}
     return null;
   };
   const label = (el) => String((el && (el.innerText || el.textContent)) || "").trim();
+  const normPath = (p) => {
+    let s = String(p || "").split("?")[0].split("#")[0];
+    while (s.length > 1 && s.endsWith("/")) s = s.slice(0, -1);
+    return s;
+  };
+  const extractConvId = (raw) => {
+    const clean = normPath(raw);
+    const parts = clean.split("/").filter(Boolean);
+    const appIdx = parts.indexOf("app");
+    if (appIdx !== -1 && appIdx + 1 < parts.length) {
+      return parts[appIdx + 1];
+    }
+    return "";
+  };
+  const triggerMenu = (btn, withPointer) => {
+    if (withPointer) {
+      try { if (typeof btn.focus === "function") btn.focus(); } catch (e) {}
+      try {
+        if (typeof btn.dispatchEvent === "function") {
+          btn.dispatchEvent(new Event("pointerdown", { bubbles: true, cancelable: true }));
+          btn.dispatchEvent(new Event("mouseup", { bubbles: true, cancelable: true }));
+        }
+      } catch (e) {}
+    }
+    btn.click();
+  };
   try {
-    const expectedPath = new URL(${JSON.stringify(targetUrl)}).pathname;
-    if (location.pathname.indexOf(expectedPath) !== 0) {
+    const expectedPath = normPath(new URL(${JSON.stringify(targetUrl)}).pathname);
+    const actualPath = normPath(location.pathname);
+    const expectedId = extractConvId(expectedPath);
+    const actualId = extractConvId(actualPath);
+    const pathMatches = expectedId
+      ? (actualId && actualId === expectedId)
+      : (actualPath === expectedPath || actualPath.indexOf(expectedPath + "/") === 0);
+    if (!pathMatches) {
       return { success: false, reason: "target_url_mismatch", expected: expectedPath, actual: location.pathname };
     }
-    const beforePath = location.pathname;
+    const beforePath = actualPath;
     const beforeTitle = document.title;
-    const convId = expectedPath.split("/").pop();
+    const getSidebarLinks = () => [...document.querySelectorAll('a[href*="/app/"]')];
     const findEntry = () => {
-      const links = [...document.querySelectorAll('a[href*="/app/"]')];
-      return links.find((a) => (a.getAttribute("href") || "").indexOf(convId) !== -1 && isVisible(a)) || null;
+      if (!expectedId) return null;
+      const matches = getSidebarLinks().filter((a) => extractConvId(a.getAttribute("href") || "") === expectedId && isVisible(a));
+      return matches.length === 1 ? matches[0] : null;
     };
-    const hadEntry = Boolean(findEntry());
-    const menuBtn = await waitFor(() => {
-      const exact = [...document.querySelectorAll('button[aria-label="Open menu for conversation actions."]')].filter(isVisible);
+    const isInNav = (el) => Boolean(el && typeof el.closest === "function" && el.closest('nav, aside, [role="navigation"]'));
+    const findHeaderMenuBtn = () => {
+      const exactSel = [
+        'button[aria-label="Open menu for conversation actions."]',
+        'button[aria-label="打开对话操作菜单"]',
+        'button[aria-label="打开会话操作菜单"]',
+        'button[aria-label="打开用于对话操作的菜单"]',
+        'button[data-test-id="conversation-actions-menu-button"]',
+      ].join(", ");
+      const exact = [...document.querySelectorAll(exactSel)].filter((el) => isVisible(el) && !isInNav(el));
       if (exact.length === 1) return exact[0];
       if (exact.length > 1) return null;
-      const loose = [...document.querySelectorAll('button[aria-label*="conversation actions"], button[aria-label*="会话操作"], button[aria-label*="对话操作"]')]
-        .filter((el) => isVisible(el) && !el.closest("nav, aside, [role=navigation]"));
+      const looseSel = [
+        'button[aria-label*="conversation actions" i]',
+        'button[aria-label*="chat actions" i]',
+        'button[aria-label*="会话操作"]',
+        'button[aria-label*="对话操作"]',
+        'button[aria-label*="对话选项"]',
+        'button[aria-label*="更多选项"]',
+      ].join(", ");
+      const loose = [...document.querySelectorAll(looseSel)].filter((el) => isVisible(el) && !isInNav(el));
       return loose.length === 1 ? loose[0] : null;
-    }, 10000);
-    if (!menuBtn) return { success: false, reason: "menu_button_not_found" };
-    menuBtn.click();
-    const deleteItem = await waitFor(() => {
+    };
+    const findRowMenuBtn = (entry) => {
+      if (!entry) return null;
+      const rowSel = [
+        'button[data-test-id="actions-menu-button"]',
+        'button[aria-label*="actions" i]',
+        'button[aria-label*="操作"]',
+        'button[aria-label*="选项"]',
+        'button[aria-label*="More" i]',
+        'button[aria-label*="更多"]',
+      ].join(", ");
+      let node = entry.parentElement;
+      for (let depth = 0; depth < 5 && node; depth += 1) {
+        if (node.tagName === "NAV" || node.tagName === "ASIDE" || node.tagName === "BODY" || node.tagName === "HTML") break;
+        const btns = [...node.querySelectorAll(rowSel)].filter(isVisible);
+        if (btns.length === 1) return btns[0];
+        if (btns.length > 1) return null;
+        node = node.parentElement;
+      }
+      return null;
+    };
+    const isScrollable = (el) => {
+      if (!el || !el.isConnected) return false;
+      if (!(Number(el.scrollHeight) > Number(el.clientHeight) + 4)) return false;
+      try {
+        const oy = window.getComputedStyle(el).overflowY;
+        if (oy && oy !== "auto" && oy !== "scroll" && oy !== "overlay") return false;
+      } catch (e) {}
+      return true;
+    };
+    const findSidebarScroller = () => {
+      const links = getSidebarLinks();
+      for (const a of links) {
+        let cur = a.parentElement;
+        while (cur && cur.tagName !== "BODY" && cur.tagName !== "HTML") {
+          if (isScrollable(cur)) return cur;
+          cur = cur.parentElement;
+        }
+      }
+      const containers = [...document.querySelectorAll('nav, aside, [role="navigation"], [data-test-id*="history"]')];
+      for (const c of containers) {
+        if (isScrollable(c)) return c;
+        if (typeof c.querySelectorAll === "function") {
+          for (const child of c.querySelectorAll("div")) {
+            if (isScrollable(child)) return child;
+          }
+        }
+      }
+      return null;
+    };
+
+    let entry = findEntry();
+    const hadEntry = Boolean(entry);
+    let scrolledSteps = 0;
+    let scrollerFound = false;
+
+    let menuBtn = await waitFor(() => {
+      const hdr = findHeaderMenuBtn();
+      if (hdr) return hdr;
+      entry = findEntry();
+      return findRowMenuBtn(entry);
+    }, Math.min(cfg.headerWaitMs, cfg.totalLinkTimeoutMs), cfg.pollIntervalMs);
+
+    if (!menuBtn && expectedId) {
+      const overallDeadline = Date.now() + cfg.totalLinkTimeoutMs;
+      let noGrowthStreak = 0;
+      while (!menuBtn && scrolledSteps < cfg.maxScrollSteps && Date.now() < overallDeadline) {
+        const scroller = findSidebarScroller();
+        if (!scroller) break;
+        scrollerFound = true;
+        const prevCount = getSidebarLinks().length;
+        const prevHeight = Number(scroller.scrollHeight) || 0;
+        scrolledSteps += 1;
+        scroller.scrollTop = prevHeight;
+        if (typeof scroller.dispatchEvent === "function") {
+          try { scroller.dispatchEvent(new Event("scroll")); } catch (e) {}
+        }
+        const stepDeadline = Math.min(overallDeadline, Date.now() + cfg.scrollSettleMs);
+        let grew = false;
+        while (Date.now() < stepDeadline) {
+          const hdr = findHeaderMenuBtn();
+          if (hdr) { menuBtn = hdr; break; }
+          entry = findEntry();
+          if (entry) {
+            if (typeof entry.scrollIntoView === "function") {
+              try { entry.scrollIntoView({ block: "center", inline: "nearest" }); } catch (e) {}
+            }
+            const rb = findRowMenuBtn(entry);
+            if (rb) { menuBtn = rb; break; }
+          }
+          const curCount = getSidebarLinks().length;
+          const curHeight = Number(scroller.scrollHeight) || 0;
+          if (curCount > prevCount || curHeight > prevHeight) {
+            grew = true;
+            await sleep(cfg.pollIntervalMs);
+            entry = findEntry();
+            if (entry) {
+              const rb = findRowMenuBtn(entry);
+              if (rb) menuBtn = rb;
+            }
+            break;
+          }
+          await sleep(cfg.pollIntervalMs);
+        }
+        if (menuBtn) break;
+        if (grew) {
+          noGrowthStreak = 0;
+        } else {
+          noGrowthStreak += 1;
+          if (noGrowthStreak >= cfg.maxNoGrowthSteps) break;
+        }
+      }
+    }
+
+    if (!menuBtn) {
+      return {
+        success: false,
+        reason: "menu_button_not_found",
+        scrolledSteps,
+        scrollerFound,
+        entryFound: Boolean(entry),
+      };
+    }
+
+    const findDeleteItem = () => {
       const menus = [...document.querySelectorAll('gem-menu, [role="menu"], .mat-mdc-menu-panel')].filter(isVisible);
       const pool = [];
       for (const m of menus) {
-        for (const it of m.querySelectorAll('[role="menuitem"]')) {
+        for (const it of m.querySelectorAll('[role="menuitem"], button[data-test-id*="delete"]')) {
           if (isVisible(it)) pool.push(it);
         }
       }
       const all = pool.length ? pool : [...document.querySelectorAll('[role="menuitem"]')].filter(isVisible);
-      return all.find((el) => { const t = label(el); return t === "Delete" || t === "删除"; }) || null;
-    }, 4000);
-    if (!deleteItem) return { success: false, reason: "delete_menu_item_not_found" };
+      return all.find((el) => { const t = label(el); return t === "Delete" || t === "删除" || t === "删除对话" || t === "Delete chat"; }) || null;
+    };
+
+    triggerMenu(menuBtn, false);
+    let menuRetried = false;
+    let deleteItem = await waitFor(findDeleteItem, Math.min(cfg.menuRetryMs, cfg.menuWaitMs), cfg.pollIntervalMs);
+    if (!deleteItem && cfg.menuWaitMs > cfg.menuRetryMs) {
+      menuRetried = true;
+      triggerMenu(menuBtn, true);
+      deleteItem = await waitFor(findDeleteItem, cfg.menuWaitMs - cfg.menuRetryMs, cfg.pollIntervalMs);
+    }
+    if (!deleteItem) return { success: false, reason: "delete_menu_item_not_found", scrolledSteps, menuRetried };
     deleteItem.click();
     const confirmBtn = await waitFor(() => {
       const dialogs = [...document.querySelectorAll('mat-dialog-container[role="dialog"], [role="dialog"]')].filter(isVisible);
@@ -441,19 +630,19 @@ export function buildDeleteConversationJs(targetUrl) {
       });
       if (!dlg) return null;
       return [...dlg.querySelectorAll("button")].find((b) => { const t = label(b); return isVisible(b) && (t === "Delete" || t === "删除"); }) || null;
-    }, 4000);
-    if (!confirmBtn) return { success: false, reason: "confirm_button_not_found" };
+    }, 4000, cfg.pollIntervalMs);
+    if (!confirmBtn) return { success: false, reason: "confirm_button_not_found", scrolledSteps, menuRetried };
     confirmBtn.click();
     const verified = await waitFor(() => {
-      if (location.pathname !== beforePath) return "route_changed";
+      if (normPath(location.pathname) !== beforePath) return "route_changed";
       if (document.title !== beforeTitle) return "title_changed";
-      if (hadEntry && !findEntry()) return "sidebar_entry_removed";
+      if ((hadEntry || entry) && !findEntry()) return "sidebar_entry_removed";
       const body = String(document.body.innerText || "");
       if (body.indexOf("not found") !== -1 || body.indexOf("找不到") !== -1 || body.indexOf("不存在") !== -1) return "state_changed";
       return null;
-    }, 8000);
-    if (!verified) return { success: false, reason: "delete_unverified" };
-    return { success: true, verified };
+    }, 8000, cfg.pollIntervalMs);
+    if (!verified) return { success: false, reason: "delete_unverified", scrolledSteps, menuRetried };
+    return { success: true, verified, scrolledSteps, menuRetried };
   } catch (err) {
     return { success: false, reason: "eval_error:" + (err && err.message ? err.message : String(err)) };
   }

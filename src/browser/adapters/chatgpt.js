@@ -340,6 +340,8 @@ export function buildDeleteConversationJs(targetUrl, {
   maxNoGrowthSteps = 2,
   totalLinkTimeoutMs = 25000,
   pollIntervalMs = 150,
+  menuWaitMs = 4000,
+  menuRetryMs = 1500,
 } = {}) {
   // 三方审核合并实现（Gemini + agy，2026-11-24；2026-11-28 补充侧边栏懒加载滚动）：
   // 1) 目标绑定：location.pathname 必须匹配 targetUrl 的 path，否则拒绝。
@@ -356,6 +358,8 @@ export function buildDeleteConversationJs(targetUrl, {
     maxNoGrowthSteps,
     totalLinkTimeoutMs,
     pollIntervalMs,
+    menuWaitMs,
+    menuRetryMs,
   };
   return `(async () => {
   const cfg = ${JSON.stringify(cfg)};
@@ -498,13 +502,24 @@ export function buildDeleteConversationJs(targetUrl, {
       }
       return null;
     }, 4000);
-    if (!menuBtn) return { success: false, reason: "session_menu_button_not_found" };
-    menuBtn.click();
-    const deleteItem = await waitFor(() => {
+    if (!menuBtn) return { success: false, reason: "session_menu_button_not_found", scrolledSteps };
+    const triggerMenu = (btn, withPointer) => {
+      if (withPointer) {
+        try { if (typeof btn.focus === "function") btn.focus(); } catch (e) {}
+        try {
+          if (typeof btn.dispatchEvent === "function") {
+            btn.dispatchEvent(new Event("pointerdown", { bubbles: true, cancelable: true }));
+            btn.dispatchEvent(new Event("mouseup", { bubbles: true, cancelable: true }));
+          }
+        } catch (e) {}
+      }
+      btn.click();
+    };
+    const findDeleteItem = () => {
       const menus = [...document.querySelectorAll('[role="menu"], [data-radix-popper-content-wrapper], [data-state="open"]')].filter(isVisible);
       const pool = [];
       for (const m of menus) {
-        for (const it of m.querySelectorAll('[role="menuitem"]')) {
+        for (const it of m.querySelectorAll('[role="menuitem"], button[role="menuitem"], [data-testid*="delete"]')) {
           if (isVisible(it)) pool.push(it);
         }
       }
@@ -513,8 +528,16 @@ export function buildDeleteConversationJs(targetUrl, {
         const t = firstLine(el);
         return t === "删除" || t === "Delete" || t === "删除聊天" || t === "Delete chat";
       }) || null;
-    }, 4000);
-    if (!deleteItem) return { success: false, reason: "delete_menu_item_not_found" };
+    };
+    triggerMenu(menuBtn, false);
+    let menuRetried = false;
+    let deleteItem = await waitFor(findDeleteItem, Math.min(cfg.menuRetryMs, cfg.menuWaitMs), cfg.pollIntervalMs);
+    if (!deleteItem && cfg.menuWaitMs > cfg.menuRetryMs) {
+      menuRetried = true;
+      triggerMenu(menuBtn, true);
+      deleteItem = await waitFor(findDeleteItem, cfg.menuWaitMs - cfg.menuRetryMs, cfg.pollIntervalMs);
+    }
+    if (!deleteItem) return { success: false, reason: "delete_menu_item_not_found", scrolledSteps, menuRetried };
     deleteItem.click();
     const confirmBtn = await waitFor(() => {
       const dialogs = [...document.querySelectorAll('div[role="dialog"][aria-modal="true"]')].filter((d) => {
@@ -545,9 +568,36 @@ export function buildDeleteConversationJs(targetUrl, {
       return null;
     }, 8000);
     if (!verified) return { success: false, reason: "delete_unverified" };
-    return { success: true, verified };
+    return { success: true, verified, scrolledSteps, menuRetried };
   } catch (err) {
     return { success: false, reason: "eval_error:" + (err && err.message ? err.message : String(err)) };
   }
+})()`;
+}
+
+export function buildDownloadTriggerJs() {
+  return `(() => {
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const sel = [
+    'button[aria-label="下载文件"]',
+    'button[aria-label="Download file"]',
+    'button[aria-label="Download"]',
+    'a[download]',
+  ].join(", ");
+  const candidates = [...document.querySelectorAll(sel)].filter((el) => isVisible(el) && !el.disabled);
+  const clicked = [];
+  for (const el of candidates) {
+    try {
+      el.click();
+      clicked.push(String(el.getAttribute("aria-label") || el.getAttribute("download") || el.innerText || "").trim() || "download");
+    } catch (e) {}
+  }
+  return { clickedCount: clicked.length, labels: clicked };
 })()`;
 }

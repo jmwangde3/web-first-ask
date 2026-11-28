@@ -50,8 +50,11 @@ test("F7 CLI: wfa cdp cleanup refuses pre-existing conversations and deletes cre
   assert.equal(refused.code, 1);
   assert.match(errOut.output, /REFUSE_PREEXISTING_CONVERSATION/);
 
+  const tmpHome = await mkdtemp(path.join(os.tmpdir(), "wfa-cli-cleanup-"));
+  try {
   const okOut = createMockStream();
   const deleted = await runCdpCommand(["cleanup", "--task-id", "t-created", "--json"], {
+    home: tmpHome,
     stdout: okOut,
     stderr: createMockStream(),
     resultStore: {
@@ -80,6 +83,9 @@ test("F7 CLI: wfa cdp cleanup refuses pre-existing conversations and deletes cre
   });
   assert.equal(deleted.code, 0);
   assert.equal(JSON.parse(okOut.output).status, "deleted");
+  } finally {
+    await rm(tmpHome, { recursive: true, force: true });
+  }
 });
 
 test("F8 CLI: wfa cdp ask --fallback-bundle auto-bundles and submits follow-up on REPO_UNREADABLE", async (t) => {
