@@ -840,6 +840,41 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
     throw new WfaError("ATTACH_UPLOAD_FAILED", `CDP DOM.setFileInputFiles failed: ${err.message || String(err)}`);
   }
 
+  // Best-effort: if CDP setFileInputFiles populated input.files without triggering
+  // framework onChange, dispatch bubbling input/change events and capture inputDesc.
+  let postSetInfo = null;
+  try {
+    const postRes = await cdp.send("Runtime.evaluate", {
+      expression: `(() => {
+        const input = document.querySelector(${JSON.stringify(selector)});
+        if (!input) return { found: false };
+        const count = input.files ? input.files.length : 0;
+        let dispatched = false;
+        if (count > 0 && typeof input.dispatchEvent === "function") {
+          try {
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            dispatched = true;
+          } catch {}
+        }
+        return {
+          found: true,
+          filesAfterSet: count,
+          changeDispatched: dispatched,
+          inputDesc: {
+            ariaLabel: typeof input.getAttribute === "function" ? input.getAttribute("aria-label") : null,
+            accept: typeof input.getAttribute === "function" ? input.getAttribute("accept") : null,
+            multiple: Boolean(input.multiple),
+            id: input.id || null,
+            inForm: Boolean(typeof input.closest === "function" && input.closest("form")),
+          },
+        };
+      })()`,
+      returnByValue: true,
+    }, sessionId);
+    postSetInfo = postRes?.result?.value || null;
+  } catch {}
+
   if (signal?.aborted) {
     const err = new Error("Operation cancelled");
     err.code = "CANCELLED";
@@ -878,6 +913,8 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
         expectedFiles: absolutePaths.map((fp) => path.basename(fp)),
         verifyPolls,
         inputFiles: diag?.inputFiles ?? null,
+        inputDesc: diag?.inputDesc ?? postSetInfo?.inputDesc ?? null,
+        changeDispatched: postSetInfo?.changeDispatched ?? null,
         chipCount: diag?.chipCount ?? 0,
         chipTexts: diag?.chipTexts ?? [],
         matched: diag?.matched ?? [],

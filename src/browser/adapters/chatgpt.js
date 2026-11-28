@@ -13,10 +13,55 @@ export const sendSelector = 'form:has([contenteditable="true"], textarea) button
 export const challengeTitlePattern = /请稍候|just a moment|verifying|security check|cloudflare|人机验证/i;
 export const turnChallengeTitlePattern = /please wait|just a moment|checking your browser|verify you are human|security check|unusual traffic|cloudflare|请稍候|正在确认您是真人|人机验证/i;
 
-// 批次 D 附件上传契约：ChatGPT 真机 DOM 存在直接可用的文档通用入口 input，无需展开菜单
+// 附件上传契约（2026-11-28 真机核实）：ChatGPT 需先点击「添加文件等内容 / Add files」触发上传菜单与事件绑定，
+// 再对通用文件 input[type="file"]（aria-label="附加文件" 等，accept=null）注入文件。
+export const uploadTriggerSelector = [
+  'button[aria-label="添加文件等内容"]',
+  'button[aria-label="Add files"]',
+  'button[aria-label="Add photos and files"]',
+  'button[aria-label="Add photos & files"]',
+  'button[aria-label="Attach files"]',
+].join(", ");
 export const fileInputSelector = 'input[type="file"][aria-label="附加文件"], input[type="file"][aria-label="Attach files"], input[type="file"][aria-label="Upload files"], input[type="file"][aria-label="上传文件"]';
 export function buildUploadJs() {
-  return null;
+  return `(async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    if (style && (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")) return false;
+    const rect = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    return !rect || (rect.width > 0 && rect.height > 0);
+  };
+  const trigger = [...document.querySelectorAll(${JSON.stringify(uploadTriggerSelector)})].find(isVisible) || null;
+  let triggered = false;
+  if (trigger && typeof trigger.click === "function") {
+    trigger.click();
+    triggered = true;
+    await sleep(250);
+  }
+  const deadline = Date.now() + 4000;
+  let input = null;
+  while (Date.now() < deadline) {
+    input = document.querySelector(${JSON.stringify(fileInputSelector)});
+    if (input) break;
+    await sleep(100);
+  }
+  if (!input) {
+    return { success: false, triggered, reason: "file_input_not_found" };
+  }
+  return {
+    success: true,
+    triggered,
+    inputDesc: {
+      ariaLabel: input.getAttribute("aria-label"),
+      accept: input.getAttribute("accept"),
+      multiple: Boolean(input.multiple),
+      id: input.id || null,
+      inForm: Boolean(typeof input.closest === "function" && input.closest("form")),
+    },
+  };
+})()`;
 }
 
 
@@ -44,9 +89,16 @@ export function buildAttachmentVerifyJs(fileNames) {
     present: chips.length > 0 && matched.every(Boolean) && sendReady,
     matched,
     chipCount: chips.length,
-    chipTexts: texts.slice(0, 8),
-    sendReady,
+    chipTexts: texts.slice(0, 10),
     inputFiles: input && input.files ? [...input.files].map((f) => f.name) : [],
+    inputDesc: input ? {
+      ariaLabel: typeof input.getAttribute === "function" ? input.getAttribute("aria-label") : null,
+      accept: typeof input.getAttribute === "function" ? input.getAttribute("accept") : null,
+      multiple: Boolean(input.multiple),
+      id: input.id || null,
+      inForm: Boolean(typeof input.closest === "function" && input.closest("form")),
+    } : null,
+    sendReady,
   };
 })()`;
 }

@@ -59,6 +59,7 @@ export async function recordResult(home, turn) {
     conversationId: turn.conversationId ?? null,
     conversationUrl: turn.conversationUrl ?? null,
     createdByWfa: typeof turn.createdByWfa === "boolean" ? turn.createdByWfa : null,
+    createdCleanup: turn.createdCleanup ?? null,
     targetId: turn.targetId ?? null,
     state: turn.state,
     text: turn.text ?? null,

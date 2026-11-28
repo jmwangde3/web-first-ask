@@ -10,7 +10,11 @@ test("adapter upload contract exposes valid selectors and buildUploadJs", () => 
   assert.ok(chatgptAdapter.fileInputSelector.includes('aria-label="附加文件"'));
   assert.ok(chatgptAdapter.fileInputSelector.includes('aria-label="Attach files"'));
   assert.ok(chatgptAdapter.fileInputSelector.includes('aria-label="Upload files"'));
-  assert.equal(chatgptAdapter.buildUploadJs(), null);
+  assert.ok(chatgptAdapter.uploadTriggerSelector.includes('aria-label="添加文件等内容"'));
+  assert.ok(chatgptAdapter.uploadTriggerSelector.includes('aria-label="Add files"'));
+  const chatgptJs = chatgptAdapter.buildUploadJs();
+  assert.equal(typeof chatgptJs, "string");
+  assert.ok(chatgptJs.includes("添加文件等内容"));
 
   // Gemini contract verification (bilingual EN + ZH)
   assert.ok(geminiAdapter.uploadTriggerSelector.includes('aria-label="Upload & tools"'));

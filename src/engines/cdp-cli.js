@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getHomeDir } from "../paths.js";
 import { isDebugEnabled, appendDebugIssue } from "../debug-log.js";
@@ -13,11 +13,11 @@ import * as geminiAdapter from "../browser/adapters/gemini.js";
 import * as claudeAdapter from "../browser/adapters/claude.js";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
-import { archiveRepository } from "../repository-archive.js";
+import { archiveRepository, buildZip } from "../repository-archive.js";
 
 const execFileAsync = promisify(execFileCb);
 export const CODE_TASK_VERIFY_DIRECTIVE =
-  "\n\n[Verification requirement] Use the attached repository bundle to verify your patch: run `git apply --check` and full `npm test`, and report the exact pass/fail results before returning the final patch.";
+  "\n\n[Verification requirement] Use the attached repository .zip (containing repo.bundle; unzip and `git clone repo.bundle repo`) to verify your patch: run `git apply --check` and full `npm test`, and report the exact pass/fail results before returning the final patch.";
 import { sleep as defaultSleep } from "../util.js";
 import { readBrokerRecord, isInstanceAlive } from "../broker/lifecycle.js";
 import { ensureBroker, createTurn, waitForTurn, waitForSubmission } from "../broker/client.js";
@@ -698,13 +698,20 @@ async function handleAsk(argv, deps) {
     if (typeof deps.createCodeTaskBundle === "function") {
       bundlePath = await deps.createCodeTaskBundle({ workspaceRoot, bundleDir });
     } else {
-      const gitBundlePath = path.join(bundleDir, `repo-${Date.now()}-${randomUUID().slice(0, 8)}.bundle`);
+      const stamp = `${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const tmpBundlePath = path.join(bundleDir, `repo-${stamp}.bundle`);
+      const zipPath = path.join(bundleDir, `repo-${stamp}.zip`);
       try {
-        await execFileAsync("git", ["bundle", "create", gitBundlePath, "HEAD"], { cwd: workspaceRoot, timeout: 15000 });
-        bundlePath = gitBundlePath;
+        await execFileAsync("git", ["bundle", "create", tmpBundlePath, "HEAD"], { cwd: workspaceRoot, timeout: 15000 });
+        const bundleBytes = await readFile(tmpBundlePath);
+        const zipBytes = buildZip([{ name: "repo.bundle", data: bundleBytes }]);
+        await writeFile(zipPath, zipBytes);
+        bundlePath = zipPath;
       } catch {
         const arc = await (deps.archiveRepository || archiveRepository)({ cwd: workspaceRoot, outDir: bundleDir });
         bundlePath = arc?.archivePath || arc?.path || null;
+      } finally {
+        await rm(tmpBundlePath, { force: true }).catch(() => {});
       }
     }
     if (bundlePath && !attachedFiles.includes(bundlePath)) {
@@ -803,7 +810,7 @@ async function handleAsk(argv, deps) {
     ...(attachedFiles.length > 0 ? { files: attachedFiles } : {}),
     ...(geminiMode !== null ? { geminiMode } : {}),
     ...(downloadDir !== null ? { downloadDir } : {}),
-    ...(options.cleanup ? { cleanupCreated: true } : {}),
+    ...((options["no-cleanup"] ? false : (Boolean(options.cleanup) || conversationId === null)) ? { cleanupCreated: true } : {}),
     ...(minIntervalMs !== undefined ? { minIntervalMs } : {}),
     ...(options["chrome-path"] ? { chromePath: options["chrome-path"] } : {}),
   });
@@ -914,6 +921,9 @@ async function handleAsk(argv, deps) {
     id: turn.id ?? turnId,
     provider: turn.provider ?? provider,
     conversationId: turn.conversationId ?? conversationId,
+    conversationUrl: turn.conversationUrl ?? null,
+    ...(geminiMode !== null ? { geminiMode } : (turn.geminiMode != null ? { geminiMode: turn.geminiMode } : {})),
+    ...(turn.createdCleanup != null ? { cleanup: turn.createdCleanup } : {}),
     mode: turn.mode ?? mode,
     status: turn.state,
     text: rawText,

@@ -666,7 +666,7 @@ async function handleBrokerAsk(argv, deps) {
       ...(geminiMode !== null ? { geminiMode } : {}),
       ...(attachedFiles.length > 0 ? { files: attachedFiles } : {}),
       ...(downloadDir !== null ? { downloadDir } : {}),
-      ...(options.cleanup ? { cleanupCreated: true } : {}),
+      ...((options["no-cleanup"] ? false : (Boolean(options.cleanup) || !options["conversation-id"])) ? { cleanupCreated: true } : {}),
     });
   } catch (err) {
     stderr.write(`wfa: ${err?.code || "BROKER_UNREACHABLE"}: ${err?.message || String(err)}\n`);
