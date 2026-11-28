@@ -333,15 +333,34 @@ ${ANSWER_BODY_READER_JS}
 })()`;
 }
 
-export function buildDeleteConversationJs(targetUrl) {
-  // 三方审核合并实现（Gemini + agy，2026-11-24）：
+export function buildDeleteConversationJs(targetUrl, {
+  initialWaitMs = 2500,
+  maxScrollSteps = 12,
+  scrollSettleMs = 2500,
+  maxNoGrowthSteps = 2,
+  totalLinkTimeoutMs = 25000,
+  pollIntervalMs = 150,
+} = {}) {
+  // 三方审核合并实现（Gemini + agy，2026-11-24；2026-11-28 补充侧边栏懒加载滚动）：
   // 1) 目标绑定：location.pathname 必须匹配 targetUrl 的 path，否则拒绝。
-  // 2) 入口：侧边栏当前会话项（aria-current=page，唯一可见），回退精确 href。
+  // 2) 入口：仅匹配 href 精确等于当前 pathname 的唯一可见侧边栏条目（含 aria-current="page" 校验）；
+  //    若首屏（前 20 条）未出现，对侧边栏滚动容器做有界懒加载滚动（最多 maxScrollSteps 步、
+  //    连续 maxNoGrowthSteps 步无增长早停、总耗时上限 totalLinkTimeoutMs）。
   // 3) 菜单项：限定在打开的菜单容器内，按首行文本匹配（菜单项带换行快捷键后缀）。
   // 4) 确认框：aria-modal=true 且非 floating/quick-chat，文本含 删除聊天/Delete chat。
   // 5) 验证：路由离开 / 侧边栏条目消失 / not found 文案。
+  const cfg = {
+    initialWaitMs,
+    maxScrollSteps,
+    scrollSettleMs,
+    maxNoGrowthSteps,
+    totalLinkTimeoutMs,
+    pollIntervalMs,
+  };
   return `(async () => {
+  const cfg = ${JSON.stringify(cfg)};
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const normPath = (p) => { let s = String(p || ""); while (s.length > 1 && s.endsWith("/")) s = s.slice(0, -1); return s; };
   const isVisible = (el) => {
     if (!el || !el.isConnected) return false;
     const style = window.getComputedStyle(el);
@@ -353,29 +372,121 @@ export function buildDeleteConversationJs(targetUrl) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try { const v = fn(); if (v) return v; } catch (e) {}
-      await sleep(intervalMs || 150);
+      await sleep(intervalMs || cfg.pollIntervalMs);
     }
     return null;
   };
   const label = (el) => String((el && (el.innerText || el.textContent)) || "").trim();
   const firstLine = (el) => label(el).split(String.fromCharCode(10))[0].trim();
   try {
-    const expectedPath = new URL(${JSON.stringify(targetUrl)}).pathname;
-    if (location.pathname.indexOf(expectedPath) !== 0) {
-      return { success: false, reason: "target_url_mismatch", expected: expectedPath, actual: location.pathname };
+    const expectedPath = normPath(new URL(${JSON.stringify(targetUrl)}).pathname);
+    const beforePathRaw = location.pathname;
+    const beforePath = normPath(beforePathRaw);
+    if (beforePath !== expectedPath && beforePath.indexOf(expectedPath + "/") !== 0) {
+      return { success: false, reason: "target_url_mismatch", expected: expectedPath, actual: beforePathRaw };
     }
-    const beforePath = location.pathname;
     const beforeTitle = document.title;
-    const findSidebarLink = () => {
-      const links = [...document.querySelectorAll('a[href^="/c/"]')];
-      return links.find((a) => a.getAttribute("href") === beforePath && isVisible(a)) || null;
+    const getSidebarLinks = () => [...document.querySelectorAll('a[href^="/c/"]')];
+    const matchesTargetHref = (a) => {
+      if (!a || typeof a.getAttribute !== "function") return false;
+      const href = String(a.getAttribute("href") || "").split("?")[0].split("#")[0];
+      return normPath(href) === beforePath;
     };
-    const link = await waitFor(() => {
-      const active = [...document.querySelectorAll('a[aria-current="page"][href^="/c/"]')].filter(isVisible);
+    const findSidebarLink = () => {
+      const exact = getSidebarLinks().filter((a) => matchesTargetHref(a) && isVisible(a));
+      return exact.length === 1 ? exact[0] : null;
+    };
+    const findCurrentLink = () => {
+      const active = [...document.querySelectorAll('a[aria-current="page"][href^="/c/"]')]
+        .filter((a) => matchesTargetHref(a) && isVisible(a));
       if (active.length === 1) return active[0];
       return findSidebarLink();
-    }, 10000);
-    if (!link) return { success: false, reason: "current_session_link_not_found" };
+    };
+    const isScrollable = (el) => {
+      if (!el || !el.isConnected) return false;
+      if (!(Number(el.scrollHeight) > Number(el.clientHeight) + 4)) return false;
+      try {
+        const oy = window.getComputedStyle(el).overflowY;
+        if (oy && oy !== "auto" && oy !== "scroll" && oy !== "overlay") return false;
+      } catch (e) {}
+      return true;
+    };
+    const findSidebarScroller = () => {
+      const links = getSidebarLinks();
+      for (const a of links) {
+        let cur = a.parentElement;
+        while (cur && cur.tagName !== "BODY" && cur.tagName !== "HTML") {
+          if (isScrollable(cur)) return cur;
+          cur = cur.parentElement;
+        }
+      }
+      const containers = [...document.querySelectorAll('nav, aside, [data-testid*="history"]')];
+      for (const c of containers) {
+        if (isScrollable(c)) return c;
+        if (typeof c.querySelectorAll === "function") {
+          for (const child of c.querySelectorAll("div")) {
+            if (isScrollable(child)) return child;
+          }
+        }
+      }
+      return null;
+    };
+
+    const overallDeadline = Date.now() + cfg.totalLinkTimeoutMs;
+    let link = await waitFor(findCurrentLink, Math.min(cfg.initialWaitMs, cfg.totalLinkTimeoutMs), cfg.pollIntervalMs);
+    let scrolledSteps = 0;
+    let scrollerFound = false;
+
+    if (!link) {
+      let noGrowthStreak = 0;
+      while (!link && scrolledSteps < cfg.maxScrollSteps && Date.now() < overallDeadline) {
+        const scroller = findSidebarScroller();
+        if (!scroller) break;
+        scrollerFound = true;
+        const prevCount = getSidebarLinks().length;
+        const prevHeight = Number(scroller.scrollHeight) || 0;
+        scrolledSteps += 1;
+        scroller.scrollTop = prevHeight;
+        if (typeof scroller.dispatchEvent === "function") {
+          try { scroller.dispatchEvent(new Event("scroll")); } catch (e) {}
+        }
+        const stepDeadline = Math.min(overallDeadline, Date.now() + cfg.scrollSettleMs);
+        let grew = false;
+        while (Date.now() < stepDeadline) {
+          link = findCurrentLink();
+          if (link) break;
+          const curCount = getSidebarLinks().length;
+          const curHeight = Number(scroller.scrollHeight) || 0;
+          if (curCount > prevCount || curHeight > prevHeight) {
+            grew = true;
+            await sleep(cfg.pollIntervalMs);
+            link = findCurrentLink();
+            break;
+          }
+          await sleep(cfg.pollIntervalMs);
+        }
+        if (link) break;
+        if (grew) {
+          noGrowthStreak = 0;
+        } else {
+          noGrowthStreak += 1;
+          if (noGrowthStreak >= cfg.maxNoGrowthSteps) break;
+        }
+      }
+    }
+
+    if (!link) {
+      return {
+        success: false,
+        reason: "current_session_link_not_found",
+        scrolledSteps,
+        scrollerFound,
+        finalLinkCount: getSidebarLinks().length,
+      };
+    }
+    if (typeof link.scrollIntoView === "function") {
+      try { link.scrollIntoView({ block: "center", inline: "nearest" }); } catch (e) {}
+    }
     const menuBtn = await waitFor(() => {
       let node = link.parentElement;
       for (let depth = 0; depth < 6 && node; depth += 1) {
@@ -426,7 +537,7 @@ export function buildDeleteConversationJs(targetUrl) {
     if (!confirmBtn) return { success: false, reason: "confirm_button_not_found" };
     confirmBtn.click();
     const verified = await waitFor(() => {
-      if (location.pathname !== beforePath) return "route_changed";
+      if (normPath(location.pathname) !== beforePath) return "route_changed";
       if (!findSidebarLink()) return "sidebar_entry_removed";
       if (document.title !== beforeTitle && document.title.indexOf("ChatGPT") !== -1) return "title_reset";
       const body = String(document.body.innerText || "");
