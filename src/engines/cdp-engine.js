@@ -578,7 +578,7 @@ export async function runCdpTurn({
       if (Array.isArray(files) && files.length > 0) {
         const attachFn = driver.attachFiles || defaultDriver.attachFiles;
         try {
-          await attachFn(cdp, sessionId, adapter, files, { signal, sleep: sleepFn });
+          await attachFn(cdp, sessionId, adapter, files, { signal, sleep: sleepFn, targetId });
           // 多附件批量操作后注入 4-6s 批量节奏（三方裁决 2026-11-24），再进入输入。
           await (deps.pace || defaultPace)("batch", { sleep: sleepFn, signal });
         } catch (attachErr) {

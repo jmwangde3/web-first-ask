@@ -150,3 +150,64 @@ test("chatgpt upload: buildUploadJs clicks uploadTriggerSelector and ATTACH_UPLO
   );
   assert.equal(uploadJsCalled, true, "ChatGPT attachFiles must run buildUploadJs before DOM.setFileInputFiles");
 });
+
+test("attachFiles: re-acquires fresh nodeId and retries once after 1s when chipCount=0, and records full instrumentation", async () => {
+  const { attachFiles } = await import("../src/browser/driver.js");
+  const chatgptAdapter = await import("../src/browser/adapters/chatgpt.js");
+  const testFile = path.resolve("package.json");
+
+  let queryCount = 0;
+  let setFileCalls = 0;
+  let clock = 0;
+  const mockCdp = {
+    async send(method, params = {}) {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.querySelector") {
+        queryCount += 1;
+        return { nodeId: 100 + queryCount };
+      }
+      if (method === "DOM.describeNode") {
+        return { node: { nodeName: "INPUT", attributes: ["type", "file", "aria-label", "附加文件", "id", "_r_u_"] } };
+      }
+      if (method === "DOM.setFileInputFiles") {
+        setFileCalls += 1;
+        return { ok: true };
+      }
+      if (method === "Runtime.evaluate") {
+        const expr = String(params.expression || "");
+        if (expr.includes("添加文件等内容")) {
+          return { result: { value: { success: true, triggered: true } } };
+        }
+        if (expr.includes("readyState")) {
+          return { result: { value: { url: "https://chatgpt.com/", readyState: "complete", chipCount: 0 } } };
+        }
+        if (expr.includes("filesAfterSet")) {
+          return { result: { value: { found: true, url: "https://chatgpt.com/", chipCount: setFileCalls >= 2 ? 1 : 0, filesAfterSet: 0, changeDispatched: false, inputDesc: { ariaLabel: "附加文件", accept: null, multiple: true, id: "_r_u_", inForm: true } } } };
+        }
+        // Verification poll: attempt 1 sees chipCount=0, attempt 2 sees present=true
+        if (setFileCalls >= 2) {
+          return { result: { value: { present: true, matched: [true], chipCount: 1, chipTexts: ["package.json"], inputFiles: [], sendReady: true } } };
+        }
+        return { result: { value: { present: false, matched: [false], chipCount: 0, chipTexts: [], inputFiles: [], sendReady: false } } };
+      }
+      return {};
+    },
+  };
+
+  const res = await attachFiles(mockCdp, "sess-retry", chatgptAdapter, [testFile], {
+    targetId: "tgt-retry",
+    attachmentVerifyTimeoutMs: 2000,
+    retryAfterMs: 1000,
+    attachmentVerifyIntervalMs: 250,
+    now: () => clock,
+    sleep: async (ms) => { clock += ms; },
+  });
+
+  assert.equal(setFileCalls, 2, "must retry DOM.setFileInputFiles once after 1s with chipCount=0");
+  assert.equal(queryCount, 2, "must re-acquire fresh nodeId before retry");
+  assert.equal(res.attempts.length, 2);
+  assert.equal(res.attempts[0].nodeId, 101);
+  assert.equal(res.attempts[1].nodeId, 102);
+  assert.equal(res.attempts[0].describeNode.attrs["aria-label"], "附加文件");
+  assert.equal(res.attempts[0].beforeUrl, "https://chatgpt.com/");
+});

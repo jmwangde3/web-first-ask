@@ -729,24 +729,21 @@ export async function typePrompt(cdp, sessionId, adapter, text) {
  * @param {string[]} filePaths 需要附加的绝对文件路径数组
  * @param {object} options
  */
-export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
-  signal,
-  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  now = () => Date.now(),
+export async function attachFiles(cdp, sessionId, adapter, filePaths, {
   attachmentVerifyTimeoutMs = 7000,
   attachmentVerifyIntervalMs = 200,
+  retryAfterMs = 1200,
+  maxInjectAttempts = 2,
+  targetId = null,
+  signal,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
 } = {}) {
-  if (signal?.aborted) {
-    const err = new Error("Operation cancelled");
-    err.code = "CANCELLED";
-    throw err;
-  }
-
-  if (!filePaths || !filePaths.length) {
+  if (!Array.isArray(filePaths) || filePaths.length === 0) {
     return { attached: [], provider: adapter?.id || "unknown", skipped: [] };
   }
 
-  // 1. 严格校验绝对路径
+  // 1. 路径安全校验：只允许绝对路径，拒绝相对路径
   const absolutePaths = filePaths.map((fp) => String(fp).trim());
   for (const fp of absolutePaths) {
     const isAbs = /^[a-zA-Z]:[\\/]/.test(fp) || fp.startsWith("/") || fp.startsWith("\\\\");
@@ -755,170 +752,259 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
     }
   }
 
-  // 2. 若 adapter 需要触发前端上传前置动作（例如 Gemini 展开菜单），先执行 buildUploadJs
-  if (typeof adapter.buildUploadJs === "function") {
-    const uploadJs = adapter.buildUploadJs();
-    if (uploadJs) {
-      const evalRes = await cdp.send("Runtime.evaluate", {
-        expression: uploadJs,
-        returnByValue: true,
-        awaitPromise: true,
-      }, sessionId);
-
-      if (signal?.aborted) {
-        const err = new Error("Operation cancelled");
-        err.code = "CANCELLED";
-        throw err;
-      }
-
-      const resVal = evalRes?.result?.value;
-      if (resVal && resVal.success === false) {
-        throw new WfaError("ATTACH_UPLOAD_FAILED", `Failed to prepare upload UI: ${resVal.reason || "unknown"}`);
-      }
-    }
-  }
-
   const selector = adapter.fileInputSelector || 'input[type="file"]';
-
-  // 3. 核心机制：CDP DOM 查找与 DOM.setFileInputFiles
-  // 先通过 DOM.getDocument 拿 root nodeId，再用 DOM.querySelector 查询 input 元素
-  let fileNodeId = null;
-  let backendNodeId = null;
-
-  try {
-    const doc = await cdp.send("DOM.getDocument", { depth: 0 }, sessionId);
-    if (doc?.root?.nodeId) {
-      const queryRes = await cdp.send("DOM.querySelector", {
-        nodeId: doc.root.nodeId,
-        selector,
-      }, sessionId);
-      if (queryRes?.nodeId) {
-        fileNodeId = queryRes.nodeId;
-      }
-    }
-  } catch {}
-
-  // 兜底路径：若 DOM.querySelector 未直接拿到有效 nodeId，通过 Runtime.evaluate 解析 DOM 并提取 backendNodeId
-  if (!fileNodeId) {
-    const evalNode = await cdp.send("Runtime.evaluate", {
-      expression: `document.querySelector(${JSON.stringify(selector)})`,
-    }, sessionId);
-    const objectId = evalNode?.result?.objectId;
-    if (objectId) {
-      try {
-        const desc = await cdp.send("DOM.describeNode", { objectId }, sessionId);
-        backendNodeId = desc?.node?.backendNodeId;
-      } catch {}
-    }
-  }
-
-  if (!fileNodeId && !backendNodeId) {
-    throw new WfaError("ATTACH_UPLOAD_FAILED", `File input element not found for selector: ${selector}`);
-  }
-
-  if (signal?.aborted) {
-    const err = new Error("Operation cancelled");
-    err.code = "CANCELLED";
-    throw err;
-  }
-
-  // 选择理由：优先采用 CDP DOM.setFileInputFiles 配合 nodeId 或 backendNodeId 注入，
-  // 避免使用 Page.setInterceptFileChooserDialog（其需要真实触发用户点击并捕获原生文件选择对话框，在隐藏式 input 或不同 OS 平台下时序不可靠）。
-  try {
-    if (fileNodeId) {
-      await cdp.send("DOM.setFileInputFiles", {
-        files: absolutePaths,
-        nodeId: fileNodeId,
-      }, sessionId);
-    } else {
-      await cdp.send("DOM.setFileInputFiles", {
-        files: absolutePaths,
-        backendNodeId,
-      }, sessionId);
-    }
-  } catch (err) {
-    throw new WfaError("ATTACH_UPLOAD_FAILED", `CDP DOM.setFileInputFiles failed: ${err.message || String(err)}`);
-  }
-
-  // Best-effort: if CDP setFileInputFiles populated input.files without triggering
-  // framework onChange, dispatch bubbling input/change events and capture inputDesc.
-  let postSetInfo = null;
-  try {
-    const postRes = await cdp.send("Runtime.evaluate", {
-      expression: `(() => {
-        const input = document.querySelector(${JSON.stringify(selector)});
-        if (!input) return { found: false };
-        const count = input.files ? input.files.length : 0;
-        let dispatched = false;
-        if (count > 0 && typeof input.dispatchEvent === "function") {
-          try {
-            input.dispatchEvent(new Event("input", { bubbles: true }));
-            input.dispatchEvent(new Event("change", { bubbles: true }));
-            dispatched = true;
-          } catch {}
-        }
-        return {
-          found: true,
-          filesAfterSet: count,
-          changeDispatched: dispatched,
-          inputDesc: {
-            ariaLabel: typeof input.getAttribute === "function" ? input.getAttribute("aria-label") : null,
-            accept: typeof input.getAttribute === "function" ? input.getAttribute("accept") : null,
-            multiple: Boolean(input.multiple),
-            id: input.id || null,
-            inForm: Boolean(typeof input.closest === "function" && input.closest("form")),
-          },
-        };
-      })()`,
-      returnByValue: true,
-    }, sessionId);
-    postSetInfo = postRes?.result?.value || null;
-  } catch {}
-
-  if (signal?.aborted) {
-    const err = new Error("Operation cancelled");
-    err.code = "CANCELLED";
-    throw err;
-  }
-
-  // 4. 等待并验证附件 chip 出现（2026-11-24 真机证据）：
-  // React 读文件进 state 后清空 input.files，chip 才是真实成功标志；
-  // 它出现前就提交 prompt 会导致 "I don't see an attached file"。
-  // input.files 仅作诊断，绝不参与成功判定。
+  const chipSelector = adapter.attachmentChipSelector || "";
   const verifyJs = typeof adapter.buildAttachmentVerifyJs === "function"
     ? adapter.buildAttachmentVerifyJs(absolutePaths)
     : null;
+
+  const sampleTabState = async () => {
+    try {
+      const res = await cdp.send("Runtime.evaluate", {
+        expression: `(() => ({
+          url: String(location.href || ""),
+          readyState: String(document.readyState || ""),
+          chipCount: ${JSON.stringify(chipSelector)} ? document.querySelectorAll(${JSON.stringify(chipSelector)}).length : null,
+        }))()`,
+        returnByValue: true,
+      }, sessionId);
+      return res?.result?.value || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const describeAttrsPreview = (desc) => {
+    const raw = desc?.node?.attributes;
+    if (!Array.isArray(raw)) return null;
+    const preview = {};
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      const k = String(raw[i]);
+      if (["type", "aria-label", "accept", "multiple", "id", "name", "class"].includes(k)) {
+        preview[k] = String(raw[i + 1]).slice(0, 120);
+      }
+    }
+    return { nodeName: desc?.node?.nodeName || null, attrs: preview };
+  };
+
+  const runUploadAndInjectAttempt = async (attemptNum) => {
+    const trace = {
+      attempt: attemptNum,
+      beforeUrl: null,
+      beforeReadyState: null,
+      beforeChipCount: null,
+      nodeId: null,
+      backendNodeId: null,
+      describeNode: null,
+      setFileReturn: null,
+      afterUrl: null,
+      afterChipCount: null,
+      filesAfterSet: null,
+      changeDispatched: null,
+      inputDesc: null,
+    };
+
+    const before = await sampleTabState();
+    trace.beforeUrl = before?.url ?? null;
+    trace.beforeReadyState = before?.readyState ?? null;
+    trace.beforeChipCount = before?.chipCount ?? null;
+
+    // 2. 若 adapter 需要触发前端上传前置动作（例如 Gemini / ChatGPT 展开菜单），先执行 buildUploadJs
+    if (typeof adapter.buildUploadJs === "function") {
+      const uploadJs = adapter.buildUploadJs();
+      if (uploadJs) {
+        const evalRes = await cdp.send("Runtime.evaluate", {
+          expression: uploadJs,
+          returnByValue: true,
+          awaitPromise: true,
+        }, sessionId);
+
+        if (signal?.aborted) {
+          const err = new Error("Operation cancelled");
+          err.code = "CANCELLED";
+          throw err;
+        }
+
+        const resVal = evalRes?.result?.value;
+        if (resVal && resVal.success === false) {
+          throw new WfaError("ATTACH_UPLOAD_FAILED", `Failed to prepare upload UI: ${resVal.reason || "unknown"}`);
+        }
+      }
+    }
+
+    // 3. 每次注入前重新取最新 nodeId / backendNodeId，防止 SPA hydration 导致旧节点失效
+    let fileNodeId = null;
+    let backendNodeId = null;
+    let described = null;
+
+    try {
+      const doc = await cdp.send("DOM.getDocument", { depth: 0 }, sessionId);
+      if (doc?.root?.nodeId) {
+        const queryRes = await cdp.send("DOM.querySelector", {
+          nodeId: doc.root.nodeId,
+          selector,
+        }, sessionId);
+        if (queryRes?.nodeId) {
+          fileNodeId = queryRes.nodeId;
+          try {
+            described = await cdp.send("DOM.describeNode", { nodeId: fileNodeId }, sessionId);
+          } catch {}
+        }
+      }
+    } catch {}
+
+    if (!fileNodeId) {
+      const evalNode = await cdp.send("Runtime.evaluate", {
+        expression: `document.querySelector(${JSON.stringify(selector)})`,
+      }, sessionId);
+      const objectId = evalNode?.result?.objectId;
+      if (objectId) {
+        try {
+          described = await cdp.send("DOM.describeNode", { objectId }, sessionId);
+          backendNodeId = described?.node?.backendNodeId ?? null;
+        } catch {}
+      }
+    }
+
+    trace.nodeId = fileNodeId;
+    trace.backendNodeId = backendNodeId;
+    trace.describeNode = describeAttrsPreview(described);
+
+    if (!fileNodeId && !backendNodeId) {
+      throw new WfaError("ATTACH_UPLOAD_FAILED", `File input element not found for selector: ${selector}`);
+    }
+
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
+
+    try {
+      if (fileNodeId) {
+        trace.setFileReturn = await cdp.send("DOM.setFileInputFiles", {
+          files: absolutePaths,
+          nodeId: fileNodeId,
+        }, sessionId);
+      } else {
+        trace.setFileReturn = await cdp.send("DOM.setFileInputFiles", {
+          files: absolutePaths,
+          backendNodeId,
+        }, sessionId);
+      }
+    } catch (err) {
+      throw new WfaError("ATTACH_UPLOAD_FAILED", `CDP DOM.setFileInputFiles failed: ${err.message || String(err)}`);
+    }
+
+    // Best-effort: if CDP setFileInputFiles populated input.files without triggering
+    // framework onChange, dispatch bubbling input/change events and capture inputDesc.
+    try {
+      const postRes = await cdp.send("Runtime.evaluate", {
+        expression: `(() => {
+          const input = document.querySelector(${JSON.stringify(selector)});
+          if (!input) return { found: false, url: String(location.href || "") };
+          const count = input.files ? input.files.length : 0;
+          let dispatched = false;
+          if (count > 0 && typeof input.dispatchEvent === "function") {
+            try {
+              input.dispatchEvent(new Event("input", { bubbles: true }));
+              input.dispatchEvent(new Event("change", { bubbles: true }));
+              dispatched = true;
+            } catch {}
+          }
+          return {
+            found: true,
+            url: String(location.href || ""),
+            chipCount: ${JSON.stringify(chipSelector)} ? document.querySelectorAll(${JSON.stringify(chipSelector)}).length : null,
+            filesAfterSet: count,
+            changeDispatched: dispatched,
+            inputDesc: {
+              ariaLabel: typeof input.getAttribute === "function" ? input.getAttribute("aria-label") : null,
+              accept: typeof input.getAttribute === "function" ? input.getAttribute("accept") : null,
+              multiple: Boolean(input.multiple),
+              id: input.id || null,
+              inForm: Boolean(typeof input.closest === "function" && input.closest("form")),
+            },
+          };
+        })()`,
+        returnByValue: true,
+      }, sessionId);
+      const val = postRes?.result?.value || null;
+      trace.afterUrl = val?.url ?? null;
+      trace.afterChipCount = val?.chipCount ?? null;
+      trace.filesAfterSet = val?.filesAfterSet ?? null;
+      trace.changeDispatched = val?.changeDispatched ?? null;
+      trace.inputDesc = val?.inputDesc ?? null;
+    } catch {}
+
+    if (signal?.aborted) {
+      const err = new Error("Operation cancelled");
+      err.code = "CANCELLED";
+      throw err;
+    }
+    return trace;
+  };
+
+  const attempts = [];
+  const firstTrace = await runUploadAndInjectAttempt(1);
+  attempts.push(firstTrace);
+
+  // 4. 等待并验证附件 chip 出现；若首次注入后 1 秒仍无 chip（如新标签页 React 刚完成 hydration），
+  // 自动重新取 nodeId 再注入一次，随后跑完剩余验证窗口。
   if (verifyJs) {
     let diag = null;
     let verifyPolls = 0;
-    const deadline = now() + attachmentVerifyTimeoutMs;
-    while (now() < deadline) {
-      if (signal?.aborted) {
-        const err = new Error("Operation cancelled");
-        err.code = "CANCELLED";
-        throw err;
+    const allowRetry = maxInjectAttempts > 1 && attachmentVerifyTimeoutMs >= retryAfterMs;
+    const pollUntil = async (windowMs) => {
+      const deadline = now() + windowMs;
+      while (now() < deadline) {
+        if (signal?.aborted) {
+          const err = new Error("Operation cancelled");
+          err.code = "CANCELLED";
+          throw err;
+        }
+        verifyPolls += 1;
+        const res = await cdp.send("Runtime.evaluate", {
+          expression: verifyJs,
+          returnByValue: true,
+        }, sessionId);
+        diag = res?.result?.value || null;
+        if (diag?.present) return true;
+        await sleep(attachmentVerifyIntervalMs);
       }
-      verifyPolls += 1;
-      const res = await cdp.send("Runtime.evaluate", {
-        expression: verifyJs,
-        returnByValue: true,
-      }, sessionId);
-      diag = res?.result?.value || null;
-      if (diag?.present) break;
-      await sleep(attachmentVerifyIntervalMs);
+      return false;
+    };
+
+    let verified = false;
+    if (allowRetry) {
+      verified = await pollUntil(retryAfterMs);
+      if (!verified && (diag?.chipCount ?? 0) === 0) {
+        const retryTrace = await runUploadAndInjectAttempt(2);
+        attempts.push(retryTrace);
+        verified = await pollUntil(attachmentVerifyTimeoutMs);
+      } else if (!verified) {
+        verified = await pollUntil(Math.max(0, attachmentVerifyTimeoutMs - retryAfterMs));
+      }
+    } else {
+      verified = await pollUntil(attachmentVerifyTimeoutMs);
     }
-    if (!diag?.present) {
+
+    if (!verified) {
+      const lastTrace = attempts[attempts.length - 1] || null;
       const diagnostics = {
         provider: adapter?.id || "unknown",
+        targetId: targetId ?? null,
+        sessionId: sessionId ?? null,
         expectedFiles: absolutePaths.map((fp) => path.basename(fp)),
         verifyPolls,
         inputFiles: diag?.inputFiles ?? null,
-        inputDesc: diag?.inputDesc ?? postSetInfo?.inputDesc ?? null,
-        changeDispatched: postSetInfo?.changeDispatched ?? null,
+        inputDesc: diag?.inputDesc ?? lastTrace?.inputDesc ?? null,
+        changeDispatched: lastTrace?.changeDispatched ?? null,
         chipCount: diag?.chipCount ?? 0,
         chipTexts: diag?.chipTexts ?? [],
         matched: diag?.matched ?? [],
         sendReady: diag?.sendReady ?? null,
+        attempts,
       };
       throw new WfaError(
         "ATTACH_UPLOAD_FAILED",
@@ -929,13 +1015,11 @@ export async function attachFiles(cdp, sessionId, adapter, filePaths = [], {
     }
   }
 
-  // 5. 不在此处重复 waitForEditor：调用方 engine 已在 openTab 后等待过 editor，
-  // 这里再等一次在 mock/慢渲染下会额外卡 15s，且上传本身不改变 editor 可用性。
-
   return {
     attached: absolutePaths,
     provider: adapter?.id || "unknown",
     skipped: [],
+    attempts,
   };
 }
 
